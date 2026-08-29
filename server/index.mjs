@@ -1838,7 +1838,7 @@ async function pushSub2ApiTeams(motherIds = []) {
 const MCP_PROTOCOL_VERSION = '2025-06-18';
 const mcpSessions = new Map();
 const mcpTools = [
-  { name: 'get_state', description: '获取配额中枢当前状态、Team 汇总、账号状态和自动化设置。', inputSchema: { type: 'object', properties: { includeHistory: { type: 'boolean', description: '是否同时返回最近操作历史，默认 true。' } }, additionalProperties: false } },
+  { name: 'get_state', description: '获取 team轮转当前状态、Team 汇总、账号状态和自动化设置。', inputSchema: { type: 'object', properties: { includeHistory: { type: 'boolean', description: '是否同时返回最近操作历史，默认 true。' } }, additionalProperties: false } },
   { name: 'list_teams', description: '列出所有 Team 空间、所有者、席位和当前成员。', inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
   { name: 'list_accounts', description: '列出 Free 账号池中的账号状态、额度摘要和加入过的 Team。', inputSchema: { type: 'object', properties: { status: { type: 'string', description: '按状态筛选，例如 ready、active、warning、exhausted。' }, teamId: { type: 'string', description: '只返回当前属于指定 Team 的账号。' } }, additionalProperties: false } },
   { name: 'get_history', description: '获取额度检测、移除、加入和设置变更记录。', inputSchema: { type: 'object', properties: { limit: { type: 'integer', minimum: 1, maximum: 200, description: '最多返回多少条，默认 50。' } }, additionalProperties: false } },
@@ -1933,7 +1933,7 @@ async function mcpHandleMessage(message, req, res) {
     const requested = String(params.protocolVersion || '');
     const protocolVersion = requested === MCP_PROTOCOL_VERSION || requested === '2025-03-26' ? requested : MCP_PROTOCOL_VERSION;
     mcpSessions.set(sessionId, protocolVersion);
-    return { response: { jsonrpc: '2.0', id, result: { protocolVersion, capabilities: { tools: {} }, serverInfo: { name: 'quota-hub', version: '1.0.0' }, instructions: '使用工具管理 Team 额度和补位；服务器不会通过 MCP 返回完整凭据或 access token。' } }, sessionId, protocolVersion };
+    return { response: { jsonrpc: '2.0', id, result: { protocolVersion, capabilities: { tools: {} }, serverInfo: { name: 'team-rotation', version: '1.0.0' }, instructions: '使用工具管理 Team 额度和补位；服务器不会通过 MCP 返回完整凭据或 access token。' } }, sessionId, protocolVersion };
   }
   if (method === 'notifications/initialized' || method === 'notifications/cancelled') return { notification: true };
   if (method === 'ping') return { response: { jsonrpc: '2.0', id, result: {} } };
@@ -2438,7 +2438,7 @@ const server = createServer((req, res) => {
 server.listen(port, host, () => {
   configureMaintenanceTimer();
   setTimeout(() => { void runMaintenanceCycle(); }, 1500).unref?.();
-  console.log(`quota-hub server listening on http://${host}:${port}`);
+  console.log(`team-rotation server listening on http://${host}:${port}`);
 });
 
 // OAuth uses a localhost callback that is easier to complete in the user's

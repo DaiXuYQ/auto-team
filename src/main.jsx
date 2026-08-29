@@ -832,7 +832,7 @@ function App() {
 
   return <div className="app-shell">
     <header className="topbar">
-      <div className="brand"><div className="brand-mark"><Zap size={17} strokeWidth={2.6} /></div><div><strong>配额中枢</strong><span>TEAM AUTOMATION</span></div></div>
+      <div className="brand"><div className="brand-mark"><Zap size={17} strokeWidth={2.6} /></div><div><strong>team轮转</strong><span>TEAM AUTOMATION</span></div></div>
       <nav className="main-nav">{navItems.map(({ id, label, icon: Icon }) => <button key={id} className={view === id ? 'nav-item active' : 'nav-item'} onClick={() => setView(id)}><Icon size={17} />{label}{id === 'free' && <em>{accountRecords.length}</em>}</button>)}</nav>
       <div className="top-actions"><button className="icon-button theme-toggle" title={theme === 'dark' ? '切换为白天模式' : '切换为黑夜模式'} aria-label={theme === 'dark' ? '切换为白天模式' : '切换为黑夜模式'} onClick={() => setTheme((current) => current === 'dark' ? 'light' : 'dark')}>{theme === 'dark' ? <Sun size={18} /> : <Moon size={18} />}</button><button className="icon-button" title="Agent 接入与功能说明" aria-label="Agent 接入与功能说明" onClick={() => setShowAgentHelp(true)}><CircleHelp size={18} /></button><button className="icon-button" title="更多" aria-label="更多"><MoreHorizontal size={19} /></button><div className="avatar" title="当前用户">AL</div></div>
     </header>
@@ -1076,8 +1076,8 @@ function ProxyModal({ proxy = defaultProxySettings, onClose, onSave, onAdd, onRe
 
 function AgentAccessModal({ onClose, notify }) {
   const httpEndpoint = `${API_BASE || window.location.origin}/mcp`;
-  const httpConfig = JSON.stringify({ mcpServers: { 'quota-hub': { url: httpEndpoint } } }, null, 2);
-  const stdioConfig = JSON.stringify({ mcpServers: { 'quota-hub': { command: 'npm', args: ['run', 'mcp'], cwd: 'F:/ai-work/gpt-tila-team', env: { QUOTA_HUB_MCP_URL: 'http://127.0.0.1:8786/mcp' } } } }, null, 2);
+  const httpConfig = JSON.stringify({ mcpServers: { 'team-rotation': { url: httpEndpoint } } }, null, 2);
+  const stdioConfig = JSON.stringify({ mcpServers: { 'team-rotation': { command: 'npm', args: ['run', 'mcp'], cwd: 'F:/ai-work/gpt-tila-team', env: { QUOTA_HUB_MCP_URL: 'http://127.0.0.1:8786/mcp' } } } }, null, 2);
   async function copyConfig(value) {
     try {
       await navigator.clipboard.writeText(value);
@@ -1094,7 +1094,7 @@ function AgentAccessModal({ onClose, notify }) {
     ['调整策略', 'update_settings'],
   ];
   return <Modal title="功能说明 · Agent 接入" onClose={onClose} className="agent-modal">
-    <p className="modal-intro">这里是配额中枢的功能和标准 MCP 接入说明。顶部问号现在打开的就是这个窗口，Agent 可以通过 MCP 查询状态、检测额度和执行补位。</p>
+    <p className="modal-intro">这里是 team轮转的功能和标准 MCP 接入说明。顶部问号现在打开的就是这个窗口，Agent 可以通过 MCP 查询状态、检测额度和执行补位。</p>
     <div className="agent-feature-grid">{[['Team 自动化', '持续检测 Team 席位和 5h / 7d 额度；按策略移出耗尽账号，再从待加入池补位。'], ['Free 账号池', '维护普通账号的邮箱、密码 / 2FA 状态、Access Token 和加入过的 Team。'], ['集成与导出', '支持 Sub2API 分组推送，以及邮箱 / 接码服务配置。'], ['右上角控制', '月亮切换主题；问号查看本说明和 Agent 接入；头像显示当前用户。']].map(([title, detail]) => <div className="agent-feature" key={title}><strong>{title}</strong><span>{detail}</span></div>)}</div>
     <div className="agent-section"><div className="agent-section-title"><div><strong>HTTP MCP（推荐）</strong><span>适用于支持 Streamable HTTP 的 Agent 客户端</span></div><button className="button ghost compact-button" onClick={() => copyConfig(httpConfig)}><Copy size={14} />复制配置</button></div><div className="agent-endpoint">{httpEndpoint}</div><pre className="agent-config">{httpConfig}</pre></div>
     <div className="agent-section"><div className="agent-section-title"><div><strong>stdio MCP</strong><span>适用于只支持本地命令的客户端；先运行 `npm run server`</span></div><button className="button ghost compact-button" onClick={() => copyConfig(stdioConfig)}><Copy size={14} />复制配置</button></div><pre className="agent-config">{stdioConfig}</pre></div>

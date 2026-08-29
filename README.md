@@ -1,4 +1,4 @@
-# 配额中枢
+# team轮转
 
 一个面向 Team 空间和 Free 账号池的轻量管理台。界面围绕 Team 记录与账号记录组织，服务端继续保留真实 Team 检测、额度查询和自动补位能力。
 
@@ -38,7 +38,7 @@ npm run server
 ```json
 {
   "mcpServers": {
-    "quota-hub": {
+    "team-rotation": {
       "url": "http://127.0.0.1:8786/mcp"
     }
   }
@@ -50,7 +50,7 @@ npm run server
 ```json
 {
   "mcpServers": {
-    "quota-hub": {
+    "team-rotation": {
       "command": "npm",
       "args": ["run", "mcp"],
       "cwd": "F:/ai-work/gpt-tila-team",
