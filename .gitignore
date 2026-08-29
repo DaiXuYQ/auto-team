@@ -1,0 +1,7 @@
+node_modules/
+dist/
+data/state.json
+data/*.tmp
+*.log
+.chrome-check-2/
+page-check.png
