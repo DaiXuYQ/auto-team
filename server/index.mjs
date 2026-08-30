@@ -737,6 +737,65 @@ function childFromImportedAccount(item) {
   };
 }
 
+function singleSub2ApiAccount(input = {}) {
+  let candidate = input?.json ?? input?.account ?? input;
+  if (typeof candidate === 'string') {
+    try {
+      candidate = JSON.parse(candidate);
+    } catch {
+      return { ok: false, message: 'invalid_sub2api_json' };
+    }
+  }
+  if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return { ok: false, message: 'invalid_sub2api_account' };
+  if (candidate.account !== undefined) candidate = candidate.account;
+  if (Array.isArray(candidate?.accounts)) {
+    if (candidate.accounts.length !== 1) return { ok: false, message: 'single_sub2api_account_required' };
+    candidate = candidate.accounts[0];
+  }
+  if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return { ok: false, message: 'invalid_sub2api_account' };
+  return { ok: true, account: candidate };
+}
+
+function childHasActiveTeamMembership(child) {
+  const history = Array.isArray(child?.workspaceHistory) ? child.workspaceHistory : [];
+  if (history.some((entry) => entry?.team && entry.status === 'active')) return true;
+  if (!child?.team) return false;
+  return !history.some((entry) => entry?.team === child.team && ['kicked', 'cooldown'].includes(entry.status));
+}
+
+function applyFreeSub2ApiAccount(child, account, fields = credentialFields(account)) {
+  const imported = childFromImportedAccount({
+    ...account,
+    id: child.id,
+    planType: fields.planType || 'free',
+    source: 'sub2api',
+    sub2apiImported: true,
+    team: child.team || null,
+    workspaceHistory: child.workspaceHistory || [],
+  });
+  const credentialKeys = [
+    'password', 'totp', 'mailboxUrl', 'accessToken', 'refreshToken', 'accountId', 'chatgptUserId',
+    'clientId', 'idToken', 'organizationId', 'modelMapping', 'concurrency', 'priority', 'rateMultiplier',
+    'autoPauseOnExpired', 'expiresAt', 'subscriptionExpiresAt', 'quota5h', 'quota7d', 'quotaSnapshot',
+    'quota5hResetAfterSeconds', 'quota7dResetAfterSeconds', 'quota5hResetAt', 'quota7dResetAt', 'quotaUpdatedAt',
+  ];
+  for (const key of credentialKeys) {
+    const value = imported[key];
+    if (value !== '' && value !== null && value !== undefined) child[key] = value;
+  }
+  if (fields.email) child.email = fields.email;
+  if (fields.extra && Object.keys(fields.extra).length) child.extra = { ...(child.extra || {}), ...fields.extra };
+  child.plan = fields.planType || (child.plan && child.plan !== '待检测' ? child.plan : 'free');
+  child.tokenScope = 'free';
+  child.token = child.accessToken ? preview(child.accessToken) : child.token || '待登录获取 AT';
+  child.importSource = 'sub2api';
+  child.sub2apiImported = true;
+  child.importedAt = now();
+  child.authAt = now();
+  child.status = child.team ? 'active' : 'ready';
+  setChildLoginState(child, 'ready', '已录入 Sub2API Free JSON');
+}
+
 function ownerAccountFromImportedAccount(item) {
   const fields = credentialFields(item);
   return {
@@ -2505,6 +2564,37 @@ async function handleApi(req, res, url) {
     const exportedAt = now();
     return sendJson(res, 200, { exported_at: exportedAt, exportedAt, scope: 'free', account: sub2ApiAccountFromChild(child) });
   }
+  if (method === 'PUT' && segments[1] === 'children' && segments[2] && segments[3] === 'sub2api') {
+    const child = findChild(segments[2]);
+    if (!child) return sendJson(res, 404, { message: 'child_not_found' });
+    const parsed = singleSub2ApiAccount(body);
+    if (!parsed.ok) return sendJson(res, 400, { message: parsed.message });
+    const fields = credentialFields(parsed.account);
+    if (isTeamAccount(parsed.account)) return sendJson(res, 409, { message: 'team_sub2api_json_not_allowed' });
+    if (!fields.accessToken && !fields.refreshToken) return sendJson(res, 400, { message: 'sub2api_token_required' });
+    const incomingEmail = String(fields.email || '').trim();
+    const currentEmail = String(child.email || '').trim();
+    const emailChanged = incomingEmail && currentEmail && incomingEmail.toLowerCase() !== currentEmail.toLowerCase();
+    const childHasCredentials = Boolean(child.accessToken || child.refreshToken || child.password || child.totp || child.mailboxUrl);
+    if (emailChanged && childHasCredentials) return sendJson(res, 409, { message: 'child_email_mismatch' });
+    const duplicate = incomingEmail && state.children.find((item) => (
+      item.id !== child.id && String(item.email || '').trim().toLowerCase() === incomingEmail.toLowerCase()
+    ));
+    if (duplicate) return sendJson(res, 409, { message: 'child_email_exists', child: publicChild(duplicate) });
+    applyFreeSub2ApiAccount(child, parsed.account, fields);
+    addHistory('录入 Free JSON', `${child.email} 已保存 Sub2API 完整凭据`);
+    await persist();
+    return sendJson(res, 200, { child: publicChild(child), state: publicState({ includeHistory: false }) });
+  }
+  if (method === 'DELETE' && segments[1] === 'children' && segments[2] && !segments[3]) {
+    const child = findChild(segments[2]);
+    if (!child) return sendJson(res, 404, { message: 'child_not_found' });
+    if (childHasActiveTeamMembership(child)) return sendJson(res, 409, { message: 'child_has_active_team_memberships' });
+    state.children = state.children.filter((item) => item.id !== child.id);
+    addHistory('删除 Free 账号', `${child.email || child.id} 已从本地账号池删除`);
+    await persist();
+    return sendJson(res, 200, { ok: true, state: publicState({ includeHistory: false }) });
+  }
   if (method === 'PATCH' && segments[1] === 'children' && segments[2]) {
     const child = findChild(segments[2]);
     if (!child) return sendJson(res, 404, { message: 'child_not_found' });
@@ -2622,8 +2712,10 @@ const server = createServer((req, res) => {
 });
 
 server.listen(port, host, () => {
-  configureMaintenanceTimer();
-  setTimeout(() => { void runMaintenanceCycle(); }, 1500).unref?.();
+  if (process.env.DISABLE_MAINTENANCE !== 'true') {
+    configureMaintenanceTimer();
+    setTimeout(() => { void runMaintenanceCycle(); }, 1500).unref?.();
+  }
   console.log(`team-rotation server listening on http://${host}:${port}`);
 });
 
