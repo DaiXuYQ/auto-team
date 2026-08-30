@@ -1244,10 +1244,9 @@ function applyQuotaResult(child, result, teamId = null, window = selectedKickWin
 
 async function probeChild(child) {
   if (!child) return { ok: false, status: 404, message: 'child_not_found' };
-  const result = await probeUsage(child.accessToken, child.accountId);
-  applyQuotaResult(child, result);
-  await persist();
-  return { ...result, id: child.id, email: child.email, quota5h: child.quota5h, quota7d: child.quota7d, quotaSnapshot: child.quotaSnapshot };
+  // Free accounts are only credentials for entering a Team. Their usable quota
+  // starts from the Team workspace and must never be probed as a Free account.
+  return { ok: false, status: 409, code: 'free_quota_not_tracked', message: 'Free 账号不单独检测额度；请在加入 Team 后检测对应空间额度', id: child.id, email: child.email };
 }
 
 function setChildLoginState(child, status, message = '') {
@@ -1389,11 +1388,12 @@ async function checkTeam(motherId) {
   const results = [];
   for (const child of members) {
     const teamOwner = teamOwnerRecords(mother).find((owner) => String(owner.email || '').toLowerCase() === String(child.email || '').toLowerCase());
-    const quotaToken = teamOwner?.accessToken || child.accessToken;
-    const result = await probeUsage(quotaToken, mother.accountId || child.accountId);
+    const workspaceToken = workspaceTokenFor(child, mother.accountId) || workspaceTokenFor(child, mother.team);
+    const quotaToken = teamOwner?.accessToken || workspaceToken?.accessToken || '';
+    const result = await probeUsage(quotaToken, mother.accountId);
     applyQuotaResult(child, result, mother.team, kickWindow);
     const membership = membershipFor(child, mother.team);
-    results.push({ id: child.id, email: child.email, ...result, quotaSource: teamOwner?.accessToken ? 'team' : 'free_fallback', quota5h: membership?.quota5h ?? child.quota5h, quota7d: membership?.quota7d ?? child.quota7d });
+    results.push({ id: child.id, email: child.email, ...result, quotaSource: quotaToken ? 'team' : 'team_token_missing', quota5h: membership?.quota5h ?? null, quota7d: membership?.quota7d ?? null });
   }
   mother.lastCheck = now();
   addHistory('额度检测', `${mother.team} 检测 ${members.length} 个子号，席位 ${mother.used ?? '-'} / ${mother.seats ?? '-'}`);
@@ -1570,18 +1570,6 @@ async function refillTeam(motherId) {
   for (const child of candidates) {
     if (!mother.accessToken || !mother.accountId) { joinFailures.push({ id: child.id, email: child.email, ok: false, status: 400, message: 'workspace_credentials_required' }); continue; }
     const membership = membershipFor(child, mother.team, true);
-    const quota = await probeUsage(child.accessToken, mother.accountId || child.accountId);
-    applyQuotaResult(child, quota, mother.team, kickWindow, { createMembership: true });
-    if (!quota.ok || quotaIsExhausted(child, quota, kickWindow)) {
-      joinFailures.push({ id: child.id, email: child.email, ok: false, status: quota.status || 502, message: quota.ok ? 'quota_exhausted' : `quota_probe_${quota.message || 'failed'}` });
-      if (quota.ok && quotaIsExhausted(child, quota, kickWindow)) {
-        const retryAfter = quotaRetryAfter(child, kickWindow, mother.team);
-        Object.assign(membership, { status: 'cooldown', cooldownAt: now(), reason: quotaKickReason(child, kickWindow), retryAfter, rejoinEligible: Boolean(retryAfter) });
-      } else {
-        child.workspaceHistory = (child.workspaceHistory || []).filter((entry) => entry !== membership);
-      }
-      continue;
-    }
     const remote = await joinWorkspace(child, { motherId, workspaceId: mother.accountId, approve: true });
     if (!remote.ok) {
       child.workspaceHistory = (child.workspaceHistory || []).filter((entry) => entry !== membership);
@@ -1864,6 +1852,12 @@ function sub2ApiExtra(child) {
   const extra = {
     ...(child?.extra && typeof child.extra === 'object' ? child.extra : {}),
   };
+  if (child?.tokenScope !== 'team') {
+    // A Free export is reusable for joining spaces. Team-specific usage must
+    // not follow that credential into another Team's record.
+    for (const key of Object.keys(extra)) if (/^codex_(5h|7d|primary|secondary|usage_)/.test(key)) delete extra[key];
+    return Object.fromEntries(Object.entries(extra).filter(([, value]) => value !== null && value !== undefined && value !== ''));
+  }
   const reset5h = child?.quota5hResetAfterSeconds ?? primary.resetAfterSeconds ?? null;
   const reset7d = child?.quota7dResetAfterSeconds ?? secondary.resetAfterSeconds ?? null;
   const resetAt5h = child?.quota5hResetAt || primary.resetAt || null;
@@ -2029,7 +2023,7 @@ const mcpSessions = new Map();
 const mcpTools = [
   { name: 'get_state', description: '获取 team轮转当前状态、Team 汇总、账号状态和自动化设置。', inputSchema: { type: 'object', properties: { includeHistory: { type: 'boolean', description: '是否同时返回最近操作历史，默认 true。' } }, additionalProperties: false } },
   { name: 'list_teams', description: '列出所有 Team 空间、所有者、席位和当前成员。', inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
-  { name: 'list_accounts', description: '列出 Free 账号池中的账号状态、额度摘要和加入过的 Team。', inputSchema: { type: 'object', properties: { status: { type: 'string', description: '按状态筛选，例如 ready、active、warning、exhausted。' }, teamId: { type: 'string', description: '只返回当前属于指定 Team 的账号。' } }, additionalProperties: false } },
+  { name: 'list_accounts', description: '列出 Free 账号池中的登录状态、加入过的 Team 和凭据可用性。额度只在 Team 检测工具中返回。', inputSchema: { type: 'object', properties: { status: { type: 'string', description: '按状态筛选，例如 ready、active、warning、exhausted。' }, teamId: { type: 'string', description: '只返回当前属于指定 Team 的账号。' } }, additionalProperties: false } },
   { name: 'get_history', description: '获取额度检测、移除、加入和设置变更记录。', inputSchema: { type: 'object', properties: { limit: { type: 'integer', minimum: 1, maximum: 200, description: '最多返回多少条，默认 50。' } }, additionalProperties: false } },
   { name: 'check_team_quota', description: '检测一个 Team 及其成员的 5h / 7d 额度，并同步席位和成员快照。', inputSchema: { type: 'object', properties: { teamId: { type: 'string', description: 'Team 记录 id、accountId 或 team id。' } }, required: ['teamId'], additionalProperties: false } },
   { name: 'check_all_teams', description: '检测所有已配置真实凭据的 Team。', inputSchema: { type: 'object', properties: {}, additionalProperties: false } },

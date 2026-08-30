@@ -29,7 +29,7 @@ npm run build
 npm run server
 ```
 
-服务监听 `http://127.0.0.1:8786`，并提供 `/api/state`、`/api/history`、`/api/settings`、`/api/mothers/*`（Team 所有者与空间操作）、`/api/children/import`、`/api/children/:id/login`、`/api/children/:id/acquire`、`/api/children/:id/probe`、`/api/children/:id/join`、`/api/children/:id/switch`、`/api/children/:id/kick`、`/api/maintenance/check`、`/api/maintenance/refill` 和 `/api/sub2api/export`。`/api/state` 额外返回脱敏的 `teams` 汇总、账号凭据状态、加入历史和 Sub2API 状态；前端同步时可传 `includeHistory=false` 跳过历史。`/api/history?page=1&pageSize=20` 返回当前页 `items` 及 `total`、`totalPages` 等分页信息，不带分页参数时保持返回完整数组。开启服务端自动补位后，轮询只处理拥有真实所有者 AT 和空间 ID 的 Team；没有真实凭据的记录不会被标记为已加入或被远端操作。API 的完整 AT/refresh token、密码和 2FA 只写入本地 `data/state.json`，接口响应会脱敏；生产环境应进一步加认证、HTTPS 和密钥加密。
+服务监听 `http://127.0.0.1:8786`，并提供 `/api/state`、`/api/history`、`/api/settings`、`/api/mothers/*`（Team 所有者与空间操作）、`/api/children/import`、`/api/children/:id/login`、`/api/children/:id/acquire`、`/api/children/:id/join`、`/api/children/:id/switch`、`/api/children/:id/kick`、`/api/maintenance/check`、`/api/maintenance/refill` 和 `/api/sub2api/export`。Free 账号只用于登录、取得凭据和加入 Team，不单独检测额度；5h / 7d 额度只保存和检测在对应 Team 空间下。`/api/state` 额外返回脱敏的 `teams` 汇总、账号凭据状态、加入历史和 Sub2API 状态；前端同步时可传 `includeHistory=false` 跳过历史。`/api/history?page=1&pageSize=20` 返回当前页 `items` 及 `total`、`totalPages` 等分页信息，不带分页参数时保持返回完整数组。开启服务端自动补位后，轮询只处理拥有真实所有者 AT 和空间 ID 的 Team；没有真实凭据的记录不会被标记为已加入或被远端操作。API 的完整 AT/refresh token、密码和 2FA 只写入本地 `data/state.json`，接口响应会脱敏；生产环境应进一步加认证、HTTPS 和密钥加密。
 
 ## Agent MCP 接入
 
