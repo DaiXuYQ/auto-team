@@ -1139,6 +1139,13 @@ function childIsWorkspaceOwner(child, mother) {
     || memberIsOwner(child?.memberSnapshot, mother);
 }
 
+function childMatchesKnownTeamOwner(child, mother) {
+  const email = String(child?.email || '').trim().toLowerCase();
+  if (!email || !mother) return false;
+  return [mother, ...(Array.isArray(mother.ownerAccounts) ? mother.ownerAccounts : [])]
+    .some((owner) => String(owner?.email || '').trim().toLowerCase() === email);
+}
+
 function upsertTeamOwnerFromChild(mother, child, workspaceId, workspaceToken) {
   if (!mother || !child?.email || !workspaceToken?.accessToken) return null;
   if (!Array.isArray(mother.ownerAccounts)) mother.ownerAccounts = [];
@@ -1438,30 +1445,108 @@ async function acquireChildAuth(child, { refresh = false, verificationCode = '',
   return { ok: false, status: login.status || 202, code: browserRequired ? 'verification_required' : login.code || 'login_failed', message, stage: login.stage, browserRequired, needsInput: login.needsInput, authUrl: login.authUrl || null, child: publicChild(child) };
 }
 
+function canAutoPushRenewedTeamJson() {
+  const config = state.settings?.integrations?.sub2api || {};
+  const groupId = Number(config.groupId);
+  return config.enabled === true
+    && Boolean(sub2ApiRoot(config.baseUrl))
+    && Boolean(config.apiKey)
+    && (Number.isFinite(groupId) && groupId > 0 || Boolean(String(config.groupName || '').trim()));
+}
+
+async function renewUnauthorizedTeamToken(mother, child) {
+  if (!mother?.accountId || !child) return { ok: false, status: 400, message: 'workspace_id_or_child_missing', freeRefreshed: false };
+  let switched = await switchWorkspace(child, { workspaceId: mother.accountId });
+  let freeRefreshed = false;
+
+  // A Team token may expire while the Free token is still valid. Refresh the
+  // Free token only when the workspace exchange itself cannot authenticate.
+  if (!switched.ok && (switched.status === 401 || !child.accessToken)) {
+    const refreshed = await acquireChildAuth(child, { refresh: true });
+    if (!refreshed.ok) {
+      return {
+        ok: false,
+        status: refreshed.status || switched.status || 502,
+        message: refreshed.message || 'free_token_refresh_failed',
+        freeRefreshed: true,
+      };
+    }
+    freeRefreshed = refreshed.source === 'refresh_token';
+    switched = await switchWorkspace(child, { workspaceId: mother.accountId });
+  }
+  if (!switched.ok) return { ok: false, status: switched.status || 502, message: switched.message || 'workspace_token_refresh_failed', freeRefreshed };
+
+  const workspaceToken = workspaceTokenFor(child, mother.accountId) || workspaceTokenFor(child, mother.team);
+  if (!workspaceToken?.accessToken) return { ok: false, status: 502, message: 'renewed_workspace_token_missing', freeRefreshed };
+  if (childIsWorkspaceOwner(child, mother) || childMatchesKnownTeamOwner(child, mother)) {
+    upsertTeamOwnerFromChild(mother, child, mother.accountId, workspaceToken);
+  }
+  addHistory('刷新 Team JSON', `${child.email} 的 ${mother.team} Team Token 已重新获取${freeRefreshed ? '，Free AT 已刷新' : ''}`);
+  await persist();
+  return { ok: true, status: 200, message: 'team_token_renewed', freeRefreshed };
+}
+
+async function pushRenewedTeamJson(mother) {
+  if (!canAutoPushRenewedTeamJson()) {
+    return { attempted: false, ok: null, status: null, message: 'sub2api_auto_push_not_configured', pushed: 0, failed: 0 };
+  }
+  const result = await pushSub2ApiTeams([mother.id]);
+  return {
+    attempted: true,
+    ok: result.ok === true,
+    status: result.status || null,
+    message: result.message || null,
+    pushed: result.pushed?.length || 0,
+    failed: result.failed?.length || 0,
+  };
+}
+
 async function checkTeam(motherId) {
   const mother = findMother(motherId);
   if (!mother) return { ok: false, status: 404, message: 'mother_not_found' };
-  const workspace = await syncMotherWorkspace(mother).catch((error) => ({ ok: false, message: error?.message || 'workspace_sync_failed', members: [] }));
+  let workspace = await syncMotherWorkspace(mother).catch((error) => ({ ok: false, message: error?.message || 'workspace_sync_failed', members: [] }));
   const members = state.children.filter((child) => isChildMemberOfTeam(child, mother.team));
   const kickWindow = selectedKickWindow(mother);
   const results = [];
+  let renewedTeamTokens = 0;
+  let renewedFreeTokens = 0;
   for (const child of members) {
     const teamOwner = teamOwnerRecords(mother).find((owner) => String(owner.email || '').toLowerCase() === String(child.email || '').toLowerCase());
     const workspaceToken = workspaceTokenFor(child, mother.accountId) || workspaceTokenFor(child, mother.team);
     const quotaToken = teamOwner?.accessToken || workspaceToken?.accessToken || '';
-    const result = await probeUsage(quotaToken, mother.accountId);
+    let result = await probeUsage(quotaToken, mother.accountId);
+    let tokenRecovery = null;
+    if (result.status === 401) {
+      tokenRecovery = await renewUnauthorizedTeamToken(mother, child);
+      if (tokenRecovery.ok) {
+        renewedTeamTokens += 1;
+        if (tokenRecovery.freeRefreshed) renewedFreeTokens += 1;
+        const renewedToken = workspaceTokenFor(child, mother.accountId) || workspaceTokenFor(child, mother.team);
+        result = await probeUsage(renewedToken?.accessToken || '', mother.accountId);
+      }
+    }
     applyQuotaResult(child, result, mother.team, kickWindow);
     const membership = membershipFor(child, mother.team);
-    results.push({ id: child.id, email: child.email, ...result, quotaSource: quotaToken ? 'team' : 'team_token_missing', quota5h: membership?.quota5h ?? null, quota7d: membership?.quota7d ?? null });
+    results.push({ id: child.id, email: child.email, ...result, quotaSource: quotaToken ? 'team' : 'team_token_missing', quota5h: membership?.quota5h ?? null, quota7d: membership?.quota7d ?? null, tokenRecovery: tokenRecovery ? { attempted: true, ok: tokenRecovery.ok, status: tokenRecovery.status, message: tokenRecovery.message, freeRefreshed: tokenRecovery.freeRefreshed } : null });
+  }
+  const sub2apiPush = renewedTeamTokens > 0
+    ? await pushRenewedTeamJson(mother)
+    : { attempted: false, ok: null, status: null, message: null, pushed: 0, failed: 0 };
+  if (renewedTeamTokens > 0 && workspace.ok !== true) {
+    workspace = await syncMotherWorkspace(mother).catch((error) => ({ ok: false, message: error?.message || 'workspace_sync_failed', members: [] }));
   }
   mother.lastCheck = now();
-  addHistory('额度检测', `${mother.team} 检测 ${members.length} 个子号，席位 ${mother.used ?? '-'} / ${mother.seats ?? '-'}`);
+  const renewalDetail = !renewedTeamTokens
+    ? ''
+    : `，刷新 ${renewedTeamTokens} 个 Team JSON${sub2apiPush.attempted ? `，Sub2API 推送 ${sub2apiPush.pushed} 个` : '，Sub2API 未推送（未启用或未配置分组）'}`;
+  addHistory('额度检测', `${mother.team} 检测 ${members.length} 个子号，席位 ${mother.used ?? '-'} / ${mother.seats ?? '-'}${renewalDetail}`);
   await persist();
   const probesOk = results.every((result) => result.ok === true);
   const syncOk = workspace.ok === true;
+  const pushOk = !sub2apiPush.attempted || sub2apiPush.ok === true;
   return {
-    ok: syncOk && probesOk,
-    status: syncOk && probesOk ? 200 : 207,
+    ok: syncOk && probesOk && pushOk,
+    status: syncOk && probesOk && pushOk ? 200 : 207,
     motherId,
     checked: results.length,
     results,
@@ -1469,6 +1554,9 @@ async function checkTeam(motherId) {
     members: workspace.members || mother.members || [],
     syncOk,
     probesOk,
+    renewedTeamTokens,
+    renewedFreeTokens,
+    sub2apiPush,
   };
 }
 
@@ -1827,7 +1915,13 @@ async function switchWorkspace(child, body) {
   }
   const workspaceToken = saveWorkspaceToken(child, workspaceId, accessToken, claims);
   const mother = state.mothers.find((item) => item.accountId === workspaceId || item.team === workspaceId);
-  if (mother && childIsWorkspaceOwner(child, mother)) upsertTeamOwnerFromChild(mother, child, workspaceId, workspaceToken);
+  const knownOwner = childMatchesKnownTeamOwner(child, mother);
+  if (mother && String(mother.email || '').trim().toLowerCase() === String(child.email || '').trim().toLowerCase()) {
+    mother.accessToken = accessToken;
+    mother.token = preview(accessToken);
+    mother.expiresAt = workspaceToken.expiresAt || mother.expiresAt || null;
+  }
+  if (mother && (childIsWorkspaceOwner(child, mother) || knownOwner)) upsertTeamOwnerFromChild(mother, child, workspaceId, workspaceToken);
   const membership = mother ? membershipFor(child, mother.team, true) : membershipFor(child, workspaceId, true);
   if (membership) {
     membership.workspaceTokenStatus = 'ready';
