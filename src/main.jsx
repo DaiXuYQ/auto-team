@@ -532,7 +532,20 @@ function App() {
       await refreshState(false);
       setProgress(100); setLastSync('刚刚'); setStage('refill');
       const checked = result.checked ?? result.results?.length ?? 0;
-      if (result.ok === false) notify(`${allTeams ? '多 Team 检测部分失败' : '检测部分失败'}，已检查 ${allTeams ? `${result.succeeded || 0}/${result.teamCount || mothers.length} 个 Team，` : ''}${checked} 个账号`, 'error');
+      const quotaResults = allTeams
+        ? (result.teams || []).flatMap((team) => team.results || [])
+        : (result.results || []);
+      const recoveries = quotaResults.map((item) => item.tokenRecovery).filter(Boolean);
+      const recovered = recoveries.filter((item) => item.ok).length;
+      const waitingForLogin = recoveries.filter((item) => !item.ok && (item.needsInput || item.browserRequired)).length;
+      const recoveryDetail = recovered
+        ? `；已自动更新 ${recovered} 个 Team JSON`
+        : waitingForLogin
+          ? `；${waitingForLogin} 个账号需要完成登录验证后重试`
+          : recoveries.length
+            ? '；OAuth 自动恢复未成功，请检查 Free 账号凭据'
+            : '';
+      if (result.ok === false) notify(`${allTeams ? '多 Team 检测部分失败' : '检测部分失败'}，已检查 ${allTeams ? `${result.succeeded || 0}/${result.teamCount || mothers.length} 个 Team，` : ''}${checked} 个账号${recoveryDetail}`, 'error');
       else notify(`${allTeams ? `全部 ${result.teamCount || mothers.length} 个 Team` : '检测'}完成，已检查 ${checked} 个账号`);
     } catch (error) {
       setProgress(0); notify(`额度检测失败：${error.message}`, 'error');

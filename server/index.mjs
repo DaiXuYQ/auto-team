@@ -1359,7 +1359,7 @@ function applyLoggedInChildToken(child, result) {
   setChildLoginState(child, 'ready', '已完成登录，Free JSON 已生成');
 }
 
-async function acquireChildAuth(child, { refresh = false, verificationCode = '', callbackUrl = '' } = {}) {
+async function acquireChildAuth(child, { refresh = false, verificationCode = '', callbackUrl = '', allowCredentialLogin = false } = {}) {
   if (!child) return { ok: false, status: 404, message: 'child_not_found' };
   if (child.accessToken && !refresh) {
     setChildLoginState(child, 'ready', '已有可用 AT');
@@ -1379,9 +1379,11 @@ async function acquireChildAuth(child, { refresh = false, verificationCode = '',
     setChildLoginState(child, 'login_required', 'refresh token 已失效，需要重新登录获取 AT');
     child.status = 'login_required';
     await persist();
-    return { ok: false, status: refreshed.status || 502, code: 'refresh_failed', message: 'refresh token 已失效，需要重新登录', child: publicChild(child) };
+    if (!allowCredentialLogin) {
+      return { ok: false, status: refreshed.status || 502, code: 'refresh_failed', message: 'refresh token 已失效，需要重新登录', child: publicChild(child) };
+    }
   }
-  if (child.accessToken) {
+  if (child.accessToken && !allowCredentialLogin) {
     setChildLoginState(child, 'ready', '当前账号已有 AT，但没有可用 refresh token');
     await persist();
     return { ok: true, status: 200, source: 'access_token', child: publicChild(child) };
@@ -1458,27 +1460,34 @@ async function renewUnauthorizedTeamToken(mother, child) {
   if (!mother?.accountId || !child) return { ok: false, status: 400, message: 'workspace_id_or_child_missing', freeRefreshed: false };
   // Recover the Free OAuth session first. A Team AT is derived from that
   // session, so exchanging it before the OAuth refresh can reproduce a 401.
-  const refreshed = await acquireChildAuth(child, { refresh: true });
+  // When the RT is invalid, stored email/password/2FA credentials are the
+  // fallback for generating a new Free JSON before re-entering the Team.
+  const refreshed = await acquireChildAuth(child, { refresh: true, allowCredentialLogin: true });
   if (!refreshed.ok) {
     return {
       ok: false,
       status: refreshed.status || 502,
+      code: refreshed.code || 'free_oauth_refresh_failed',
       message: refreshed.message || 'free_oauth_refresh_failed',
-      freeRefreshed: true,
+      freeRefreshed: false,
+      credentialLoginAttempted: true,
+      needsInput: Boolean(refreshed.needsInput),
+      browserRequired: Boolean(refreshed.browserRequired),
     };
   }
   const freeRefreshed = refreshed.source === 'refresh_token';
+  const credentialLogin = refreshed.source === 'email_password_2fa';
   const switched = await switchWorkspace(child, { workspaceId: mother.accountId });
-  if (!switched.ok) return { ok: false, status: switched.status || 502, message: switched.message || 'workspace_token_refresh_failed', freeRefreshed };
+  if (!switched.ok) return { ok: false, status: switched.status || 502, message: switched.message || 'workspace_token_refresh_failed', freeRefreshed, credentialLogin };
 
   const workspaceToken = workspaceTokenFor(child, mother.accountId) || workspaceTokenFor(child, mother.team);
-  if (!workspaceToken?.accessToken) return { ok: false, status: 502, message: 'renewed_workspace_token_missing', freeRefreshed };
+  if (!workspaceToken?.accessToken) return { ok: false, status: 502, message: 'renewed_workspace_token_missing', freeRefreshed, credentialLogin };
   if (childIsWorkspaceOwner(child, mother) || childMatchesKnownTeamOwner(child, mother)) {
     upsertTeamOwnerFromChild(mother, child, mother.accountId, workspaceToken);
   }
-  addHistory('刷新 Team JSON', `${child.email} 的 ${mother.team} 已刷新 OAuth 授权并重新获取 Team Token${freeRefreshed ? '' : '（无 RT，沿用现有 Free AT）'}`);
+  addHistory('刷新 Team JSON', `${child.email} 的 ${mother.team} 已${credentialLogin ? '重新登录生成 Free JSON' : freeRefreshed ? '刷新 OAuth 授权' : '使用现有 Free AT'}并重新获取 Team Token`);
   await persist();
-  return { ok: true, status: 200, message: 'team_token_renewed', freeRefreshed };
+  return { ok: true, status: 200, message: 'team_token_renewed', freeRefreshed, credentialLogin, credentialLoginAttempted: credentialLogin };
 }
 
 async function pushRenewedTeamJson(mother) {
@@ -1505,6 +1514,7 @@ async function checkTeam(motherId) {
   const results = [];
   let renewedTeamTokens = 0;
   let renewedFreeTokens = 0;
+  let reloggedFreeAccounts = 0;
   for (const child of members) {
     const teamOwner = teamOwnerRecords(mother).find((owner) => String(owner.email || '').toLowerCase() === String(child.email || '').toLowerCase());
     const workspaceToken = workspaceTokenFor(child, mother.accountId) || workspaceTokenFor(child, mother.team);
@@ -1516,13 +1526,14 @@ async function checkTeam(motherId) {
       if (tokenRecovery.ok) {
         renewedTeamTokens += 1;
         if (tokenRecovery.freeRefreshed) renewedFreeTokens += 1;
+        if (tokenRecovery.credentialLogin) reloggedFreeAccounts += 1;
         const renewedToken = workspaceTokenFor(child, mother.accountId) || workspaceTokenFor(child, mother.team);
         result = await probeUsage(renewedToken?.accessToken || '', mother.accountId);
       }
     }
     applyQuotaResult(child, result, mother.team, kickWindow);
     const membership = membershipFor(child, mother.team);
-    results.push({ id: child.id, email: child.email, ...result, quotaSource: quotaToken ? 'team' : 'team_token_missing', quota5h: membership?.quota5h ?? null, quota7d: membership?.quota7d ?? null, tokenRecovery: tokenRecovery ? { attempted: true, ok: tokenRecovery.ok, status: tokenRecovery.status, message: tokenRecovery.message, freeRefreshed: tokenRecovery.freeRefreshed } : null });
+    results.push({ id: child.id, email: child.email, ...result, quotaSource: quotaToken ? 'team' : 'team_token_missing', quota5h: membership?.quota5h ?? null, quota7d: membership?.quota7d ?? null, tokenRecovery: tokenRecovery ? { attempted: true, ok: tokenRecovery.ok, status: tokenRecovery.status, code: tokenRecovery.code || null, message: tokenRecovery.message, freeRefreshed: tokenRecovery.freeRefreshed, credentialLogin: Boolean(tokenRecovery.credentialLogin), credentialLoginAttempted: Boolean(tokenRecovery.credentialLoginAttempted), needsInput: Boolean(tokenRecovery.needsInput), browserRequired: Boolean(tokenRecovery.browserRequired) } : null });
   }
   const sub2apiPush = renewedTeamTokens > 0
     ? await pushRenewedTeamJson(mother)
@@ -1533,7 +1544,7 @@ async function checkTeam(motherId) {
   mother.lastCheck = now();
   const renewalDetail = !renewedTeamTokens
     ? ''
-    : `，刷新 ${renewedTeamTokens} 个 Team JSON${sub2apiPush.attempted ? `，Sub2API 推送 ${sub2apiPush.pushed} 个` : '，Sub2API 未推送（未启用或未配置分组）'}`;
+    : `，刷新 ${renewedTeamTokens} 个 Team JSON${reloggedFreeAccounts ? `，重新登录 ${reloggedFreeAccounts} 个 Free 账号` : ''}${sub2apiPush.attempted ? `，Sub2API 推送 ${sub2apiPush.pushed} 个` : '，Sub2API 未推送（未启用或未配置分组）'}`;
   addHistory('额度检测', `${mother.team} 检测 ${members.length} 个子号，席位 ${mother.used ?? '-'} / ${mother.seats ?? '-'}${renewalDetail}`);
   await persist();
   const probesOk = results.every((result) => result.ok === true);
@@ -1551,6 +1562,7 @@ async function checkTeam(motherId) {
     probesOk,
     renewedTeamTokens,
     renewedFreeTokens,
+    reloggedFreeAccounts,
     sub2apiPush,
   };
 }
