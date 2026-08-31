@@ -1,20 +1,26 @@
 import { createHash, createHmac, randomBytes, randomUUID } from 'node:crypto';
 import { accessTokenClaims, decodeJwtPayload } from './openai-auth.mjs';
-import { browserLoginForCallback } from './openai-browser-login.mjs';
+import { fetchSentinelToken } from './openai-sentinel.mjs';
 
 const AUTH_BASE_URL = 'https://auth.openai.com';
 const CHATGPT_BASE_URL = 'https://chatgpt.com';
 const DEFAULT_CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann';
 const DEFAULT_REDIRECT_URI = 'http://localhost:1455/auth/callback';
 const TOKEN_ENDPOINTS = [
-  'https://auth.openai.com/api/oauth/oauth2/token',
   'https://auth.openai.com/oauth/token',
+  'https://auth.openai.com/api/oauth/oauth2/token',
 ];
 const callbackInbox = new Map();
 
 const browserHeaders = {
   'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8',
-  'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+  'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.7922.175 Safari/537.36',
+  'sec-ch-ua': '"Google Chrome";v="151", "Chromium";v="151", "Not.A/Brand";v="24"',
+  'sec-ch-ua-full-version-list': '"Google Chrome";v="151.0.7922.175", "Chromium";v="151.0.7922.175", "Not.A/Brand";v="24.0.0.0"',
+  'sec-ch-ua-mobile': '?0',
+  'sec-ch-ua-platform': '"Windows"',
+  'sec-ch-ua-platform-version': '"15.0.0"',
+  'sec-ch-viewport-width': '"1365"',
 };
 
 export class OpenAiLoginError extends Error {
@@ -123,9 +129,13 @@ function extractCode(value) {
 function createCookieJar(snapshot = {}) {
   const jar = new Map(Object.entries(snapshot || {}).filter(([key, value]) => key && value));
   function absorb(response) {
-    const values = typeof response.headers.getSetCookie === 'function'
+    const rawValues = typeof response.headers.getSetCookie === 'function'
       ? response.headers.getSetCookie()
-      : (response.headers.get('set-cookie') || '').split(/,(?=[^;,]+=)/g);
+      : [response.headers.get('set-cookie') || ''];
+    // A Response reconstructed by the proxy layer can expose all Set-Cookie
+    // fields as one combined value even through getSetCookie(). Split each raw
+    // value again while preserving commas inside Expires attributes.
+    const values = rawValues.flatMap((value) => String(value || '').split(/,(?=[^;,]+=)/g));
     for (const line of values) {
       const pair = String(line || '').split(';', 1)[0];
       const separator = pair.indexOf('=');
@@ -159,18 +169,99 @@ function pageUrl(payload, fallback = '') {
   try { return new URL(next, AUTH_BASE_URL).toString(); } catch { return next; }
 }
 
+function responseErrorCode(payload, body = '') {
+  const candidates = [
+    payload?.error?.code,
+    payload?.error?.type,
+    payload?.code,
+    typeof payload?.error === 'string' ? payload.error : '',
+  ];
+  for (const candidate of candidates) {
+    const value = string(candidate).toLowerCase();
+    if (/^[a-z0-9_.-]{1,80}$/.test(value)) return value;
+  }
+  const text = string(body).toLowerCase();
+  if (text.includes('invalid_state')) return 'invalid_state';
+  if (text.includes('sign-in session is no longer valid')) return 'signin_session_invalid';
+  return '';
+}
+
 function classifyChallenge(url, body = '', status = 0) {
+  let path = '';
+  try { path = new URL(url, AUTH_BASE_URL).pathname.toLowerCase(); } catch { path = string(url).toLowerCase(); }
+  if (/\/mfa|two-factor|two_factor|totp|authenticator|one-time-password/.test(path)) return 'totp_required';
+  if (/email-verification|email_otp|passwordless/.test(path)) return 'email_otp_required';
+  if (status < 400) return '';
   const value = `${url} ${body}`.toLowerCase();
-  if (status === 403 || /turnstile|captcha|sentinel|unsupported_country|country_region/.test(value)) return 'browser_verification_required';
+  if (status === 403 || /turnstile|captcha|unsupported_country|country_region/.test(value)) return 'protocol_verification_required';
   if (/mfa|two-factor|two_factor|totp|authenticator|one-time-password/.test(value)) return 'totp_required';
   if (/email-verification|email_otp|passwordless/.test(value)) return 'email_otp_required';
   return '';
 }
 
-function workspaceIdFromCookie(value) {
+function sentinelHash(input) {
+  let hash = 2166136261;
+  for (let index = 0; index < input.length; index += 1) {
+    hash ^= input.charCodeAt(index);
+    hash = Math.imul(hash, 16777619) >>> 0;
+  }
+  hash ^= hash >>> 16;
+  hash = Math.imul(hash, 2246822507) >>> 0;
+  hash ^= hash >>> 13;
+  hash = Math.imul(hash, 3266489909) >>> 0;
+  hash ^= hash >>> 16;
+  return (hash >>> 0).toString(16).padStart(8, '0');
+}
+
+async function sentinelAnswer(seed, difficulty) {
+  const started = Date.now();
+  const data = [
+    3000,
+    new Date().toString(),
+    4294705152,
+    0,
+    browserHeaders['user-agent'],
+    'https://sentinel.openai.com/sentinel/20260219f9f6/sdk.js',
+    '20260219f9f6',
+    'zh-CN',
+    'zh-CN,zh,en',
+    0,
+    `userAgent=${browserHeaders['user-agent']}`,
+    'location',
+    'navigator',
+    0,
+    randomUUID(),
+    'sv',
+    8,
+    Date.now(),
+    0, 1, 1, 0, 0, 0, 1,
+  ];
+  for (let attempt = 0; attempt < 500000; attempt += 1) {
+    data[3] = attempt;
+    data[9] = Date.now() - started;
+    const encoded = Buffer.from(JSON.stringify(data), 'utf8').toString('base64');
+    if (sentinelHash(`${seed}${encoded}`).slice(0, difficulty.length) <= difficulty) return `${encoded}~S`;
+    if ((attempt + 1) % 5000 === 0) await Promise.resolve();
+  }
+  throw new OpenAiLoginError('sentinel_proof_failed', 'Sentinel proof 计算失败', 502);
+}
+
+function isProtocolAuthPage(url) {
+  return ['/log-in', '/log-in/password', '/email-verification', '/mfa', '/two-factor', '/totp', '/authenticator', '/one-time-password', '/workspace', '/sign-in-with-chatgpt/codex/consent']
+    .some((step) => authStep(url, step));
+}
+
+function workspaceIdFromCookie(value, preferredId = '', mode = 'free') {
   const decoded = decodeJsonPart(string(value).split('.')[0]);
   if (!decoded || typeof decoded !== 'object') return '';
   const workspaces = Array.isArray(decoded.workspaces) ? decoded.workspaces : [];
+  const preferred = string(preferredId);
+  if (preferred) {
+    const matched = workspaces.find((item) => string(item?.id) === preferred);
+    if (matched) return preferred;
+    if (mode === 'team') return '';
+  }
+  if (mode === 'team') return string(workspaces.find((item) => item?.kind !== 'personal')?.id);
   return string(workspaces.find((item) => item?.kind === 'personal')?.id || workspaces[0]?.id);
 }
 
@@ -232,8 +323,10 @@ class LoginRunner {
     this.mailboxUrl = string(options.mailboxUrl);
     this.verificationCode = string(options.verificationCode);
     this.callbackUrl = string(options.callbackUrl);
-    this.accountId = string(options.accountId);
+    this.accountId = string(options.workspaceId || options.accountId);
+    this.workspaceMode = options.workspaceMode === 'team' ? 'team' : 'free';
     this.requestFetch = options.fetch || fetch;
+    this.sentinelProxy = options.sentinelProxy || options.browserProxy || null;
     this.mailboxHeaders = options.mailboxHeaders && typeof options.mailboxHeaders === 'object' ? options.mailboxHeaders : {};
     this.timeoutMs = Number(options.timeoutMs) || 15000;
     this.onProgress = typeof options.onProgress === 'function' ? options.onProgress : () => {};
@@ -286,9 +379,38 @@ class LoginRunner {
       prompt: 'login',
       id_token_add_organizations: 'true',
       codex_cli_simplified_flow: 'true',
-      login_hint: this.email,
     });
     return `${AUTH_BASE_URL}/oauth/authorize?${query.toString()}`;
+  }
+
+  async startAuthorization({ fresh = false } = {}) {
+    if (fresh) {
+      this.session.state = '';
+      this.session.codeVerifier = '';
+      this.session.currentUrl = '';
+      this.session.cookies = {};
+      this.session.baselineMailbox = null;
+      this.callbackUrl = '';
+      this.jar = createCookieJar();
+    }
+    let current = this.authorizeUrl();
+    for (let hop = 0; hop < 8; hop += 1) {
+      if (isCallback(current)) return current;
+      const result = await this.request(current, {
+        headers: {
+          accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          'accept-encoding': 'gzip, deflate, br',
+          'sec-fetch-dest': 'document',
+          'sec-fetch-mode': 'navigate',
+          'sec-fetch-site': hop === 0 ? 'none' : 'same-origin',
+        },
+      });
+      this.session.deviceId = this.jar.get('oai-did') || this.session.deviceId;
+      if (result.status >= 400) throw new OpenAiLoginError('oauth_start_failed', `OAuth 会话创建失败（HTTP ${result.status}）`, result.status);
+      if (!result.location) return current;
+      current = result.location;
+    }
+    throw new OpenAiLoginError('oauth_start_redirects_exceeded', 'OAuth 入口重定向次数过多', 502);
   }
 
   async mailboxCode() {
@@ -312,16 +434,75 @@ class LoginRunner {
 
   async sendAuthorizeContinue() {
     this.progress('authenticating', '正在提交登录邮箱');
+    const sentinelToken = await this.sentinelToken('authorize_continue');
     const result = await this.request(`${AUTH_BASE_URL}/api/accounts/authorize/continue`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json', origin: AUTH_BASE_URL, referer: `${AUTH_BASE_URL}/log-in` },
+      headers: { accept: 'application/json', 'content-type': 'application/json', 'openai-sentinel-token': sentinelToken, origin: AUTH_BASE_URL, referer: `${AUTH_BASE_URL}/log-in-or-create-account?usernameKind=email`, 'sec-fetch-dest': 'empty', 'sec-fetch-mode': 'cors', 'sec-fetch-site': 'same-origin' },
       body: { username: { kind: 'email', value: this.email } },
     });
     if (!result.ok) {
+      const remoteCode = responseErrorCode(result.payload, result.text);
+      if (result.status === 409 || remoteCode === 'invalid_state' || remoteCode === 'signin_session_invalid') {
+        throw new OpenAiLoginError('authorize_state_invalid', 'OAuth 登录会话已失效', 409);
+      }
       const challenge = classifyChallenge(result.location || '', result.text, result.status);
       throw new OpenAiLoginError(challenge || 'authorize_failed', challenge ? '登录需要浏览器验证' : '登录邮箱提交失败', result.status || 502, { browserRequired: Boolean(challenge) });
     }
     return pageUrl(result.payload, result.location || `${AUTH_BASE_URL}/email-verification`);
+  }
+
+  async sentinelToken(flow) {
+    this.progress('authenticating', `正在后台完成 ${flow} 协议验证`);
+    let browserError = null;
+    try {
+      return await fetchSentinelToken({
+        flow,
+        deviceId: this.session.deviceId,
+        userAgent: browserHeaders['user-agent'],
+        proxy: this.sentinelProxy,
+        timeoutMs: Math.max(20000, this.timeoutMs),
+      });
+    } catch (error) {
+      browserError = error;
+    }
+    const seed = `${Date.now() / 1000}:${randomBytes(8).toString('hex')}`;
+    const requirementProof = `gAAAAAC${await sentinelAnswer(seed, '0')}`;
+    const response = await this.requestFetch('https://sentinel.openai.com/backend-api/sentinel/req', {
+      method: 'POST',
+      headers: { accept: 'application/json', 'content-type': 'application/json', 'user-agent': browserHeaders['user-agent'] },
+      body: JSON.stringify({ p: requirementProof, id: this.session.deviceId, flow }),
+      signal: AbortSignal.timeout(this.timeoutMs),
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new OpenAiLoginError('sentinel_requirements_failed', `Sentinel requirements 请求失败（HTTP ${response.status}）`, response.status || 502);
+    if (payload.turnstile?.dx) {
+      const reason = browserError?.message === 'sentinel_browser_unavailable'
+        ? '未找到后台浏览器运行环境'
+        : browserError?.message === 'sentinel_socks_auth_unsupported'
+          ? '后台浏览器不支持带认证的 SOCKS 代理'
+          : '后台 Sentinel 验证未通过';
+      throw new OpenAiLoginError('sentinel_verification_failed', `${reason}，无法生成 Turnstile 令牌`, 502);
+    }
+    let proof = null;
+    if (payload.proofofwork?.required && payload.proofofwork.seed && payload.proofofwork.difficulty) {
+      proof = `gAAAAAB${await sentinelAnswer(String(payload.proofofwork.seed), String(payload.proofofwork.difficulty))}`;
+    }
+    return JSON.stringify({ p: proof, t: null, c: string(payload.token), id: this.session.deviceId, flow });
+  }
+
+  async verifyPassword() {
+    this.progress('authenticating', '正在校验账号密码');
+    const sentinelToken = await this.sentinelToken('password_verify');
+    const result = await this.request(`${AUTH_BASE_URL}/api/accounts/password/verify`, {
+      method: 'POST',
+      headers: { accept: 'application/json', 'content-type': 'application/json', 'openai-sentinel-token': sentinelToken, origin: AUTH_BASE_URL, referer: `${AUTH_BASE_URL}/log-in/password`, 'sec-fetch-dest': 'empty', 'sec-fetch-mode': 'cors', 'sec-fetch-site': 'same-origin' },
+      body: { password: this.password },
+    });
+    if (!result.ok) {
+      const challenge = classifyChallenge(result.location || '', result.text, result.status);
+      throw new OpenAiLoginError(challenge || 'password_invalid', challenge ? '密码登录触发协议验证' : '账号密码校验失败', result.status || 400, { needsInput: Boolean(challenge) });
+    }
+    return pageUrl(result.payload, result.location);
   }
 
   async sendPasswordlessOtp() {
@@ -349,30 +530,32 @@ class LoginRunner {
 
   async validateTotp(url) {
     if (!this.totp) throw new OpenAiLoginError('totp_required', '登录需要 2FA 验证码，请补充 2FA Secret', 202, { needsInput: true });
-    const code = generateTotp(this.totp);
-    const candidates = [
-      url,
-      `${AUTH_BASE_URL}/api/accounts/mfa/validate`,
-      `${AUTH_BASE_URL}/api/accounts/totp/validate`,
-      `${AUTH_BASE_URL}/api/accounts/otp/validate`,
-    ].filter((item, index, list) => item && list.indexOf(item) === index);
-    let last = null;
-    for (const endpoint of candidates) {
-      const result = await this.request(endpoint, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json', origin: AUTH_BASE_URL, referer: url || `${AUTH_BASE_URL}/log-in` },
-        body: { code, otp: code, totp: code, token: code },
-      });
-      if (result.ok) return pageUrl(result.payload, result.location);
-      last = result;
-      if (result.status !== 404 && result.status !== 405) break;
+    let challengeId = '';
+    try {
+      const path = new URL(url, AUTH_BASE_URL).pathname;
+      challengeId = string(path.match(/^\/mfa-challenge\/([^/]+)/i)?.[1]);
+    } catch {
+      challengeId = '';
     }
-    throw new OpenAiLoginError('totp_invalid', last?.status === 403 ? '2FA 验证需要浏览器确认' : '2FA 验证失败', last?.status || 400, { browserRequired: last?.status === 403 });
+    if (!challengeId) throw new OpenAiLoginError('totp_challenge_invalid', '2FA challenge ID 缺失', 502);
+    const code = generateTotp(this.totp);
+    const result = await this.request(`${AUTH_BASE_URL}/api/accounts/mfa/verify`, {
+      method: 'POST',
+      headers: { accept: 'application/json', 'content-type': 'application/json', origin: AUTH_BASE_URL, referer: url, 'sec-fetch-dest': 'empty', 'sec-fetch-mode': 'cors', 'sec-fetch-site': 'same-origin' },
+      body: { id: challengeId, type: 'totp', code },
+    });
+    if (result.ok) return pageUrl(result.payload, result.location || url);
+    throw new OpenAiLoginError('totp_invalid', '2FA 验证失败', result.status || 400);
   }
 
   async selectWorkspace(url) {
-    const workspaceId = workspaceIdFromCookie(this.jar.get('oai-client-auth-session')) || this.accountId;
-    if (!workspaceId) throw new OpenAiLoginError('workspace_required', '登录会话没有可选择的空间', 202, { needsInput: true });
+    const workspaceId = workspaceIdFromCookie(this.jar.get('oai-client-auth-session'), this.accountId, this.workspaceMode);
+    if (!workspaceId) {
+      const message = this.workspaceMode === 'team' && this.accountId
+        ? '登录账号不属于目标 Team 空间'
+        : '登录会话没有可选择的空间';
+      throw new OpenAiLoginError('workspace_required', message, 409);
+    }
     const result = await this.request(`${AUTH_BASE_URL}/api/accounts/workspace/select`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', origin: AUTH_BASE_URL, referer: url || `${AUTH_BASE_URL}/sign-in-with-chatgpt/codex/consent` },
@@ -388,9 +571,10 @@ class LoginRunner {
       if (isCallback(current)) return current;
       const result = await this.request(current, { headers: { accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', referer: `${AUTH_BASE_URL}/` } });
       const challenge = classifyChallenge(current, result.text, result.status);
-      if (challenge) throw new OpenAiLoginError(challenge, '登录需要浏览器验证', result.status || 202, { browserRequired: true });
+      if (challenge) throw new OpenAiLoginError(challenge, '协议登录触发额外验证', result.status || 202, { needsInput: true });
       if (result.location) { current = result.location; continue; }
       if (result.status >= 400) throw new OpenAiLoginError('oauth_redirect_failed', 'OAuth 授权跳转失败', result.status);
+      if (isProtocolAuthPage(current)) return current;
       break;
     }
     throw new OpenAiLoginError('oauth_callback_missing', '未能取得 OAuth 回调地址', 502);
@@ -406,7 +590,7 @@ class LoginRunner {
     let last = null;
     for (const endpoint of TOKEN_ENDPOINTS) {
       const body = new URLSearchParams({ grant_type: 'authorization_code', client_id: DEFAULT_CLIENT_ID, code, redirect_uri: DEFAULT_REDIRECT_URI, code_verifier: this.session.codeVerifier });
-      const result = await this.request(endpoint, { method: 'POST', headers: { accept: 'application/json', 'content-type': 'application/x-www-form-urlencoded', referer: DEFAULT_REDIRECT_URI }, body });
+      const result = await this.request(endpoint, { method: 'POST', headers: { accept: 'application/json', 'content-type': 'application/x-www-form-urlencoded', 'user-agent': 'codex-cli/0.91.0' }, body });
       if (result.ok) {
         const accessToken = string(result.payload.access_token || result.payload.accessToken);
         const refreshToken = string(result.payload.refresh_token || result.payload.refreshToken);
@@ -437,22 +621,27 @@ class LoginRunner {
       let current = this.callbackUrl || this.session.currentUrl;
       if (!current) {
         this.progress('initializing', '正在创建 OpenAI 登录会话');
-        const start = await this.request(this.authorizeUrl(), { headers: { accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', referer: `${CHATGPT_BASE_URL}/` } });
-        current = start.location || this.authorizeUrl();
+        current = await this.startAuthorization();
         this.session.currentUrl = current;
       }
       if (this.callbackUrl) return await this.exchangeCode(current);
+      let authRecoveryCount = 0;
       for (let step = 0; step < 10; step += 1) {
         this.session.currentUrl = current;
         if (isCallback(current)) return await this.exchangeCode(current);
         if (authStep(current, '/log-in') && !authStep(current, '/log-in/password')) {
-          current = await this.sendAuthorizeContinue();
+          try {
+            current = await this.sendAuthorizeContinue();
+          } catch (error) {
+            if (error?.code !== 'authorize_state_invalid' || authRecoveryCount >= 2) throw error;
+            authRecoveryCount += 1;
+            this.progress('initializing', `OAuth 会话已失效，正在重新建立协议会话（${authRecoveryCount}/2）`);
+            current = await this.startAuthorization({ fresh: true });
+          }
           continue;
         }
         if (authStep(current, '/log-in/password')) {
-          // OpenAI's current email flow deliberately upgrades the password page
-          // to passwordless OTP; the password remains stored for future flows.
-          current = await this.sendPasswordlessOtp();
+          current = await this.verifyPassword();
           continue;
         }
         if (authStep(current, '/email-verification')) {
@@ -465,16 +654,16 @@ class LoginRunner {
           current = await this.validateTotp(current);
           continue;
         }
-        if (authStep(current, '/sign-in-with-chatgpt/codex/consent')) {
+        if (authStep(current, '/workspace') || authStep(current, '/sign-in-with-chatgpt/codex/consent')) {
           current = await this.selectWorkspace(current);
           continue;
         }
-        if (authStep(current, '/add-phone')) throw new OpenAiLoginError('browser_verification_required', '此账号需要浏览器完成额外验证', 202, { browserRequired: true });
+        if (authStep(current, '/add-phone')) throw new OpenAiLoginError('protocol_verification_required', '此账号需要额外验证，纯协议无法继续', 202, { needsInput: true });
         if (current.startsWith(AUTH_BASE_URL)) {
           current = await this.followToCallback(current);
           continue;
         }
-        throw new OpenAiLoginError('auth_step_unknown', '登录停在未识别的验证页面', 202, { browserRequired: true });
+        throw new OpenAiLoginError('auth_step_unknown', '登录停在未识别的协议步骤', 202, { needsInput: true });
       }
       throw new OpenAiLoginError('auth_steps_exceeded', '登录步骤过多，已暂停本次操作', 502);
     } catch (error) {
@@ -494,39 +683,13 @@ export async function loginFreeAccount(options = {}) {
     const token = await runner.run();
     return { ok: true, status: 200, code: 'ready', stage: 'ready', ...token, session: publicSession(runner.session) };
   } catch (error) {
-    if (error instanceof OpenAiLoginError && error.browserRequired && options.browserFallback !== false) {
-      await runner.captureMailboxBaseline();
-      const browserResult = await browserLoginForCallback({
-        authUrl: runner.authorizeUrl(),
-        email: runner.email,
-        password: runner.password,
-        proxy: options.browserProxy,
-        timeoutMs: Math.max(15000, Number(options.timeoutMs) || 15000),
-        totalTimeoutMs: Math.max(60000, Number(options.browserTimeoutMs) || 120000),
-        totpCode: () => generateTotp(runner.totp),
-        emailOtp: async () => {
-          try { return await runner.mailboxCode(); } catch { return ''; }
-        },
-        onProgress: runner.onProgress,
-      });
-      if (browserResult.ok && browserResult.callbackUrl) {
-        try {
-          const token = await runner.exchangeCode(browserResult.callbackUrl);
-          return { ok: true, status: 200, code: 'ready', stage: 'ready', ...token, session: publicSession(runner.session) };
-        } catch (exchangeError) {
-          error = exchangeError;
-        }
-      } else {
-        error = new OpenAiLoginError(browserResult.code || 'browser_login_failed', browserResult.message || '浏览器登录失败', browserResult.code === 'email_otp_required' || browserResult.code === 'totp_required' ? 202 : 502, { browserRequired: true, needsInput: browserResult.code === 'email_otp_required' || browserResult.code === 'totp_required' });
-      }
-    }
     return {
       ok: false,
       status: error.status || 502,
       code: error.code || 'login_failed',
       message: error.message || '登录失败',
       stage: runner.phase,
-      browserRequired: Boolean(error.browserRequired),
+      browserRequired: false,
       needsInput: Boolean(error.needsInput),
       authUrl: runner.authorizeUrl(),
       session: publicSession(runner.session),

@@ -147,6 +147,78 @@ function workspaceTokenFor(child, workspaceId) {
   const accessToken = String(stored?.accessToken || legacy || '').trim();
   return accessToken ? { ...stored, accessToken } : null;
 }
+
+function teamTokenDetails(accessToken, workspaceId) {
+  const token = String(accessToken || '').trim();
+  const target = String(workspaceId || '').trim();
+  if (!token || !target) return null;
+  const claims = accessTokenClaims(token);
+  if (claims.accountId !== target) return null;
+  const expiresAt = Date.parse(claims.expiresAt || '');
+  if (Number.isFinite(expiresAt) && expiresAt <= Date.now() + 30_000) return null;
+  return { accessToken: token, claims };
+}
+
+function teamManagerContexts(mother) {
+  const workspaceId = String(mother?.accountId || mother?.team || '').trim();
+  if (!mother || !workspaceId) return [];
+  const candidates = [
+    { ...mother, source: 'team_primary' },
+    ...(Array.isArray(mother.ownerAccounts) ? mother.ownerAccounts.map((owner) => ({ ...owner, source: 'team_owner' })) : []),
+  ];
+  for (const child of state.children) {
+    if (!isChildMemberOfTeam(child, mother.team) || (!childIsWorkspaceOwner(child, mother) && !childMatchesKnownTeamOwner(child, mother))) continue;
+    const workspaceToken = workspaceTokenFor(child, workspaceId);
+    if (!workspaceToken?.accessToken) continue;
+    candidates.push({
+      accessToken: workspaceToken.accessToken,
+      expiresAt: workspaceToken.expiresAt,
+      email: child.email,
+      deviceId: child.deviceId,
+      cookie: child.cookie,
+      source: 'free_account_team_owner',
+    });
+  }
+  const usable = candidates.flatMap((candidate) => {
+    const details = teamTokenDetails(candidate.accessToken, workspaceId);
+    return details ? [{ ...candidate, ...details }] : [];
+  });
+  usable.sort((left, right) => Date.parse(right.claims.expiresAt || '') - Date.parse(left.claims.expiresAt || ''));
+  return usable.map((selected) => ({
+    ...mother,
+    accessToken: selected.accessToken,
+    deviceId: selected.deviceId || mother.deviceId,
+    cookie: selected.cookie || mother.cookie,
+    managerSource: selected.source,
+    managerEmail: selected.email || mother.email || '',
+  }));
+}
+
+function teamManagerContext(mother) {
+  return teamManagerContexts(mother)[0] || null;
+}
+
+function teamHasManagementPath(mother) {
+  if (!mother?.accountId) return false;
+  if (teamManagerContext(mother)) return true;
+  if (mother.accessToken || (mother.ownerAccounts || []).some((owner) => owner?.accessToken)) return true;
+  return state.children.some((child) => (
+    isChildMemberOfTeam(child, mother.team)
+    && (childIsWorkspaceOwner(child, mother) || childMatchesKnownTeamOwner(child, mother))
+    && Boolean(child.accessToken || child.refreshToken || (child.email && child.password))
+  ));
+}
+
+async function withTeamManager(mother, operation) {
+  const managers = teamManagerContexts(mother);
+  if (!managers.length) return { manager: null, result: null };
+  let attempted = null;
+  for (const manager of managers) {
+    attempted = { manager, result: await operation(manager) };
+    if (attempted.result?.status !== 401 && attempted.result?.status !== 403) return attempted;
+  }
+  return attempted;
+}
 function saveWorkspaceToken(child, workspaceId, accessToken, claims = {}) {
   if (!child || !workspaceId || !accessToken) return null;
   if (!child.workspaceTokens || typeof child.workspaceTokens !== 'object' || Array.isArray(child.workspaceTokens)) child.workspaceTokens = {};
@@ -957,12 +1029,14 @@ async function queryWorkspaceMembersPage(mother, { offset = 0, limit = 25, query
   const params = new URLSearchParams({ offset: String(safeOffset), limit: String(safeLimit), query: String(query || '') });
   const accountId = encodeURIComponent(mother.accountId);
   const requestPath = `/backend-api/accounts/${accountId}/users?${params}`;
-  const result = await fetchChatGptJson(mother.accessToken, requestPath, {
+  const attempted = await withTeamManager(mother, (manager) => fetchChatGptJson(manager.accessToken, requestPath, {
     accountId: mother.accountId,
     targetPath: `/backend-api/accounts/${mother.accountId}/users`,
     targetRoute: '/backend-api/accounts/{account_id}/users',
-    headers: { ...(mother.deviceId ? { 'oai-device-id': mother.deviceId } : {}), ...(mother.cookie ? { cookie: mother.cookie } : {}) },
-  });
+    headers: { ...(manager.deviceId ? { 'oai-device-id': manager.deviceId } : {}), ...(manager.cookie ? { cookie: manager.cookie } : {}) },
+  }));
+  if (!attempted?.result) return { ok: false, status: 401, message: 'workspace_owner_token_required', items: [], total: 0, offset: safeOffset, limit: safeLimit };
+  const result = attempted.result;
   const record = result.payload && typeof result.payload === 'object' ? result.payload : {};
   const items = Array.isArray(record.items) ? record.items.map(normalizeMember).filter((item) => item.id || item.email) : [];
   return { ...result, accountId: mother.accountId, items, total: Number.isFinite(Number(record.total)) ? Number(record.total) : items.length, offset: Number(record.offset ?? safeOffset), limit: Number(record.limit ?? safeLimit) };
@@ -990,12 +1064,14 @@ async function queryWorkspaceSubscription(mother) {
   if (!mother?.accountId) return { ok: false, status: 400, message: 'workspace_id_required', subscription: null };
   const accountId = encodeURIComponent(mother.accountId);
   const requestPath = `/backend-api/subscriptions?account_id=${accountId}`;
-  const result = await fetchChatGptJson(mother.accessToken, requestPath, {
+  const attempted = await withTeamManager(mother, (manager) => fetchChatGptJson(manager.accessToken, requestPath, {
     accountId: mother.accountId,
     targetPath: '/backend-api/subscriptions',
     targetRoute: '/backend-api/subscriptions',
-    headers: { ...(mother.deviceId ? { 'oai-device-id': mother.deviceId } : {}), ...(mother.cookie ? { cookie: mother.cookie } : {}) },
-  });
+    headers: { ...(manager.deviceId ? { 'oai-device-id': manager.deviceId } : {}), ...(manager.cookie ? { cookie: manager.cookie } : {}) },
+  }));
+  if (!attempted?.result) return { ok: false, status: 401, message: 'workspace_owner_token_required', subscription: null };
+  const result = attempted.result;
   return { ...result, accountId: mother.accountId, subscription: result.ok ? normalizeSubscription(result.payload, mother.accountId) : null };
 }
 
@@ -1042,24 +1118,26 @@ async function syncMotherWorkspace(mother, { query = '', force = false } = {}) {
 }
 
 async function removeWorkspaceMember(mother, member) {
-  if (!mother?.accessToken || !mother?.accountId || !member?.id) return { ok: false, status: 400, message: 'workspace_member_credentials_required' };
+  if (!mother?.accountId || !member?.id) return { ok: false, status: 400, message: 'workspace_member_credentials_required' };
   const accountId = encodeURIComponent(mother.accountId);
   const memberId = encodeURIComponent(member.id);
-  const result = await fetchChatGptJson(mother.accessToken, `/backend-api/accounts/${accountId}/users/${memberId}`, {
+  const attempted = await withTeamManager(mother, (manager) => fetchChatGptJson(manager.accessToken, `/backend-api/accounts/${accountId}/users/${memberId}`, {
     method: 'DELETE',
     accountId: mother.accountId,
     targetPath: `/backend-api/accounts/${mother.accountId}/users/${member.id}`,
     targetRoute: '/backend-api/accounts/{account_id}/users/{user_id}',
-    headers: { ...(mother.deviceId ? { 'oai-device-id': mother.deviceId } : {}), ...(mother.cookie ? { cookie: mother.cookie } : {}) },
-  });
+    headers: { ...(manager.deviceId ? { 'oai-device-id': manager.deviceId } : {}), ...(manager.cookie ? { cookie: manager.cookie } : {}) },
+  }));
+  if (!attempted?.result) return { ok: false, status: 401, message: 'workspace_owner_token_required' };
+  const result = attempted.result;
   return { ok: result.ok && result.payload?.success !== false, status: result.status, message: result.message, payload: result.payload };
 }
 
 async function setWorkspaceMemberRole(mother, workspaceId, memberId, role = 'account-owner') {
-  if (!mother?.accessToken || !workspaceId || !memberId) return { ok: false, status: 400, message: 'workspace_member_credentials_required' };
+  if (!workspaceId || !memberId) return { ok: false, status: 400, message: 'workspace_member_credentials_required' };
   const accountId = encodeURIComponent(workspaceId);
   const userId = encodeURIComponent(memberId);
-  const result = await fetchChatGptJson(mother.accessToken, `/backend-api/accounts/${accountId}/users/${userId}`, {
+  const attempted = await withTeamManager(mother, (manager) => fetchChatGptJson(manager.accessToken, `/backend-api/accounts/${accountId}/users/${userId}`, {
     method: 'PATCH',
     accountId: workspaceId,
     targetPath: `/backend-api/accounts/${workspaceId}/users/${memberId}`,
@@ -1068,10 +1146,12 @@ async function setWorkspaceMemberRole(mother, workspaceId, memberId, role = 'acc
     headers: {
       'content-type': 'application/json',
       'x-openai-account-user-update-source': 'web_members_table',
-      ...(mother.deviceId ? { 'oai-device-id': mother.deviceId } : {}),
-      ...(mother.cookie ? { cookie: mother.cookie } : {}),
+      ...(manager.deviceId ? { 'oai-device-id': manager.deviceId } : {}),
+      ...(manager.cookie ? { cookie: manager.cookie } : {}),
     },
-  });
+  }));
+  if (!attempted?.result) return { ok: false, status: 401, message: 'workspace_owner_token_required' };
+  const result = attempted.result;
   return { ok: result.ok && result.payload?.success !== false, status: result.status, message: result.message, payload: result.payload };
 }
 
@@ -1192,7 +1272,8 @@ function removeTeamOwnerForChild(mother, child) {
 }
 
 async function probeMother(mother) {
-  const result = await probeUsage(mother.accessToken, mother.accountId);
+  const attempted = await withTeamManager(mother, (manager) => probeUsage(manager.accessToken, mother.accountId));
+  const result = attempted?.result || await probeUsage('', mother.accountId);
   mother.lastCheck = now();
   mother.lastProbe = result;
   mother.status = result.ok ? 'online' : result.message === 'missing_token' ? 'unconfigured' : 'offline';
@@ -1402,13 +1483,13 @@ async function acquireChildAuth(child, { refresh = false, verificationCode = '',
   const mailboxHeaders = mailboxConfig.apiKey
     ? { authorization: `Bearer ${mailboxConfig.apiKey}`, 'x-api-key': mailboxConfig.apiKey }
     : {};
-  const browserProxyEntry = state.settings?.proxy?.enabled
+  const sentinelProxyEntry = state.settings?.proxy?.enabled
     ? (state.settings.proxy.entries || []).find((entry) => entry?.url)
     : null;
-  const browserProxy = browserProxyEntry ? {
-    server: `${browserProxyEntry.protocol || 'http'}://${browserProxyEntry.host}:${browserProxyEntry.port}`,
-    username: browserProxyEntry.username || '',
-    password: browserProxyEntry.password || '',
+  const sentinelProxy = sentinelProxyEntry ? {
+    server: `${sentinelProxyEntry.protocol || 'http'}://${sentinelProxyEntry.host}:${sentinelProxyEntry.port}`,
+    username: sentinelProxyEntry.username || '',
+    password: sentinelProxyEntry.password || '',
   } : null;
   const login = await loginFreeAccount({
     email: child.email,
@@ -1416,7 +1497,7 @@ async function acquireChildAuth(child, { refresh = false, verificationCode = '',
     totp: child.totp || child.secret,
     mailboxUrl,
     mailboxHeaders,
-    browserProxy,
+    sentinelProxy,
     verificationCode,
     callbackUrl: callbackUrl || consumeOAuthCallback(child.authSession?.state),
     session: child.authSession,
@@ -1458,6 +1539,19 @@ function canAutoPushRenewedTeamJson() {
 
 async function renewUnauthorizedTeamToken(mother, child) {
   if (!mother?.accountId || !child) return { ok: false, status: 400, message: 'workspace_id_or_child_missing', freeRefreshed: false };
+  // A Free AT can remain valid after its previously exchanged Team AT expires.
+  // Re-exchange it before rotating OAuth credentials or performing a full login.
+  if (child.accessToken) {
+    const exchanged = await switchWorkspace(child, { workspaceId: mother.accountId });
+    if (exchanged.ok) {
+      addHistory('刷新 Team JSON', `${child.email} 已使用现有 Free AT 重新获取 Team Token`);
+      await persist();
+      return { ok: true, status: 200, message: 'team_token_reexchanged', freeRefreshed: false, credentialLogin: false, reusedFreeToken: true };
+    }
+    if (exchanged.status && exchanged.status !== 401) {
+      return { ok: false, status: exchanged.status, message: exchanged.message || 'workspace_token_refresh_failed', freeRefreshed: false, credentialLogin: false };
+    }
+  }
   // Recover the Free OAuth session first. A Team AT is derived from that
   // session, so exchanging it before the OAuth refresh can reproduce a 401.
   // When the RT is invalid, stored email/password/2FA credentials are the
@@ -1518,7 +1612,8 @@ async function checkTeam(motherId) {
   for (const child of members) {
     const teamOwner = teamOwnerRecords(mother).find((owner) => String(owner.email || '').toLowerCase() === String(child.email || '').toLowerCase());
     const workspaceToken = workspaceTokenFor(child, mother.accountId) || workspaceTokenFor(child, mother.team);
-    const quotaToken = teamOwner?.accessToken || workspaceToken?.accessToken || '';
+    const importedOwnerToken = teamTokenDetails(teamOwner?.accessToken, mother.accountId)?.accessToken || '';
+    const quotaToken = workspaceToken?.accessToken || importedOwnerToken;
     let result = await probeUsage(quotaToken, mother.accountId);
     let tokenRecovery = null;
     if (result.status === 401) {
@@ -1568,7 +1663,7 @@ async function checkTeam(motherId) {
 }
 
 async function checkAllTeams() {
-  const configured = state.mothers.filter((mother) => mother.accessToken && mother.accountId);
+  const configured = state.mothers.filter(teamHasManagementPath);
   const teams = [];
   for (const mother of configured) {
     try {
@@ -1671,7 +1766,7 @@ async function refillTeam(motherId) {
       break;
     }
     const member = (mother.members || []).find((item) => item.email && child.email && item.email.toLowerCase() === child.email.toLowerCase());
-    if (!mother.accessToken || !mother.accountId) {
+    if (!teamManagerContext(mother) || !mother.accountId) {
       kickFailures.push({ id: child.id, email: child.email, ok: false, status: 400, message: 'workspace_credentials_required' });
       continue;
     }
@@ -1722,7 +1817,7 @@ async function refillTeam(motherId) {
   const joined = [];
   const joinFailures = [...ownerRoleRetryFailures, ...workspaceTokenRetryFailures];
   for (const child of candidates) {
-    if (!mother.accessToken || !mother.accountId) { joinFailures.push({ id: child.id, email: child.email, ok: false, status: 400, message: 'workspace_credentials_required' }); continue; }
+    if (!teamManagerContext(mother) || !mother.accountId) { joinFailures.push({ id: child.id, email: child.email, ok: false, status: 400, message: 'workspace_credentials_required' }); continue; }
     const membership = membershipFor(child, mother.team, true);
     const remote = await joinWorkspace(child, { motherId, workspaceId: mother.accountId, approve: true });
     if (!remote.ok) {
@@ -1777,7 +1872,7 @@ async function refillTeam(motherId) {
 }
 
 async function refillAllTeams() {
-  const configured = state.mothers.filter((mother) => mother.accessToken && mother.accountId);
+  const configured = state.mothers.filter(teamHasManagementPath);
   const teams = [];
   for (const mother of configured) {
     try {
@@ -1804,7 +1899,7 @@ async function runMaintenanceCycle() {
   maintenanceRunning = true;
   try {
     for (const mother of state.mothers) {
-      if (!mother.accessToken || !mother.accountId) continue;
+      if (!teamHasManagementPath(mother)) continue;
       try {
         const checked = await checkTeam(mother.id);
         if (checked.ok && state.settings.kickOnExhausted !== false) await refillTeam(mother.id);
@@ -1831,7 +1926,7 @@ function configureMaintenanceTimer() {
 async function joinWorkspace(child, body) {
   const mother = findMother(body.motherId);
   if (!child || !mother) return { ok: false, status: 404, message: 'account_not_found' };
-  if (!child.accessToken || !mother.accessToken || !body.workspaceId) return { ok: false, status: 400, message: 'workspace_id_and_tokens_required' };
+  if (!child.accessToken || !body.workspaceId || (body.approve !== false && !teamManagerContext(mother))) return { ok: false, status: 400, message: 'workspace_id_and_tokens_required' };
   const workspaceId = encodeURIComponent(body.workspaceId);
   const requestResult = await fetchChatGptJson(child.accessToken, `/backend-api/accounts/${workspaceId}/invites/request`, {
     method: 'POST', accountId: body.workspaceId,
@@ -1871,20 +1966,23 @@ async function joinWorkspace(child, body) {
 
 async function approveWorkspaceRequest(mother, workspaceId, email, inviteId, deviceId) {
   const base = `${CHATGPT_BASE_URL}/backend-api/accounts/${encodeURIComponent(workspaceId)}`;
-  const common = chatGptHeaders(mother.accessToken, mother.accountId || workspaceId, `/backend-api/accounts/${workspaceId}/invites`, '/backend-api/accounts/{account_id}/invites', { 'oai-device-id': deviceId || randomUUID(), 'cache-control': 'no-cache' });
-  let selectedInviteId = inviteId;
-  if (!selectedInviteId) {
-    const list = await proxyFetch(`${base}/invites?include_pending=false&include_requests=true&offset=0&limit=100&query=${encodeURIComponent(email)}`, { headers: common }).catch((error) => ({ ok: false, status: 0, json: async () => ({ error: error.message }) }));
-    const data = await list.json().catch(() => ({}));
-    const candidates = Array.isArray(data.items) ? data.items : Array.isArray(data.invites) ? data.invites : [];
-    const match = candidates.find((item) => String(item.email || item.target_email || '').toLowerCase() === email.toLowerCase()) || candidates[0];
-    selectedInviteId = match?.id || match?.invite_id;
-    if (!selectedInviteId) return { ok: false, status: list.status || 404, message: 'pending_invite_not_found', payload: data };
-  }
-  const approveHeaders = { ...common, 'content-type': 'application/json', 'x-openai-target-path': `/backend-api/accounts/${workspaceId}/invites/${selectedInviteId}`, 'x-openai-target-route': '/backend-api/accounts/{account_id}/invites/{invite_id}' };
-  const response = await proxyFetch(`${base}/invites/${encodeURIComponent(selectedInviteId)}`, { method: 'PATCH', headers: approveHeaders, body: JSON.stringify({ role: 'account-owner', seat_type: 'default', accept_request: true }) }).catch((error) => ({ ok: false, status: 0, json: async () => ({ error: error.message }) }));
-  const payload = await response.json().catch(() => ({}));
-  return { ok: response.ok, status: response.status, inviteId: selectedInviteId, payload, message: response.ok ? 'approved' : (payload.detail || payload.error || `http_${response.status}`) };
+  const attempted = await withTeamManager(mother, async (manager) => {
+    const common = chatGptHeaders(manager.accessToken, mother.accountId || workspaceId, `/backend-api/accounts/${workspaceId}/invites`, '/backend-api/accounts/{account_id}/invites', { 'oai-device-id': deviceId || manager.deviceId || randomUUID(), 'cache-control': 'no-cache' });
+    let selectedInviteId = inviteId;
+    if (!selectedInviteId) {
+      const list = await proxyFetch(`${base}/invites?include_pending=false&include_requests=true&offset=0&limit=100&query=${encodeURIComponent(email)}`, { headers: common }).catch((error) => ({ ok: false, status: 0, json: async () => ({ error: error.message }) }));
+      const data = await list.json().catch(() => ({}));
+      const candidates = Array.isArray(data.items) ? data.items : Array.isArray(data.invites) ? data.invites : [];
+      const match = candidates.find((item) => String(item.email || item.target_email || '').toLowerCase() === email.toLowerCase()) || candidates[0];
+      selectedInviteId = match?.id || match?.invite_id;
+      if (!selectedInviteId) return { ok: false, status: list.status || 404, message: 'pending_invite_not_found', payload: data };
+    }
+    const approveHeaders = { ...common, 'content-type': 'application/json', 'x-openai-target-path': `/backend-api/accounts/${workspaceId}/invites/${selectedInviteId}`, 'x-openai-target-route': '/backend-api/accounts/{account_id}/invites/{invite_id}' };
+    const response = await proxyFetch(`${base}/invites/${encodeURIComponent(selectedInviteId)}`, { method: 'PATCH', headers: approveHeaders, body: JSON.stringify({ role: 'account-owner', seat_type: 'default', accept_request: true }) }).catch((error) => ({ ok: false, status: 0, json: async () => ({ error: error.message }) }));
+    const payload = await response.json().catch(() => ({}));
+    return { ok: response.ok, status: response.status, inviteId: selectedInviteId, payload, message: response.ok ? 'approved' : (payload.detail || payload.error || `http_${response.status}`) };
+  });
+  return attempted?.result || { ok: false, status: 401, message: 'workspace_owner_token_required' };
 }
 
 async function switchWorkspace(child, body) {
@@ -2093,7 +2191,7 @@ function teamOwnerRecords(mother) {
     merged.tokenScope = 'team';
     byEmail.set(key, merged);
   }
-  return [...byEmail.values()].filter((owner) => owner.accessToken);
+  return [...byEmail.values()].filter((owner) => teamTokenDetails(owner.accessToken, workspaceId));
 }
 
 function sub2ApiAccountFromMotherOwner(mother, owner) {
@@ -2133,7 +2231,7 @@ async function pushSub2ApiEntries(entries = [], historyLabel = '推送 Sub2API')
         const credentials = item?.credentials || {};
         const accountId = String(credentials.chatgpt_account_id || credentials.account_id || item?.account_id || '').trim();
         const plan = String(credentials.plan_type || item?.plan_type || '').trim().toLowerCase();
-        if (targetAccountId && accountId) return targetAccountId === accountId;
+        if (targetAccountId) return Boolean(accountId) && targetAccountId === accountId;
         if (targetPlan && plan) return targetPlan === plan;
         return emailMatches.length === 1;
       });
@@ -2655,7 +2753,14 @@ async function handleApi(req, res, url) {
     if (fields.password) child.password = fields.password;
     if (fields.totp) child.totp = fields.totp;
     if (fields.mailboxUrl) child.mailboxUrl = fields.mailboxUrl;
-    const result = await acquireChildAuth(child, { refresh: body.refresh === true || body.mode === 'refresh-at', verificationCode: body.verificationCode, callbackUrl: body.callbackUrl });
+    const acquireMode = body.mode || body.action || '';
+    const shouldRefresh = body.refresh === true || acquireMode === 'refresh-at' || acquireMode === 'free-json';
+    const result = await acquireChildAuth(child, {
+      refresh: shouldRefresh,
+      allowCredentialLogin: acquireMode === 'free-json',
+      verificationCode: body.verificationCode,
+      callbackUrl: body.callbackUrl,
+    });
     return sendJson(res, result.status || 200, result);
   }
   if (method === 'POST' && segments[1] === 'children' && segments[2] && segments[3] === 'export') {
@@ -2720,7 +2825,16 @@ async function handleApi(req, res, url) {
   }
   if (method === 'POST' && segments[1] === 'children' && segments[2] && segments[3] === 'switch') {
     const child = findChild(segments[2]);
-    const result = await switchWorkspace(child, body);
+    let result = await switchWorkspace(child, body);
+    if (!result.ok && result.status === 401 && child) {
+      const refreshed = await acquireChildAuth(child, { refresh: true, allowCredentialLogin: true });
+      if (refreshed.ok) {
+        result = await switchWorkspace(child, body);
+        result.oauthRecovery = { attempted: true, ok: result.ok, source: refreshed.source || null };
+      } else {
+        result.oauthRecovery = { attempted: true, ok: false, status: refreshed.status, code: refreshed.code, message: refreshed.message };
+      }
+    }
     return sendJson(res, result.ok ? 200 : (result.status || 502), result);
   }
   if (method === 'POST' && segments[1] === 'children' && segments[2] && segments[3] === 'kick') {
@@ -2729,7 +2843,7 @@ async function handleApi(req, res, url) {
     const oldTeam = child.team;
     const mother = state.mothers.find((item) => item.team === oldTeam);
     if (!oldTeam || !mother) return sendJson(res, 409, { message: 'child_workspace_not_configured' });
-    if (!mother.accessToken || !mother.accountId) return sendJson(res, 400, { message: 'workspace_credentials_required' });
+    if (!teamManagerContext(mother) || !mother.accountId) return sendJson(res, 400, { message: 'workspace_credentials_required' });
     let member = (mother.members || []).find((item) => (
       (child.memberId && item.id === child.memberId)
       || (item.email && child.email && item.email.toLowerCase() === child.email.toLowerCase())
