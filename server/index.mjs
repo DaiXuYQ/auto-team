@@ -1456,24 +1456,19 @@ function canAutoPushRenewedTeamJson() {
 
 async function renewUnauthorizedTeamToken(mother, child) {
   if (!mother?.accountId || !child) return { ok: false, status: 400, message: 'workspace_id_or_child_missing', freeRefreshed: false };
-  let switched = await switchWorkspace(child, { workspaceId: mother.accountId });
-  let freeRefreshed = false;
-
-  // A Team token may expire while the Free token is still valid. Refresh the
-  // Free token only when the workspace exchange itself cannot authenticate.
-  if (!switched.ok && (switched.status === 401 || !child.accessToken)) {
-    const refreshed = await acquireChildAuth(child, { refresh: true });
-    if (!refreshed.ok) {
-      return {
-        ok: false,
-        status: refreshed.status || switched.status || 502,
-        message: refreshed.message || 'free_token_refresh_failed',
-        freeRefreshed: true,
-      };
-    }
-    freeRefreshed = refreshed.source === 'refresh_token';
-    switched = await switchWorkspace(child, { workspaceId: mother.accountId });
+  // Recover the Free OAuth session first. A Team AT is derived from that
+  // session, so exchanging it before the OAuth refresh can reproduce a 401.
+  const refreshed = await acquireChildAuth(child, { refresh: true });
+  if (!refreshed.ok) {
+    return {
+      ok: false,
+      status: refreshed.status || 502,
+      message: refreshed.message || 'free_oauth_refresh_failed',
+      freeRefreshed: true,
+    };
   }
+  const freeRefreshed = refreshed.source === 'refresh_token';
+  const switched = await switchWorkspace(child, { workspaceId: mother.accountId });
   if (!switched.ok) return { ok: false, status: switched.status || 502, message: switched.message || 'workspace_token_refresh_failed', freeRefreshed };
 
   const workspaceToken = workspaceTokenFor(child, mother.accountId) || workspaceTokenFor(child, mother.team);
@@ -1481,7 +1476,7 @@ async function renewUnauthorizedTeamToken(mother, child) {
   if (childIsWorkspaceOwner(child, mother) || childMatchesKnownTeamOwner(child, mother)) {
     upsertTeamOwnerFromChild(mother, child, mother.accountId, workspaceToken);
   }
-  addHistory('刷新 Team JSON', `${child.email} 的 ${mother.team} Team Token 已重新获取${freeRefreshed ? '，Free AT 已刷新' : ''}`);
+  addHistory('刷新 Team JSON', `${child.email} 的 ${mother.team} 已刷新 OAuth 授权并重新获取 Team Token${freeRefreshed ? '' : '（无 RT，沿用现有 Free AT）'}`);
   await persist();
   return { ok: true, status: 200, message: 'team_token_renewed', freeRefreshed };
 }
