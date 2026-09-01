@@ -106,6 +106,9 @@ state.children = (Array.isArray(state.children) ? state.children : []).map((chil
   workspaceTokens: child.workspaceTokens && typeof child.workspaceTokens === 'object' && !Array.isArray(child.workspaceTokens)
     ? child.workspaceTokens
     : {},
+  teamAuthSessions: child.teamAuthSessions && typeof child.teamAuthSessions === 'object' && !Array.isArray(child.teamAuthSessions)
+    ? child.teamAuthSessions
+    : {},
   tokenScope: 'free',
   accountType: 'free',
   plan: String(child.plan || '').toLowerCase() === 'team' ? 'free' : (child.plan || 'free'),
@@ -260,7 +263,7 @@ function isChildMemberOfTeam(child, teamId) {
   return child.team === teamId && child.status !== 'kicked' && !history.some((entry) => ['kicked', 'cooldown'].includes(entry.status));
 }
 function publicChild(child, teamId = null) {
-  const { accessToken, refreshToken, idToken, password, totp, secret, cookies, sessionJson, credentials, authSession, verificationCode, loginUrl, loginBrowserRequired, workspaceTokens, ...safe } = child;
+  const { accessToken, refreshToken, idToken, password, totp, secret, cookies, sessionJson, credentials, authSession, teamAuthSessions, verificationCode, loginUrl, loginBrowserRequired, workspaceTokens, ...safe } = child;
   const membership = teamId ? membershipFor(child, teamId) : null;
   const safeToken = accessToken ? preview(accessToken) : child.token?.startsWith('待') ? child.token : preview(child.token);
   const history = Array.isArray(child.workspaceHistory) ? child.workspaceHistory : [];
@@ -1501,7 +1504,8 @@ async function acquireChildAuth(child, { refresh = false, verificationCode = '',
     verificationCode,
     callbackUrl: callbackUrl || consumeOAuthCallback(child.authSession?.state),
     session: child.authSession,
-    accountId: child.accountId,
+    workspaceId: '',
+    workspaceMode: 'free',
     fetch: proxyFetch,
     timeoutMs: OPENAI_REQUEST_TIMEOUT_MS,
     onProgress: (phase, message) => setChildLoginState(child, phase, message),
@@ -1528,6 +1532,90 @@ async function acquireChildAuth(child, { refresh = false, verificationCode = '',
   return { ok: false, status: login.status || 202, code: browserRequired ? 'verification_required' : login.code || 'login_failed', message, stage: login.stage, browserRequired, needsInput: login.needsInput, authUrl: login.authUrl || null, child: publicChild(child) };
 }
 
+async function acquireTeamAuth(mother, child, { verificationCode = '', callbackUrl = '', force = false } = {}) {
+  const workspaceId = String(mother?.accountId || '').trim();
+  if (!mother || !child || !workspaceId) return { ok: false, status: 400, code: 'workspace_id_required', message: '请先配置目标 Team ID' };
+  const existing = workspaceTokenFor(child, workspaceId);
+  if (existing?.accessToken && !force) {
+    return { ok: true, status: 200, code: 'ready', source: 'stored_team_token', format: 'team-json', tokenScope: 'team', child: publicChild(child, mother.team) };
+  }
+  if (!child.email || !child.password) {
+    return { ok: false, status: 400, code: 'credentials_required', message: 'Team JSON 生成需要 Free 账号邮箱和密码', child: publicChild(child, mother.team) };
+  }
+  if (!child.totp && !child.secret) {
+    return { ok: false, status: 202, code: 'totp_required', message: 'Team JSON 生成需要 Free 账号 2FA Secret', needsInput: true, child: publicChild(child, mother.team) };
+  }
+  if (!child.teamAuthSessions || typeof child.teamAuthSessions !== 'object' || Array.isArray(child.teamAuthSessions)) child.teamAuthSessions = {};
+  const session = child.teamAuthSessions[workspaceId] || null;
+  const mailboxConfig = state.settings?.integrations?.mailbox || {};
+  const mailboxUrl = child.mailboxUrl || (mailboxConfig.enabled && mailboxConfig.endpoint ? mailboxConfig.endpoint : '');
+  const mailboxHeaders = mailboxConfig.apiKey
+    ? { authorization: `Bearer ${mailboxConfig.apiKey}`, 'x-api-key': mailboxConfig.apiKey }
+    : {};
+  const sentinelProxyEntry = state.settings?.proxy?.enabled
+    ? (state.settings.proxy.entries || []).find((entry) => entry?.url)
+    : null;
+  const sentinelProxy = sentinelProxyEntry ? {
+    server: `${sentinelProxyEntry.protocol || 'http'}://${sentinelProxyEntry.host}:${sentinelProxyEntry.port}`,
+    username: sentinelProxyEntry.username || '',
+    password: sentinelProxyEntry.password || '',
+  } : null;
+  child.teamLoginStatus = 'authenticating';
+  child.teamLoginMessage = `正在通过 OAuth 登录并选择 Team ${workspaceId}`;
+  await persist();
+  const login = await loginFreeAccount({
+    email: child.email,
+    password: child.password,
+    totp: child.totp || child.secret,
+    mailboxUrl,
+    mailboxHeaders,
+    sentinelProxy,
+    verificationCode,
+    callbackUrl: callbackUrl || consumeOAuthCallback(session?.state),
+    session,
+    workspaceId,
+    workspaceMode: 'team',
+    fetch: proxyFetch,
+    timeoutMs: OPENAI_REQUEST_TIMEOUT_MS,
+    onProgress: (phase, message) => { child.teamLoginStatus = phase; child.teamLoginMessage = message; },
+  });
+  if (!login.ok) {
+    child.teamAuthSessions[workspaceId] = login.session || session || null;
+    child.teamLoginStatus = login.stage || 'login_required';
+    child.teamLoginMessage = login.message || 'Team OAuth 登录失败';
+    await persist();
+    return {
+      ok: false,
+      status: login.status || 202,
+      code: login.code || 'team_login_failed',
+      message: login.message || 'Team OAuth 登录失败',
+      stage: login.stage,
+      needsInput: Boolean(login.needsInput),
+      browserRequired: false,
+      child: publicChild(child, mother.team),
+    };
+  }
+  const claims = login.claims || accessTokenClaims(login.accessToken);
+  if (claims.accountId !== workspaceId) {
+    child.teamLoginStatus = 'login_required';
+    child.teamLoginMessage = 'OAuth 登录后返回的空间不是目标 Team';
+    await persist();
+    return { ok: false, status: 502, code: 'team_workspace_mismatch', message: 'OAuth 登录后未选择目标 Team 空间', accountId: claims.accountId || null, child: publicChild(child, mother.team) };
+  }
+  const workspaceToken = saveWorkspaceToken(child, workspaceId, login.accessToken, claims);
+  delete child.teamAuthSessions[workspaceId];
+  child.teamLoginStatus = 'ready';
+  child.teamLoginMessage = '已通过 OAuth 登录并生成 Team JSON';
+  child.pendingWorkspaceId = null;
+  const membership = membershipFor(child, mother.team, true);
+  membership.workspaceTokenStatus = 'ready';
+  membership.workspaceTokenUpdatedAt = workspaceToken.acquiredAt;
+  if (childIsWorkspaceOwner(child, mother) || childMatchesKnownTeamOwner(child, mother)) upsertTeamOwnerFromChild(mother, child, workspaceId, workspaceToken);
+  addHistory('生成 Team JSON', `${child.email} 已通过 OAuth 登录并选择 ${mother.team}`);
+  await persist();
+  return { ok: true, status: 200, code: 'ready', source: 'oauth_email_password_2fa_team', format: 'team-json', tokenScope: 'team', accountId: workspaceId, expiresAt: workspaceToken.expiresAt, exportable: true, child: publicChild(child, mother.team) };
+}
+
 function canAutoPushRenewedTeamJson() {
   const config = state.settings?.integrations?.sub2api || {};
   const groupId = Number(config.groupId);
@@ -1539,6 +1627,16 @@ function canAutoPushRenewedTeamJson() {
 
 async function renewUnauthorizedTeamToken(mother, child) {
   if (!mother?.accountId || !child) return { ok: false, status: 400, message: 'workspace_id_or_child_missing', freeRefreshed: false };
+  // Team renewal follows the same OAuth -> email -> password -> TOTP ->
+  // workspace-select path used for a first Team JSON. The direct session
+  // exchange below remains a compatibility fallback for token-only imports.
+  const oauthTeam = await acquireTeamAuth(mother, child, { force: true });
+  if (oauthTeam.ok) {
+    return { ok: true, status: 200, message: 'team_token_renewed_oauth', freeRefreshed: false, credentialLogin: true, oauthTeam: true };
+  }
+  if (oauthTeam.code !== 'credentials_required' && oauthTeam.code !== 'totp_required') {
+    return { ok: false, status: oauthTeam.status || 502, code: oauthTeam.code || 'team_oauth_failed', message: oauthTeam.message || 'team_oauth_failed', freeRefreshed: false, credentialLogin: true, oauthTeam: true, needsInput: Boolean(oauthTeam.needsInput) };
+  }
   // A Free AT can remain valid after its previously exchanged Team AT expires.
   // Re-exchange it before rotating OAuth credentials or performing a full login.
   if (child.accessToken) {
@@ -1825,12 +1923,12 @@ async function refillTeam(motherId) {
       joinFailures.push({ id: child.id, email: child.email, ...remote });
       continue;
     }
-    const switched = await switchWorkspace(child, { workspaceId: mother.accountId });
+    const teamAuth = remote.teamAuth || { ok: false, status: 502, message: 'team_oauth_not_run' };
     child.pendingWorkspaceId = mother.accountId;
-    if (!switched.ok) {
+    if (!teamAuth.ok) {
       child.joinStatus = 'owner_confirmed_token_pending';
       membership.workspaceTokenStatus = 'pending';
-      joinFailures.push({ id: child.id, email: child.email, ok: false, status: switched.status || 502, phase: 'workspace_token', message: switched.message || 'workspace_token_exchange_failed' });
+      joinFailures.push({ id: child.id, email: child.email, ok: false, status: teamAuth.status || 502, phase: 'team_oauth', code: teamAuth.code || null, message: teamAuth.message || 'team_oauth_failed', needsInput: Boolean(teamAuth.needsInput) });
       continue;
     }
     joined.push(child);
@@ -1959,6 +2057,14 @@ async function joinWorkspace(child, body) {
     child.ownerRoleUpdatedAt = now();
     child.ownerRoleError = null;
     addHistory('设置 Team 所有者', `${child.email} 已设置为 ${mother.team} 所有者`);
+    const teamAuth = await acquireTeamAuth(mother, child, { force: true, verificationCode: body.verificationCode, callbackUrl: body.callbackUrl });
+    if (!teamAuth.ok) {
+      child.joinStatus = 'team_oauth_failed';
+      await persist();
+      return { ok: false, status: teamAuth.status || 502, phase: 'team_oauth', inviteId: child.pendingInviteId || null, message: teamAuth.message || 'team_oauth_failed', code: teamAuth.code, needsInput: Boolean(teamAuth.needsInput), child: publicChild(child, mother.team) };
+    }
+    await persist();
+    return { ok: true, phase: 'owner_confirmed', inviteId: child.pendingInviteId || null, payload, teamAuth };
   }
   await persist();
   return { ok: true, phase: body.approve === false ? 'requested' : 'owner_confirmed', inviteId: child.pendingInviteId || null, payload };
@@ -2758,6 +2864,18 @@ async function handleApi(req, res, url) {
     const result = await acquireChildAuth(child, {
       refresh: shouldRefresh,
       allowCredentialLogin: acquireMode === 'free-json',
+      verificationCode: body.verificationCode,
+      callbackUrl: body.callbackUrl,
+    });
+    return sendJson(res, result.status || 200, result);
+  }
+  if (method === 'POST' && segments[1] === 'children' && segments[2] && segments[3] === 'team-auth') {
+    const child = findChild(segments[2]);
+    if (!child) return sendJson(res, 404, { message: 'child_not_found' });
+    const mother = findMother(body.motherId) || state.mothers.find((item) => item.accountId === String(body.workspaceId || '').trim());
+    if (!mother) return sendJson(res, 404, { message: 'mother_not_found' });
+    const result = await acquireTeamAuth(mother, child, {
+      force: body.force !== false,
       verificationCode: body.verificationCode,
       callbackUrl: body.callbackUrl,
     });
