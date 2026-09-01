@@ -1,5 +1,5 @@
 import { createServer } from 'node:http';
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, rename, unlink, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -138,6 +138,10 @@ function persist() {
 }
 
 if (stateStorage.legacyPlaintextLoaded) await persist();
+for (const entry of await readdir(dataDir).catch(() => [])) {
+  if (!/^state\.json\.\d+\.tmp$/.test(entry)) continue;
+  await unlink(path.join(dataDir, entry)).catch(() => {});
+}
 
 function now() { return new Date().toISOString(); }
 function addHistory(action, detail, result = 'success') {
