@@ -362,6 +362,7 @@ function App() {
   const [threshold, setThreshold] = useState(10);
   const [checkInterval, setCheckInterval] = useState(60);
   const [kickWindow, setKickWindow] = useState('5h');
+  const [promoteJoinedAccounts, setPromoteJoinedAccounts] = useState(true);
   const [integrations, setIntegrations] = useState({
     sub2api: { baseUrl: '', apiKey: '', groupId: null, groupName: '', enabled: false },
     mailbox: { serviceType: 'manual', endpoint: '', apiKey: '', enabled: false },
@@ -389,6 +390,7 @@ function App() {
           setThreshold(Number(payload.settings.threshold) || 10);
           setCheckInterval(Number(payload.settings.checkInterval) || 60);
           setKickWindow(payload.settings.kickWindow === '7d' ? '7d' : '5h');
+          setPromoteJoinedAccounts(payload.settings.promoteJoinedAccounts !== false);
           setIntegrations((current) => ({
             sub2api: { ...current.sub2api, ...(payload.settings.integrations?.sub2api || {}) },
             mailbox: { ...current.mailbox, ...(payload.settings.integrations?.mailbox || {}) },
@@ -526,6 +528,7 @@ function App() {
         setThreshold(Number(payload.settings.threshold) || 10);
         setCheckInterval(Number(payload.settings.checkInterval) || 60);
         setKickWindow(payload.settings.kickWindow === '7d' ? '7d' : '5h');
+        setPromoteJoinedAccounts(payload.settings.promoteJoinedAccounts !== false);
         setIntegrations((current) => ({
           sub2api: { ...current.sub2api, ...(payload.settings.integrations?.sub2api || {}) },
           mailbox: { ...current.mailbox, ...(payload.settings.integrations?.mailbox || {}) },
@@ -621,7 +624,7 @@ function App() {
     try {
       await apiRequest('/api/settings', {
         method: 'PATCH',
-        body: JSON.stringify({ autoRefill, threshold: Number(threshold), checkInterval: Number(checkInterval), kickWindow }),
+        body: JSON.stringify({ autoRefill, promoteJoinedAccounts, threshold: Number(threshold), checkInterval: Number(checkInterval), kickWindow }),
       });
       await refreshState(false);
       notify('自动化设置已保存');
@@ -908,7 +911,7 @@ function App() {
       {view === 'teams' && <TeamManagementView teams={teamRecords} openTeam={openMother} openDetail={openTeamDetail} setShowImport={() => setShowImport(true)} exportTeamSub2Api={exportTeamSub2Api} pushTeamSub2Api={pushTeamSub2Api} />}
       {view === 'free' && <FreeAccountsView children={filteredAccounts} allChildren={accountRecords} mothers={mothers} search={search} setSearch={setSearch} setShowImport={() => setShowImport(true)} addAccount={() => openAccount()} exportSub2Api={exportSub2Api} pushSub2Api={pushSub2Api} removeChild={removeChild} deleteFreeAccount={deleteFreeAccount} openJsonImport={openJsonImport} editAccount={openAccount} acquireAccount={acquireAccount} acquireStates={acquireStates} />}
       {view === 'history' && <HistoryView history={history} page={historyPage} pageSize={historyPageSize} meta={historyMeta} loading={historyLoading} error={historyError} onPageChange={changeHistoryPage} onPageSizeChange={changeHistoryPageSize} onRetry={reloadHistory} />}
-      {view === 'settings' && <SettingsView autoRefill={autoRefill} setAutoRefill={setAutoRefill} threshold={threshold} setThreshold={setThreshold} checkInterval={checkInterval} setCheckInterval={setCheckInterval} kickWindow={kickWindow} setKickWindow={setKickWindow} integrations={integrations} openIntegration={setShowIntegration} proxy={proxySettings} openProxy={() => setShowProxy(true)} saveSettings={saveSettings} />}
+      {view === 'settings' && <SettingsView autoRefill={autoRefill} setAutoRefill={setAutoRefill} promoteJoinedAccounts={promoteJoinedAccounts} setPromoteJoinedAccounts={setPromoteJoinedAccounts} threshold={threshold} setThreshold={setThreshold} checkInterval={checkInterval} setCheckInterval={setCheckInterval} kickWindow={kickWindow} setKickWindow={setKickWindow} integrations={integrations} openIntegration={setShowIntegration} proxy={proxySettings} openProxy={() => setShowProxy(true)} saveSettings={saveSettings} />}
     </main>
 
     {showImport && <Modal title="导入账号" onClose={closeImport}><div className="modal-intro">Sub2API 混合文件会按 `plan_type` 自动分流：Team 记录合并到对应空间并保留多个所有者，Free 记录进入普通账号池。完整凭据只提交服务端，不写入浏览器存储。</div><label className="file-picker"><span>选择 Sub2API JSON</span><input type="file" accept="application/json,.json" onChange={importSub2ApiFile} /><small>{importFileName || '未选择文件'}</small></label><div className="segmented">{[['email-code', '邮箱 / 接码地址'], ['password-2fa', '邮箱 / 密码 / 2FA']].map(([id, label]) => <button key={id} className={importMode === id ? 'selected' : ''} onClick={() => setImportMode(id)}>{label}</button>)}</div><textarea className="import-area" value={importText} onChange={(event) => { setImportAccounts(null); setImportFileName(''); setImportText(event.target.value); }} placeholder={importMode === 'email-code' ? 'name@example.com | sms-provider://address\nname2@example.com | https://mailbox.example/...' : 'name@example.com----password----2fa-secret'} /><div className="modal-foot"><span className="muted">{importAccounts?.length ? `${importAccounts.length} 个 JSON 账号待导入` : '支持粘贴账号信息；不会生成演示账号。'}</span><button className="button primary" onClick={importChildren}><ArrowDownToLine size={15} />开始导入</button></div></Modal>}
@@ -1079,7 +1082,7 @@ function HistoryView({ history, page, pageSize, meta, loading, error, onPageChan
     </div>
   </section>;
 }
-function SettingsView({ autoRefill, setAutoRefill, threshold, setThreshold, checkInterval, setCheckInterval, kickWindow, setKickWindow, integrations, openIntegration, proxy, openProxy, saveSettings }) {
+function SettingsView({ autoRefill, setAutoRefill, promoteJoinedAccounts, setPromoteJoinedAccounts, threshold, setThreshold, checkInterval, setCheckInterval, kickWindow, setKickWindow, integrations, openIntegration, proxy, openProxy, saveSettings }) {
   const sub2apiGroupIdSet = Number.isFinite(Number(integrations.sub2api.groupId)) && Number(integrations.sub2api.groupId) > 0;
   const sub2apiReady = integrations.sub2api.enabled && integrations.sub2api.baseUrl && integrations.sub2api.apiKeySet && (sub2apiGroupIdSet || String(integrations.sub2api.groupName || '').trim());
   const sub2apiTarget = integrations.sub2api.groupName || (integrations.sub2api.groupId ? `分组 ${integrations.sub2api.groupId}` : '未指定同步分组');
@@ -1089,6 +1092,7 @@ function SettingsView({ autoRefill, setAutoRefill, threshold, setThreshold, chec
     <section className="content-panel settings-panel">
       <div className="content-toolbar"><div><h2>自动化策略</h2><p>控制额度检测和自动补位行为。</p></div><span className={`status-chip ${autoRefill ? 'online' : 'cooldown'}`}><i />{autoRefill ? '已启用' : '已暂停'}</span></div>
       <div className="setting-row"><div><strong>自动补满席位</strong><p>检测到选定窗口耗尽时，自动移出账号并从待加入池补位。</p></div><Toggle checked={autoRefill} onChange={setAutoRefill} /></div>
+      <div className="setting-row"><div><strong>加入后设置为所有者</strong><p>开启后，新补位账号会提升为所有者；关闭时保留普通成员权限。</p></div><Toggle checked={promoteJoinedAccounts} onChange={setPromoteJoinedAccounts} /></div>
       <div className="setting-row kick-window-row"><div><strong>自动踢出窗口</strong><p>5h 和 7d 只能选择一个作为自动踢出条件，额度预警不会改变这个选择。</p></div><div className="segmented setting-segmented">{[['5h', '5h 耗尽'], ['7d', '7d 满额']].map(([id, label]) => <button key={id} className={kickWindow === id ? 'selected' : ''} onClick={() => setKickWindow(id)}>{label}</button>)}</div></div>
       <div className="setting-row"><div><strong>额度预警阈值</strong><p>低于此百分比时标记为“额度偏低”，但不会立即移除。</p></div><div className="number-input"><input type="number" min="1" max="50" value={threshold} onChange={(event) => setThreshold(event.target.value)} /><span>%</span></div></div>
       <div className="setting-row"><div><strong>检测周期</strong><p>自动轮询 Team 空间和所有已加入的账号。</p></div><select className="select-control" value={checkInterval} onChange={(event) => setCheckInterval(event.target.value)}><option value="30">30 秒</option><option value="60">60 秒</option><option value="300">5 分钟</option></select></div>

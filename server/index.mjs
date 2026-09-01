@@ -35,6 +35,7 @@ const emptyState = {
     checkInterval: 60,
     kickOnExhausted: true,
     kickWindow: '5h',
+    promoteJoinedAccounts: true,
     integrations: {
       sub2api: { baseUrl: '', apiKey: '', groupId: null, groupName: '', enabled: false },
       mailbox: { serviceType: 'manual', endpoint: '', apiKey: '', enabled: false },
@@ -1367,14 +1368,21 @@ function accessTokenFromSessionPayload(payload) {
 
 function childIsWorkspaceOwner(child, mother) {
   const membership = membershipFor(child, mother?.team);
-  return child?.ownerRoleStatus === 'applied'
-    || membership?.role === 'account-owner'
-    || memberIsOwner(child?.memberSnapshot, mother);
+  if (membership?.role) return memberIsOwner({ email: child?.email, role: membership.role }, mother);
+  if (membership?.ownerRoleStatus) return membership.ownerRoleStatus === 'applied';
+  const email = String(child?.email || '').trim().toLowerCase();
+  const currentMember = (mother?.members || []).find((member) => String(member?.email || '').trim().toLowerCase() === email);
+  if (currentMember) return memberIsOwner(currentMember, mother);
+  return child?.team === mother?.team
+    && (child?.ownerRoleStatus === 'applied' || memberIsOwner(child?.memberSnapshot, mother));
 }
 
 function childMatchesKnownTeamOwner(child, mother) {
   const email = String(child?.email || '').trim().toLowerCase();
   if (!email || !mother) return false;
+  const membership = membershipFor(child, mother.team);
+  if (membership?.role && !memberIsOwner({ email: child.email, role: membership.role }, mother)) return false;
+  if (membership?.ownerRoleStatus === 'skipped') return false;
   return [mother, ...(Array.isArray(mother.ownerAccounts) ? mother.ownerAccounts : [])]
     .some((owner) => String(owner?.email || '').trim().toLowerCase() === email);
 }
@@ -1975,47 +1983,61 @@ async function refillTeam(motherId) {
   }
   const ownerRoleRetryFailures = [];
   const workspaceTokenRetryFailures = [];
-  const pendingOwnerRoles = state.children.filter((child) => (
-    isChildMemberOfTeam(child, mother.team)
-    && (child.ownerRoleStatus === 'failed' || child.joinStatus === 'owner_role_failed' || child.joinStatus === 'approved_pending_owner')
-  ));
+  const promoteJoinedAccounts = state.settings?.promoteJoinedAccounts !== false;
+  const pendingOwnerRoles = promoteJoinedAccounts ? state.children.filter((child) => {
+    if (!isChildMemberOfTeam(child, mother.team)) return false;
+    const membership = membershipFor(child, mother.team);
+    const ownerRoleStatus = membership?.ownerRoleStatus || child.ownerRoleStatus;
+    const joinStatus = membership?.joinStatus || child.joinStatus;
+    return ownerRoleStatus === 'failed' || joinStatus === 'owner_role_failed' || joinStatus === 'approved_pending_owner';
+  }) : [];
   for (const child of pendingOwnerRoles) {
+    const membership = membershipFor(child, mother.team, true);
     const promoted = await promoteJoinedMemberToOwner(mother, child, mother.accountId);
     if (promoted.ok) {
       child.joinStatus = 'owner_confirmed';
       child.ownerRoleStatus = 'applied';
+      membership.joinStatus = 'owner_confirmed';
+      membership.ownerRoleStatus = 'applied';
+      membership.role = 'account-owner';
       child.ownerRoleUpdatedAt = now();
       child.ownerRoleError = null;
       addHistory('重试 Team 所有者', `${child.email} 已设置为 ${mother.team} 所有者`);
       const switched = await switchWorkspaceWithFreeRecovery(child, mother.accountId);
       if (!switched.ok) {
         child.joinStatus = 'owner_confirmed_token_pending';
-        const membership = membershipFor(child, mother.team, true);
+        membership.joinStatus = 'owner_confirmed_token_pending';
         membership.workspaceTokenStatus = 'pending';
         workspaceTokenRetryFailures.push({ id: child.id, email: child.email, ok: false, status: switched.status || 502, phase: 'workspace_token_retry', message: switched.message || 'workspace_token_exchange_failed' });
       }
     } else {
       child.joinStatus = 'owner_role_failed';
       child.ownerRoleStatus = 'failed';
+      membership.joinStatus = 'owner_role_failed';
+      membership.ownerRoleStatus = 'failed';
       child.ownerRoleError = { status: promoted.status || 502, message: promoted.message || 'owner_role_failed', at: now() };
       ownerRoleRetryFailures.push({ id: child.id, email: child.email, ok: false, status: promoted.status || 502, phase: 'owner_role_retry', message: promoted.message || 'owner_role_failed' });
     }
   }
-  const knownTeamOwnerEmails = new Set(teamOwnerRecords(mother).map((owner) => String(owner.email || '').toLowerCase()));
-  const pendingWorkspaceTokens = state.children.filter((child) => (
-    isChildMemberOfTeam(child, mother.team)
-    && childIsWorkspaceOwner(child, mother)
-    && !knownTeamOwnerEmails.has(String(child.email || '').toLowerCase())
-  ));
+  const pendingWorkspaceTokens = state.children.filter((child) => {
+    if (!isChildMemberOfTeam(child, mother.team)) return false;
+    const membership = membershipFor(child, mother.team);
+    const workspaceToken = workspaceTokenFor(child, mother.accountId) || workspaceTokenFor(child, mother.team);
+    return membership?.workspaceTokenStatus === 'pending'
+      || ['team_token_failed', 'owner_confirmed_token_pending', 'member_confirmed_token_pending'].includes(membership?.joinStatus || child.joinStatus)
+      || !teamTokenDetails(workspaceToken?.accessToken, mother.accountId);
+  });
   for (const child of pendingWorkspaceTokens) {
     const switched = await switchWorkspaceWithFreeRecovery(child, mother.accountId);
+    const membership = membershipFor(child, mother.team, true);
+    const roleConfirmedStatus = childIsWorkspaceOwner(child, mother) ? 'owner_confirmed' : 'member_confirmed';
     if (switched.ok) {
-      child.joinStatus = 'owner_confirmed';
-      const membership = membershipFor(child, mother.team, true);
+      child.joinStatus = roleConfirmedStatus;
+      membership.joinStatus = roleConfirmedStatus;
       membership.workspaceTokenStatus = 'ready';
     } else {
-      child.joinStatus = 'owner_confirmed_token_pending';
-      const membership = membershipFor(child, mother.team, true);
+      child.joinStatus = `${roleConfirmedStatus}_token_pending`;
+      membership.joinStatus = child.joinStatus;
       membership.workspaceTokenStatus = 'pending';
       workspaceTokenRetryFailures.push({ id: child.id, email: child.email, ok: false, status: switched.status || 502, phase: 'workspace_token_retry', message: switched.message || 'workspace_token_exchange_failed' });
     }
@@ -2098,14 +2120,15 @@ async function refillTeam(motherId) {
     const membership = membershipFor(child, mother.team, true);
     const remote = await joinWorkspace(child, { motherId, workspaceId: mother.accountId, approve: true, pushTeamJson: false });
     if (!remote.ok) {
-      child.workspaceHistory = (child.workspaceHistory || []).filter((entry) => entry !== membership);
+      if (remote.phase !== 'team_token') child.workspaceHistory = (child.workspaceHistory || []).filter((entry) => entry !== membership);
       joinFailures.push({ id: child.id, email: child.email, ...remote });
       continue;
     }
     const teamAuth = remote.teamAuth || { ok: false, status: 502, message: 'team_token_not_generated' };
     child.pendingWorkspaceId = mother.accountId;
     if (!teamAuth.ok) {
-      child.joinStatus = 'owner_confirmed_token_pending';
+      child.joinStatus = `${promoteJoinedAccounts ? 'owner' : 'member'}_confirmed_token_pending`;
+      membership.joinStatus = child.joinStatus;
       membership.workspaceTokenStatus = 'pending';
       joinFailures.push({ id: child.id, email: child.email, ok: false, status: teamAuth.status || 502, phase: 'team_token', code: teamAuth.code || null, message: teamAuth.message || 'team_token_failed', needsInput: Boolean(teamAuth.needsInput), browserRequired: Boolean(teamAuth.browserRequired), authUrl: teamAuth.authUrl || null });
       continue;
@@ -2126,17 +2149,17 @@ async function refillTeam(motherId) {
       child.status = 'active'; child.team = mother.team; child.joinedAt = child.joinedAt || now();
       const membership = membershipFor(child, mother.team);
       const joinedMember = (synced.members || []).find((member) => String(member.email || '').toLowerCase() === String(child.email || '').toLowerCase());
+      const role = joinedMember?.role || (promoteJoinedAccounts ? 'account-owner' : 'standard-user');
       if (joinedMember) {
-        joinedMember.role = 'account-owner';
         child.memberId = joinedMember.id || child.memberId;
         child.accountUserId = joinedMember.accountUserId || child.accountUserId;
-        child.memberSnapshot = { ...joinedMember, role: 'account-owner' };
+        child.memberSnapshot = joinedMember;
       }
-      child.joinStatus = 'owner_confirmed';
-      child.ownerRoleStatus = 'applied';
+      child.joinStatus = promoteJoinedAccounts ? 'owner_confirmed' : 'member_confirmed';
+      child.ownerRoleStatus = promoteJoinedAccounts ? 'applied' : 'skipped';
       const previousHistory = (child.workspaceHistory || []).filter((entry) => !(entry.team === mother.team && entry.status === 'active' && entry !== membership));
       const activeMembership = membershipFor(child, mother.team, true) || membership;
-      Object.assign(activeMembership, { team: mother.team, joinedAt: child.joinedAt, status: 'active', role: 'account-owner', memberId: child.memberId || activeMembership.memberId || null, quota5h: activeMembership.quota5h ?? child.quota5h ?? null, quota7d: activeMembership.quota7d ?? child.quota7d ?? null, quotaSnapshot: activeMembership.quotaSnapshot || null, quotaUpdatedAt: activeMembership.quotaUpdatedAt || child.lastQuotaCheckAt || null, workspaceTokenStatus: 'ready', rejoinEligible: null, retryAfter: null, reason: null });
+      Object.assign(activeMembership, { team: mother.team, joinedAt: child.joinedAt, status: 'active', role, joinStatus: child.joinStatus, ownerRoleStatus: child.ownerRoleStatus, memberId: child.memberId || activeMembership.memberId || null, quota5h: activeMembership.quota5h ?? child.quota5h ?? null, quota7d: activeMembership.quota7d ?? child.quota7d ?? null, quotaSnapshot: activeMembership.quotaSnapshot || null, quotaUpdatedAt: activeMembership.quotaUpdatedAt || child.lastQuotaCheckAt || null, workspaceTokenStatus: 'ready', rejoinEligible: null, retryAfter: null, reason: null });
       child.workspaceHistory = [...previousHistory.filter((entry) => entry !== activeMembership), activeMembership];
       confirmedJoined.push(child);
     }
@@ -2289,42 +2312,64 @@ async function joinWorkspace(child, body) {
   child.joinStatus = 'requested';
   addHistory('申请加入 Team', `${child.email} 已向 ${mother.team} 发起申请`);
   if (body.approve !== false) {
-    const approved = await approveWorkspaceRequest(mother, body.workspaceId, child.email, child.pendingInviteId, body.deviceId);
+    const promoteJoinedAccounts = state.settings?.promoteJoinedAccounts !== false;
+    const approvedRole = promoteJoinedAccounts ? 'account-owner' : 'standard-user';
+    const approved = await approveWorkspaceRequest(mother, body.workspaceId, child.email, child.pendingInviteId, body.deviceId, approvedRole);
     if (!approved.ok) { await persist(); return { ok: false, status: approved.status || 502, phase: 'admin_approve', request: payload, ...approved }; }
-    child.joinStatus = 'approved_pending_owner';
-    child.ownerRoleStatus = 'pending';
-    addHistory('同意进入空间', `${mother.email} 已同意 ${child.email} 进入 ${mother.team}`);
-    const promoted = await promoteJoinedMemberToOwner(mother, child, body.workspaceId);
-    if (!promoted.ok) {
-      child.joinStatus = 'owner_role_failed';
-      child.ownerRoleStatus = 'failed';
-      child.ownerRoleError = { status: promoted.status || 502, message: promoted.message || 'owner_role_failed', at: now() };
-      addHistory('设置 Team 所有者', `${child.email} 进入 ${mother.team} 后提升所有者失败：${promoted.message || 'owner_role_failed'}`, 'error');
-      await persist();
-      return { ok: false, status: promoted.status || 502, phase: 'owner_role', inviteId: child.pendingInviteId || null, message: promoted.message || 'owner_role_failed' };
-    }
-    child.joinStatus = 'owner_confirmed';
-    child.ownerRoleStatus = 'applied';
-    child.ownerRoleUpdatedAt = now();
+    child.status = 'active';
+    child.team = mother.team;
+    child.joinedAt = child.joinedAt || now();
+    const membership = membershipFor(child, mother.team, true);
+    membership.role = approvedRole;
+    membership.joinStatus = promoteJoinedAccounts ? 'approved_pending_owner' : 'member_confirmed';
+    membership.ownerRoleStatus = promoteJoinedAccounts ? 'pending' : 'skipped';
+    child.joinStatus = membership.joinStatus;
+    child.ownerRoleStatus = membership.ownerRoleStatus;
     child.ownerRoleError = null;
-    addHistory('设置 Team 所有者', `${child.email} 已设置为 ${mother.team} 所有者`);
+    addHistory('同意进入空间', `${mother.email} 已同意 ${child.email} 进入 ${mother.team}`);
+    if (promoteJoinedAccounts) {
+      const promoted = await promoteJoinedMemberToOwner(mother, child, body.workspaceId);
+      if (!promoted.ok) {
+        child.joinStatus = 'owner_role_failed';
+        child.ownerRoleStatus = 'failed';
+        membership.joinStatus = 'owner_role_failed';
+        membership.ownerRoleStatus = 'failed';
+        child.ownerRoleError = { status: promoted.status || 502, message: promoted.message || 'owner_role_failed', at: now() };
+        addHistory('设置 Team 所有者', `${child.email} 进入 ${mother.team} 后提升所有者失败：${promoted.message || 'owner_role_failed'}`, 'error');
+        await persist();
+        return { ok: false, status: promoted.status || 502, phase: 'owner_role', inviteId: child.pendingInviteId || null, message: promoted.message || 'owner_role_failed' };
+      }
+      child.joinStatus = 'owner_confirmed';
+      child.ownerRoleStatus = 'applied';
+      membership.joinStatus = 'owner_confirmed';
+      membership.ownerRoleStatus = 'applied';
+      membership.role = 'account-owner';
+      child.ownerRoleUpdatedAt = now();
+      child.ownerRoleError = null;
+      addHistory('设置 Team 所有者', `${child.email} 已设置为 ${mother.team} 所有者`);
+    }
     const teamAuth = await switchWorkspaceWithFreeRecovery(child, mother.accountId, { verificationCode: body.verificationCode, callbackUrl: body.callbackUrl });
     if (!teamAuth.ok) {
-      child.joinStatus = 'team_token_failed';
+      child.joinStatus = `${promoteJoinedAccounts ? 'owner' : 'member'}_confirmed_token_pending`;
+      membership.joinStatus = child.joinStatus;
+      membership.workspaceTokenStatus = 'pending';
       await persist();
       return { ok: false, status: teamAuth.status || 502, phase: 'team_token', inviteId: child.pendingInviteId || null, message: teamAuth.message || 'team_token_failed', code: teamAuth.code, needsInput: Boolean(teamAuth.needsInput), browserRequired: Boolean(teamAuth.browserRequired), authUrl: teamAuth.authUrl || null, child: publicChild(child, mother.team) };
     }
+    membership.workspaceTokenStatus = 'ready';
     const sub2apiPush = body.pushTeamJson === false
       ? { attempted: false, ok: null, status: null, message: 'deferred_to_batch', pushed: 0, failed: 0 }
       : await pushRenewedTeamJson(mother);
     await persist();
-    return { ok: true, phase: 'owner_confirmed', inviteId: child.pendingInviteId || null, payload, freeAuth: { source: freeAuth.source || null }, teamAuth, sub2apiPush };
+    const phase = promoteJoinedAccounts ? 'owner_confirmed' : 'member_confirmed';
+    return { ok: true, phase, inviteId: child.pendingInviteId || null, payload, freeAuth: { source: freeAuth.source || null }, teamAuth, sub2apiPush };
   }
   await persist();
   return { ok: true, phase: body.approve === false ? 'requested' : 'owner_confirmed', inviteId: child.pendingInviteId || null, payload };
 }
 
-async function approveWorkspaceRequest(mother, workspaceId, email, inviteId, deviceId) {
+async function approveWorkspaceRequest(mother, workspaceId, email, inviteId, deviceId, role = 'account-owner') {
+  const approvedRole = role === 'standard-user' ? 'standard-user' : 'account-owner';
   const base = `${CHATGPT_BASE_URL}/backend-api/accounts/${encodeURIComponent(workspaceId)}`;
   const attempted = await withTeamManager(mother, async (manager) => {
     const common = chatGptHeaders(manager.accessToken, mother.accountId || workspaceId, `/backend-api/accounts/${workspaceId}/invites`, '/backend-api/accounts/{account_id}/invites', { 'oai-device-id': deviceId || manager.deviceId || randomUUID(), 'cache-control': 'no-cache' });
@@ -2338,7 +2383,7 @@ async function approveWorkspaceRequest(mother, workspaceId, email, inviteId, dev
       if (!selectedInviteId) return { ok: false, status: list.status || 404, message: 'pending_invite_not_found', payload: data };
     }
     const approveHeaders = { ...common, 'content-type': 'application/json', 'x-openai-target-path': `/backend-api/accounts/${workspaceId}/invites/${selectedInviteId}`, 'x-openai-target-route': '/backend-api/accounts/{account_id}/invites/{invite_id}' };
-    const response = await proxyFetch(`${base}/invites/${encodeURIComponent(selectedInviteId)}`, { method: 'PATCH', headers: approveHeaders, body: JSON.stringify({ role: 'account-owner', seat_type: 'default', accept_request: true }) }).catch((error) => ({ ok: false, status: 0, json: async () => ({ error: error.message }) }));
+    const response = await proxyFetch(`${base}/invites/${encodeURIComponent(selectedInviteId)}`, { method: 'PATCH', headers: approveHeaders, body: JSON.stringify({ role: approvedRole, seat_type: 'default', accept_request: true }) }).catch((error) => ({ ok: false, status: 0, json: async () => ({ error: error.message }) }));
     const payload = await response.json().catch(() => ({}));
     return { ok: response.ok, status: response.status, inviteId: selectedInviteId, payload, message: response.ok ? 'approved' : (payload.detail || payload.error || `http_${response.status}`) };
   });
@@ -2593,6 +2638,34 @@ function teamOwnerRecords(mother) {
   return [...byEmail.values()].filter((owner) => teamTokenDetails(owner.accessToken, workspaceId));
 }
 
+function teamJsonRecords(mother) {
+  const workspaceId = mother?.accountId || mother?.team || '';
+  const byEmail = new Map(teamOwnerRecords(mother).map((record) => [String(record.email || '').toLowerCase(), record]));
+  for (const child of state.children) {
+    if (!isChildMemberOfTeam(child, mother?.team)) continue;
+    const workspaceToken = workspaceTokenFor(child, workspaceId) || workspaceTokenFor(child, mother.team);
+    if (!teamTokenDetails(workspaceToken?.accessToken, workspaceId)) continue;
+    const membership = membershipFor(child, mother.team);
+    const record = {
+      ...child,
+      accessToken: workspaceToken.accessToken,
+      accountId: workspaceId,
+      team: mother.team || workspaceId,
+      plan: 'team',
+      planType: 'team',
+      tokenScope: 'team',
+      expiresAt: workspaceToken.expiresAt || child.expiresAt || null,
+      quota5h: membership?.quota5h ?? child.quota5h ?? null,
+      quota7d: membership?.quota7d ?? child.quota7d ?? null,
+      quotaSnapshot: membership?.quotaSnapshot || child.quotaSnapshot || null,
+      quotaUpdatedAt: membership?.quotaUpdatedAt || child.quotaUpdatedAt || null,
+    };
+    const key = String(child.email || '').toLowerCase();
+    if (key) byEmail.set(key, { ...(byEmail.get(key) || {}), ...record });
+  }
+  return [...byEmail.values()];
+}
+
 function sub2ApiAccountFromMotherOwner(mother, owner) {
   const record = {
     ...mother,
@@ -2660,7 +2733,7 @@ function teamSub2ApiEntries(motherIds = []) {
   const idSet = new Set(Array.isArray(motherIds) ? motherIds.map(String) : []);
   return state.mothers
     .filter((mother) => !idSet.size || idSet.has(String(mother.id)) || idSet.has(String(mother.accountId || mother.team)))
-    .flatMap((mother) => teamOwnerRecords(mother).map((owner) => ({
+    .flatMap((mother) => teamJsonRecords(mother).map((owner) => ({
       id: `${mother.id}:${owner.email}`,
       motherId: mother.id,
       email: owner.email,
@@ -2686,7 +2759,7 @@ const mcpTools = [
   { name: 'check_all_teams', description: '检测所有已配置真实凭据的 Team。', inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
   { name: 'refill_team', description: '对一个 Team 执行移除已耗尽账号并从待加入池补位。', inputSchema: { type: 'object', properties: { teamId: { type: 'string', description: 'Team 记录 id、accountId 或 team id。' } }, required: ['teamId'], additionalProperties: false } },
   { name: 'refill_all_teams', description: '对所有已配置真实凭据的 Team 执行移除和补位。', inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
-  { name: 'update_settings', description: '更新自动补位、额度预警阈值、检测周期和自动踢出窗口。', inputSchema: { type: 'object', properties: { autoRefill: { type: 'boolean' }, threshold: { type: 'number', minimum: 1, maximum: 100 }, checkInterval: { type: 'number', minimum: 30 }, kickWindow: { type: 'string', enum: ['5h', '7d'] } }, additionalProperties: false } },
+  { name: 'update_settings', description: '更新自动补位、加入账号角色、额度预警阈值、检测周期和自动踢出窗口。', inputSchema: { type: 'object', properties: { autoRefill: { type: 'boolean' }, promoteJoinedAccounts: { type: 'boolean' }, threshold: { type: 'number', minimum: 1, maximum: 100 }, checkInterval: { type: 'number', minimum: 30 }, kickWindow: { type: 'string', enum: ['5h', '7d'] } }, additionalProperties: false } },
 ];
 
 function mcpAuthOk(req) {
@@ -2754,6 +2827,7 @@ async function mcpCallTool(name, args = {}) {
   if (name === 'update_settings') {
     const input = args && typeof args === 'object' ? args : {};
     if (input.autoRefill !== undefined) state.settings.autoRefill = Boolean(input.autoRefill);
+    if (input.promoteJoinedAccounts !== undefined) state.settings.promoteJoinedAccounts = Boolean(input.promoteJoinedAccounts);
     if (input.threshold !== undefined) state.settings.threshold = Math.min(100, Math.max(1, Number(input.threshold) || state.settings.threshold));
     if (input.checkInterval !== undefined) state.settings.checkInterval = Math.max(30, Number(input.checkInterval) || state.settings.checkInterval);
     if (input.kickWindow !== undefined) state.settings.kickWindow = input.kickWindow === '7d' ? '7d' : '5h';
@@ -2860,10 +2934,10 @@ async function handleApi(req, res, url) {
   if (method === 'GET' && url.pathname === '/api/health') return sendJson(res, 200, { ok: true, updatedAt: state.updatedAt });
   if (method === 'PATCH' && url.pathname === '/api/settings') {
     const autoRefillWasEnabled = state.settings.autoRefill === true;
-    const allowed = ['autoRefill', 'threshold', 'checkInterval', 'kickOnExhausted', 'kickWindow'];
+    const allowed = ['autoRefill', 'promoteJoinedAccounts', 'threshold', 'checkInterval', 'kickOnExhausted', 'kickWindow'];
     for (const key of allowed) {
       if (body[key] === undefined) continue;
-      if (key === 'autoRefill' || key === 'kickOnExhausted') state.settings[key] = Boolean(body[key]);
+      if (key === 'autoRefill' || key === 'promoteJoinedAccounts' || key === 'kickOnExhausted') state.settings[key] = Boolean(body[key]);
       else if (key === 'kickWindow') state.settings.kickWindow = body[key] === '7d' ? '7d' : '5h';
       else state.settings[key] = Math.max(1, Number(body[key]) || state.settings[key]);
     }
