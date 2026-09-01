@@ -16,9 +16,9 @@ npm install
 npm run dev
 ```
 
-然后打开 <http://localhost:5173>。前端和服务端默认从空状态启动，不包含预置母号、子号或历史记录。数据以服务端 `data/state.json` 为准；可以在“设置”中调整预警阈值和轮询周期。
+然后打开 <http://localhost:5173>。前端和服务端默认从空状态启动，不包含预置母号、子号或历史记录。数据以服务端 `data/state.json` 为准；该文件使用 AES-256-GCM 加密，可以在“设置”中调整预警阈值和轮询周期。
 
-前端不会生成演示账号。Free 账号可以通过“导入 Sub2API JSON”导入真实 `accounts[].credentials` 和 `accounts[].extra`，也可以粘贴 `邮箱----密码----2FA`（或使用 `|`、逗号）保存登录凭据。已有 `refresh_token` 的账号可在 Free 列表点击“刷新 AT”，服务端会真实请求 OpenAI 更新并保存 AT；只有邮箱/密码/2FA 的账号会进入登录验证等待状态，遇到邮箱验证码、Turnstile 或浏览器设备校验时不会伪造成功，完成验证后可录入真实 AT。JSON 的完整凭据只提交并保存到服务端 `data/state.json`，界面和 API 响应只返回脱敏 token。
+前端不会生成演示账号。Free 账号可以通过“导入 Sub2API JSON”导入真实 `accounts[].credentials` 和 `accounts[].extra`，也可以粘贴 `邮箱----密码----2FA`（或使用 `|`、逗号）保存登录凭据。开启自动补位后，没有 Free JSON 的账号会先通过 RT 或邮箱、密码、2FA 自动取得 AT/RT；已有 AT 过期时优先用 RT 刷新。遇到邮箱验证码、Turnstile 或浏览器设备校验时不会伪造成功，界面会保留验证状态。JSON 的完整凭据只提交并加密保存在服务端，界面和 API 响应只返回脱敏 token。
 
 混合 Sub2API 文件会按 `credentials.plan_type` 分流：`team` 记录按 `chatgpt_account_id` 合并为空间，并保留该空间的多个所有者；`free` 记录进入 Free 账号池。同一邮箱同时存在 Free 和 Team 记录时不会互相覆盖。
 
@@ -29,7 +29,14 @@ npm run build
 npm run server
 ```
 
-服务监听 `http://127.0.0.1:8786`，并提供 `/api/state`、`/api/history`、`/api/settings`、`/api/mothers/*`（Team 所有者与空间操作）、`/api/children/import`、`/api/children/:id/login`、`/api/children/:id/acquire`、`/api/children/:id/join`、`/api/children/:id/switch`、`/api/children/:id/kick`、`/api/maintenance/check`、`/api/maintenance/refill` 和 `/api/sub2api/export`。Free 账号只用于登录、取得凭据和加入 Team，不单独检测额度；5h / 7d 额度只保存和检测在对应 Team 空间下。`/api/state` 额外返回脱敏的 `teams` 汇总、账号凭据状态、加入历史和 Sub2API 状态；前端同步时可传 `includeHistory=false` 跳过历史。`/api/history?page=1&pageSize=20` 返回当前页 `items` 及 `total`、`totalPages` 等分页信息，不带分页参数时保持返回完整数组。开启服务端自动补位后，轮询只处理拥有真实所有者 AT 和空间 ID 的 Team；没有真实凭据的记录不会被标记为已加入或被远端操作。API 的完整 AT/refresh token、密码和 2FA 只写入本地 `data/state.json`，接口响应会脱敏；生产环境应进一步加认证、HTTPS 和密钥加密。
+服务监听 `http://127.0.0.1:8786`，并提供 `/api/state`、`/api/history`、`/api/settings`、`/api/mothers/*`（Team 所有者与空间操作）、`/api/children/import`、`/api/children/:id/login`、`/api/children/:id/acquire`、`/api/children/:id/join`、`/api/children/:id/switch`、`/api/children/:id/kick`、`/api/maintenance/check`、`/api/maintenance/refill` 和 `/api/sub2api/export`。Free 账号只用于登录、取得凭据和加入 Team，不单独检测额度；5h / 7d 额度只保存和检测在对应 Team 空间下。`/api/state` 额外返回脱敏的 `teams` 汇总、账号凭据状态、加入历史和 Sub2API 状态；前端同步时可传 `includeHistory=false` 跳过历史。`/api/history?page=1&pageSize=20` 返回当前页 `items` 及 `total`、`totalPages` 等分页信息，不带分页参数时保持返回完整数组。单个成员检测失败只记录为部分失败，不会阻断其他成员或已确认额度状态的补位。
+
+## 安全配置
+
+- 默认只监听 `127.0.0.1`。设置非本机 `HOST` 时，必须同时设置 `TEAM_ROTATION_API_TOKEN`，否则服务拒绝启动。页面第一次访问受保护 API 时会要求输入 Token，并仅保存到当前浏览器会话。
+- 状态文件默认使用 `data/.state-key` 加密；非本机监听必须设置独立的 `TEAM_ROTATION_DATA_KEY`（32 字节 Base64、64 位十六进制或高强度口令），并单独备份该密钥。密钥丢失后无法解密状态数据。
+- 跨域前端通过 `TEAM_ROTATION_ALLOWED_ORIGINS` 配置允许来源，多个来源使用逗号分隔。默认只允许同源以及本机 Vite 开发地址。
+- MCP 默认复用 `TEAM_ROTATION_API_TOKEN`；也可以单独设置 `MCP_AUTH_TOKEN`。远程部署仍应在 HTTPS 反向代理后使用。
 
 ## Agent MCP 接入
 

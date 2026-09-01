@@ -17,6 +17,8 @@ const defaultProxySettings = { enabled: false, strategy: 'failover', timeoutMs: 
 // The production server serves the API from the same origin; Vite dev runs it
 // separately on 8786, so point browser requests at the live local API there.
 const API_BASE = import.meta.env.VITE_API_BASE || (import.meta.env.DEV ? 'http://127.0.0.1:8786' : '');
+const API_TOKEN_STORAGE_KEY = 'team_rotation_api_token';
+const LEGACY_API_TOKEN_STORAGE_KEY = 'TEAM_ROTATION_API_TOKEN';
 
 const navItems = [
   { id: 'run', label: '首页', icon: LayoutDashboard },
@@ -34,12 +36,43 @@ function hydrateChildren(items) {
   }));
 }
 
-async function apiRequest(path, options = {}) {
+function storedApiToken() {
+  try {
+    for (const storage of [window.sessionStorage, window.localStorage]) {
+      for (const key of [API_TOKEN_STORAGE_KEY, LEGACY_API_TOKEN_STORAGE_KEY]) {
+        const token = storage.getItem(key)?.trim();
+        if (token) return token;
+      }
+    }
+  } catch { /* browser storage may be unavailable */ }
+  return '';
+}
+
+function saveApiToken(token) {
+  try {
+    window.sessionStorage.setItem(API_TOKEN_STORAGE_KEY, token);
+    window.localStorage.removeItem(API_TOKEN_STORAGE_KEY);
+    window.localStorage.removeItem(LEGACY_API_TOKEN_STORAGE_KEY);
+  } catch { /* browser storage may be unavailable */ }
+}
+
+async function apiRequest(path, options = {}, retriedAfterAuth = false, promptedToken = '') {
+  const headers = new Headers(options.headers || {});
+  if (options.body && !headers.has('content-type')) headers.set('content-type', 'application/json');
+  const token = promptedToken || storedApiToken();
+  if (token && (!headers.has('authorization') || promptedToken)) headers.set('authorization', `Bearer ${token}`);
   const response = await fetch(`${API_BASE}${path}`, {
     ...options,
-    headers: { ...(options.body ? { 'content-type': 'application/json' } : {}), ...(options.headers || {}) },
+    headers,
   });
   const payload = await response.json().catch(() => ({}));
+  if (!retriedAfterAuth && response.status === 401 && payload?.code === 'api_auth_required') {
+    const token = window.prompt('服务端需要 API Token，请输入 TEAM_ROTATION_API_TOKEN：', '')?.trim();
+    if (token) {
+      saveApiToken(token);
+      return apiRequest(path, options, true, token);
+    }
+  }
   if (!response.ok) {
     const error = new Error(payload.message || payload.detail || `HTTP ${response.status}`);
     error.status = response.status;

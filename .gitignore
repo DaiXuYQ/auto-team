@@ -2,6 +2,7 @@ node_modules/
 dist/
 data/state.json
 data/*.tmp
+data/.state-key
 *.log
 .chrome-check-2/
 page-check.png

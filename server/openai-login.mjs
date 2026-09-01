@@ -556,13 +556,35 @@ class LoginRunner {
         : '登录会话没有可选择的空间';
       throw new OpenAiLoginError('workspace_required', message, 409);
     }
-    const result = await this.request(`${AUTH_BASE_URL}/api/accounts/workspace/select`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', origin: AUTH_BASE_URL, referer: url || `${AUTH_BASE_URL}/sign-in-with-chatgpt/codex/consent` },
-      body: { workspace_id: workspaceId },
-    });
-    if (!result.ok) throw new OpenAiLoginError('workspace_select_failed', '空间选择失败', result.status || 502);
-    return pageUrl(result.payload, result.location || url);
+    const consentUrl = authStep(url, '/sign-in-with-chatgpt/codex/consent')
+      ? url
+      : `${AUTH_BASE_URL}/sign-in-with-chatgpt/codex/consent`;
+    let last = null;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        const consent = await this.request(consentUrl, {
+          headers: { accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', referer: `${AUTH_BASE_URL}/` },
+        });
+        if (consent.location && (isCallback(consent.location) || (isProtocolAuthPage(consent.location) && !authStep(consent.location, '/workspace') && !authStep(consent.location, '/sign-in-with-chatgpt/codex/consent')))) return consent.location;
+        if (consent.status >= 400) {
+          last = consent;
+        } else {
+          const result = await this.request(`${AUTH_BASE_URL}/api/accounts/workspace/select`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', origin: AUTH_BASE_URL, referer: consentUrl },
+            body: { workspace_id: workspaceId },
+          });
+          if (result.ok) return pageUrl(result.payload, result.location || consentUrl);
+          last = result;
+        }
+      } catch (error) {
+        last = { status: 0, error };
+      }
+      if (![0, 408, 425, 429, 500, 502, 503, 504].includes(Number(last?.status)) || attempt === 2) break;
+      this.progress('workspace', `空间选择暂时失败，正在重试（${attempt + 2}/3）`);
+      await new Promise((resolve) => setTimeout(resolve, 400 * (attempt + 1)));
+    }
+    throw new OpenAiLoginError('workspace_select_failed', '空间选择失败', last?.status || 502);
   }
 
   async followToCallback(url) {
@@ -683,13 +705,15 @@ export async function loginFreeAccount(options = {}) {
     const token = await runner.run();
     return { ok: true, status: 200, code: 'ready', stage: 'ready', ...token, session: publicSession(runner.session) };
   } catch (error) {
+    const browserRequired = Boolean(error.browserRequired)
+      || ['protocol_verification_required', 'sentinel_verification_failed'].includes(error.code);
     return {
       ok: false,
       status: error.status || 502,
       code: error.code || 'login_failed',
       message: error.message || '登录失败',
       stage: runner.phase,
-      browserRequired: false,
+      browserRequired,
       needsInput: Boolean(error.needsInput),
       authUrl: runner.authorizeUrl(),
       session: publicSession(runner.session),

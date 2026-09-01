@@ -1,7 +1,7 @@
 import readline from 'node:readline';
 
 const endpoint = process.env.QUOTA_HUB_MCP_URL || 'http://127.0.0.1:8786/mcp';
-const token = process.env.MCP_AUTH_TOKEN || '';
+const token = process.env.MCP_AUTH_TOKEN || process.env.TEAM_ROTATION_API_TOKEN || '';
 let sessionId = '';
 let queue = Promise.resolve();
 
