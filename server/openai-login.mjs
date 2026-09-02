@@ -680,7 +680,11 @@ class LoginRunner {
           current = await this.selectWorkspace(current);
           continue;
         }
-        if (authStep(current, '/add-phone')) throw new OpenAiLoginError('protocol_verification_required', '此账号需要额外验证，纯协议无法继续', 202, { needsInput: true });
+        if (authStep(current, '/add-phone')) {
+          const message = '账号需要手机号验证，自动登录已停止，请完成接码后重试';
+          this.progress('phone_verification_required', message);
+          throw new OpenAiLoginError('phone_verification_required', message, 202, { needsInput: true });
+        }
         if (current.startsWith(AUTH_BASE_URL)) {
           current = await this.followToCallback(current);
           continue;

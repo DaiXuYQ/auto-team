@@ -309,7 +309,9 @@ function splitCredentialLine(line) {
 
 function normalizeAcquireStatus(payload = {}) {
   const raw = String(payload.code || payload.state || payload.phase || (payload.ok ? 'ready' : 'failed')).toLowerCase().replace(/[\s-]+/g, '_');
-  if (['waiting_code', 'awaiting_code', 'code_required', 'verification_required', 'waiting_verification', 'awaiting_verification', 'otp_required', 'waiting_otp', 'waiting_email', 'captcha_required'].includes(raw)) return 'waiting_code';
+  if (['phone_verification_required', 'phone_required', 'add_phone_required'].includes(raw)) return 'phone_required';
+  if (['verification_required', 'browser_verification_required', 'protocol_verification_required', 'sentinel_verification_failed', 'captcha_required'].includes(raw)) return 'browser_required';
+  if (['waiting_code', 'awaiting_code', 'code_required', 'waiting_verification', 'awaiting_verification', 'otp_required', 'waiting_otp', 'waiting_email', 'email_otp_required', 'email_otp_timeout', 'totp_required', 'totp_invalid'].includes(raw)) return 'waiting_code';
   if (['authenticating', 'logging_in', 'login_pending', 'pending_auth'].includes(raw)) return 'authenticating';
   if (['queued', 'pending', 'processing', 'started'].includes(raw)) return 'queued';
   if (['ready', 'completed', 'success', 'refreshed', 'download_ready'].includes(raw)) return 'ready';
@@ -318,8 +320,8 @@ function normalizeAcquireStatus(payload = {}) {
 
 function AcquireStatus({ state }) {
   if (!state?.status) return null;
-  const labels = { queued: '等待处理', waiting_code: '等待验证码', authenticating: '登录验证中', ready: '已更新', failed: '获取失败' };
-  return <span className={`acquire-status ${state.status} ${state.loading ? 'loading' : ''}`}><i />{labels[state.status] || '处理中'}</span>;
+  const labels = { queued: '等待处理', waiting_code: '等待验证码', phone_required: '需要手机号接码', browser_required: '需要浏览器验证', authenticating: '登录验证中', ready: '已更新', failed: '获取失败' };
+  return <span className={`acquire-status ${state.status} ${state.loading ? 'loading' : ''}`} title={state.message || ''}><i />{labels[state.status] || '处理中'}</span>;
 }
 
 function App() {
@@ -687,16 +689,18 @@ function App() {
       const result = await apiRequest(`/api/children/${encodeURIComponent(id)}/acquire`, { method: 'POST', body: JSON.stringify({ ...credentials, mode, action: mode, format: mode === 'free-json' ? 'free-json' : 'access-token', refresh: mode === 'refresh-at' }) });
       await refreshState(false);
       const status = normalizeAcquireStatus(result);
-      setAcquireStates((current) => ({ ...current, [id]: { loading: false, status, authUrl: result.authUrl || result.child?.login?.authUrl || '', browserRequired: Boolean(result.browserRequired || result.child?.login?.browserRequired) } }));
+      setAcquireStates((current) => ({ ...current, [id]: { loading: false, status, message: result.message || result.child?.login?.message || '', authUrl: result.authUrl || result.child?.login?.authUrl || '', browserRequired: Boolean(result.browserRequired || result.child?.login?.browserRequired) } }));
       if (mode === 'free-json' && status === 'ready') await downloadFreeJson(id);
-      notify(status === 'waiting_code' ? '正在等待验证码' : status === 'failed' ? 'Free JSON 获取失败' : mode === 'free-json' ? 'Free JSON 获取完成' : 'AT 刷新完成', status === 'failed' ? 'error' : status === 'waiting_code' ? 'info' : 'success');
+      const message = status === 'phone_required' ? '账号需要手机号验证，自动登录已停止，请完成接码后重试' : status === 'browser_required' ? '需要浏览器验证，请打开授权链接' : status === 'waiting_code' ? '正在等待验证码' : status === 'failed' ? 'Free JSON 获取失败' : mode === 'free-json' ? 'Free JSON 获取完成' : 'AT 刷新完成';
+      notify(message, status === 'failed' ? 'error' : ['phone_required', 'browser_required', 'waiting_code'].includes(status) ? 'info' : 'success');
     } catch (error) {
       const payload = error.payload || {};
       const status = normalizeAcquireStatus(payload);
       const authUrl = payload.authUrl || payload.child?.login?.authUrl || '';
-      setAcquireStates((current) => ({ ...current, [id]: { loading: false, status, authUrl, browserRequired: Boolean(payload.browserRequired || payload.child?.login?.browserRequired) } }));
+      setAcquireStates((current) => ({ ...current, [id]: { loading: false, status, message: payload.message || payload.child?.login?.message || '', authUrl, browserRequired: Boolean(payload.browserRequired || payload.child?.login?.browserRequired) } }));
       await refreshState(false).catch(() => {});
-      notify(status === 'waiting_code' && authUrl ? '需要浏览器验证，请打开授权链接' : status === 'waiting_code' ? '正在等待验证码' : '账号获取失败，请检查账号状态', status === 'waiting_code' ? 'info' : 'error');
+      const message = status === 'phone_required' ? '账号需要手机号验证，自动登录已停止，请完成接码后重试' : status === 'browser_required' ? '需要浏览器验证，请打开授权链接' : status === 'waiting_code' ? '正在等待验证码' : '账号获取失败，请检查账号状态';
+      notify(message, ['phone_required', 'browser_required', 'waiting_code'].includes(status) ? 'info' : 'error');
     }
   }
 
@@ -1055,7 +1059,7 @@ function Metric({ label, value, detail, icon: Icon, tone }) { return <div classN
 
 function MothersView({ mothers, setShowMother, setShowImport }) { return <section className="content-panel"><div className="content-toolbar"><div><h2>母号与空间</h2><p>管理用于检测额度、发送邀请和补位的 Team 母号。</p></div><div className="toolbar-actions"><button className="button ghost" onClick={setShowImport}><ArrowDownToLine size={15} />导入 JSON</button><button className="button primary" onClick={() => setShowMother()}><Plus size={15} />添加母号</button></div></div><div className="mother-grid">{mothers.map((mother) => <article className="mother-card" key={mother.id}><div className="card-top"><div className="mother-avatar"><KeyRound size={18} /></div><span className={`status-chip ${mother.status || 'unconfigured'}`}><i />{mother.status === 'online' ? '在线' : mother.status === 'offline' ? '离线' : '未检测'}</span></div><h3>{mother.name || '未命名母号'}</h3><p className="mono">{mother.email || '未设置邮箱'}</p><div className="space-line"><span>{teamDisplayName(mother)}</span><strong>{Number.isFinite(Number(mother.used)) && Number.isFinite(Number(mother.seats)) ? `${mother.used} / ${mother.seats} 席位` : '席位未检测'}</strong></div><div className="seat-bar"><i style={{ width: `${mother.seats ? Math.min(100, Number(mother.used || 0) / Number(mother.seats) * 100) : 0}%` }} /></div><div className="card-meta"><span>上次检测 {mother.lastCheck || '未检测'}</span><button className="text-button" onClick={() => setShowMother(mother)}>编辑 <ArrowUpRight size={14} /></button></div></article>)}<button className="add-card" onClick={() => setShowMother()}><Plus size={20} /><strong>添加母号</strong><span>连接新的 Team 空间</span></button></div><div className="subsection"><div className="subsection-title"><div><h3>空间状态</h3><p>每个空间的席位和加入记录</p></div><button className="button ghost"><ListFilter size={15} />筛选</button></div><table className="data-table"><thead><tr><th>空间</th><th>母号</th><th>席位</th><th>最后同步</th><th>状态</th><th /></tr></thead><tbody>{mothers.map((mother) => <tr key={mother.id}><td><strong>{teamDisplayName(mother)}</strong></td><td className="mono">{mother.email || '未设置'}</td><td><div className="table-seats"><span>{Number.isFinite(Number(mother.used)) && Number.isFinite(Number(mother.seats)) ? `${mother.used}/${mother.seats}` : '--'}</span><i><b style={{ width: `${mother.seats ? Math.min(100, Number(mother.used || 0) / Number(mother.seats) * 100) : 0}%` }} /></i></div></td><td>{mother.lastCheck || '未检测'}</td><td><span className={`status-chip ${mother.status || 'unconfigured'}`}><i />{mother.status === 'online' ? '正常' : '未检测'}</span></td><td><button className="icon-button small" title="更多"><MoreHorizontal size={16} /></button></td></tr>)}</tbody></table></div></section>; }
 
-function StatusBadge({ status }) { const labels = { active: '使用中', warning: '额度偏低', exhausted: '已耗尽', cooldown: '冷却中', ready: '待加入', kicked: '已移出', unconfigured: '待配置', offline: '离线', login_pending: '等待验证', login_required: '需要重新登录' }; return <span className={`status-chip ${status || 'unconfigured'}`}><i />{labels[status] || '未检测'}</span>; }
+function StatusBadge({ status }) { const labels = { active: '使用中', warning: '额度偏低', exhausted: '已耗尽', cooldown: '冷却中', ready: '待加入', kicked: '已移出', unconfigured: '待配置', offline: '离线', login_pending: '等待验证', login_required: '需要重新登录', phone_verification_required: '需要手机号接码' }; return <span className={`status-chip ${status || 'unconfigured'}`}><i />{labels[status] || '未检测'}</span>; }
 function QuotaBar({ value }) { const numeric = Number(value); const known = Number.isFinite(numeric); const tone = numeric === 0 ? 'red' : numeric <= 10 ? 'amber' : 'green'; return <div className="quota-cell"><span>{known ? `${numeric}%` : '--'}</span><i className={known ? tone : 'muted'}><b style={{ width: `${known ? Math.max(0, Math.min(100, numeric)) : 0}%` }} /></i></div>; }
 function HistoryView({ history, page, pageSize, meta, loading, error, onPageChange, onPageSizeChange, onRetry }) {
   const total = Math.max(0, Number(meta?.total) || 0);

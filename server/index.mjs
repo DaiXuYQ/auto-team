@@ -1578,6 +1578,12 @@ function freeAuthRetryBackoffActive(child) {
     && ['login_required', 'credentials_required'].includes(child?.loginStatus);
 }
 
+function freeAuthRequiresManualInput(child) {
+  return child?.status === 'login_pending'
+    || child?.status === 'phone_verification_required'
+    || child?.loginStatus === 'phone_verification_required';
+}
+
 async function ensureChildFreeAuth(child, { forceRefresh = false, verificationCode = '', callbackUrl = '' } = {}) {
   if (!child) return { ok: false, status: 404, code: 'child_not_found', message: 'child_not_found' };
   if (!forceRefresh && !freeTokenNeedsRefresh(child)) {
@@ -1659,6 +1665,10 @@ async function acquireChildAuth(child, { refresh = false, verificationCode = '',
     await persist();
     return { ok: false, status: 400, code: 'credentials_required', message: '请先填写邮箱和密码', child: publicChild(child) };
   }
+  if (child.loginStatus === 'phone_verification_required' && !verificationCode && !callbackUrl) {
+    child.authSession = null;
+    child.loginUrl = null;
+  }
   setChildLoginState(child, 'authenticating', '正在使用邮箱、密码和 2FA 登录 OpenAI');
   child.status = 'login_pending';
   child.loginBrowserRequired = false;
@@ -1698,20 +1708,22 @@ async function acquireChildAuth(child, { refresh = false, verificationCode = '',
     await persist();
     return { ok: true, status: 200, code: 'ready', source: 'email_password_2fa', format: 'free-json', child: publicChild(child), exportable: true };
   }
-  child.authSession = login.session || child.authSession || null;
+  const phoneRequired = login.code === 'phone_verification_required';
+  child.authSession = phoneRequired ? null : login.session || child.authSession || null;
   child.loginUrl = login.authUrl || null;
   child.loginBrowserRequired = Boolean(login.browserRequired);
   const waiting = login.code === 'email_otp_required' || login.code === 'email_otp_timeout' || login.code === 'totp_required' || login.code === 'totp_invalid';
   const browserRequired = Boolean(login.browserRequired) || login.code === 'browser_verification_required';
-  const status = browserRequired ? 'verification_required' : waiting ? 'waiting_code' : 'login_required';
-  const message = browserRequired
-    ? '登录需要浏览器验证，请打开授权链接完成验证后重试'
+  const status = phoneRequired ? 'phone_verification_required' : browserRequired ? 'verification_required' : waiting ? 'waiting_code' : 'login_required';
+  const message = phoneRequired
+    ? '账号需要手机号验证，自动登录已停止，请完成接码后重试'
+    : browserRequired ? '登录需要浏览器验证，请打开授权链接完成验证后重试'
     : login.message || (waiting ? '登录需要验证码，请填写验证码后重试' : '登录失败，请检查凭据或稍后重试');
   setChildLoginState(child, status, message);
-  child.status = status === 'waiting_code' || status === 'verification_required' ? 'login_pending' : 'login_required';
+  child.status = phoneRequired ? 'phone_verification_required' : status === 'waiting_code' || status === 'verification_required' ? 'login_pending' : 'login_required';
   addHistory('登录 Free 账号', `${child.email} ${message}`, 'partial');
   await persist();
-  return { ok: false, status: login.status || 202, code: browserRequired ? 'verification_required' : login.code || 'login_failed', message, stage: login.stage, browserRequired, needsInput: login.needsInput, authUrl: login.authUrl || null, child: publicChild(child) };
+  return { ok: false, status: login.status || 202, code: login.code || (browserRequired ? 'verification_required' : 'login_failed'), message, stage: login.stage, browserRequired, needsInput: login.needsInput, authUrl: login.authUrl || null, child: publicChild(child) };
 }
 
 async function acquireTeamAuth(mother, child, { verificationCode = '', callbackUrl = '', force = false } = {}) {
@@ -2097,7 +2109,7 @@ async function refillTeam(motherId) {
   const usedBeforeRefill = Number.isFinite(Number(mother.used)) ? Number(mother.used) : active.length;
   const open = Math.max(0, seatsEntitled - usedBeforeRefill + kicked.length);
   const candidatePool = state.children.filter((child) => (
-    child.status !== 'login_pending'
+    !freeAuthRequiresManualInput(child)
     && !freeAuthRetryBackoffActive(child)
     && canRejoinTeam(child, mother.team)
     && Boolean(child.accessToken || child.refreshToken || (child.email && child.password))
@@ -2227,7 +2239,7 @@ async function withMaintenanceLock(owner, operation) {
 async function prepareFreeJsonPool() {
   const results = [];
   for (const child of state.children) {
-    if (child.accessToken || (!child.refreshToken && !(child.email && child.password)) || child.status === 'login_pending') continue;
+    if (child.accessToken || (!child.refreshToken && !(child.email && child.password)) || freeAuthRequiresManualInput(child)) continue;
     if (freeAuthRetryBackoffActive(child)) continue;
     const acquired = await ensureChildFreeAuth(child);
     results.push({
