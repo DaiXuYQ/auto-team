@@ -67,7 +67,7 @@ npm run server
 }
 ```
 
-MCP 工具包括 `get_state`、`list_teams`、`list_accounts`、`get_history`、`check_team_quota`、`check_all_teams`、`refill_team`、`refill_all_teams` 和 `update_settings`。其中检测、补位和设置更新会真实改变系统状态；MCP 返回沿用脱敏投影，不返回完整密码、2FA、Access Token 或 refresh token。需要跨机器接入时设置 `HOST=0.0.0.0` 和 `MCP_AUTH_TOKEN`，客户端使用 `Authorization: Bearer <token>`。
+MCP 工具包括 `get_state`、`list_teams`、`list_accounts`、`get_history`、`check_team_quota`、`check_all_teams`、`refill_team`、`refill_all_teams`、`acquire_missing_free_json` 和 `update_settings`。其中检测、补位、批量获取 Free JSON 和设置更新会真实改变系统状态；MCP 返回沿用脱敏投影，不返回完整密码、2FA、Access Token 或 refresh token。需要跨机器接入时设置 `HOST=0.0.0.0` 和 `MCP_AUTH_TOKEN`，客户端使用 `Authorization: Bearer <token>`。
 
 ## 与真实服务对接
 

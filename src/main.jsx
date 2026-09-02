@@ -347,6 +347,7 @@ function App() {
   const [jsonImportText, setJsonImportText] = useState('');
   const [jsonImporting, setJsonImporting] = useState(false);
   const [acquireStates, setAcquireStates] = useState({});
+  const [batchAcquire, setBatchAcquire] = useState({ loading: false, result: null });
   const [showMother, setShowMother] = useState(false);
   const [editingMotherId, setEditingMotherId] = useState(null);
   const [showAccount, setShowAccount] = useState(false);
@@ -363,6 +364,7 @@ function App() {
   const [autoRefill, setAutoRefill] = useState(true);
   const [threshold, setThreshold] = useState(10);
   const [checkInterval, setCheckInterval] = useState(60);
+  const [concurrency, setConcurrency] = useState(3);
   const [kickWindow, setKickWindow] = useState('5h');
   const [promoteJoinedAccounts, setPromoteJoinedAccounts] = useState(true);
   const [integrations, setIntegrations] = useState({
@@ -391,6 +393,7 @@ function App() {
           setAutoRefill(payload.settings.autoRefill !== false);
           setThreshold(Number(payload.settings.threshold) || 10);
           setCheckInterval(Number(payload.settings.checkInterval) || 60);
+          setConcurrency(Math.min(10, Math.max(1, Number(payload.settings.concurrency) || 3)));
           setKickWindow(payload.settings.kickWindow === '7d' ? '7d' : '5h');
           setPromoteJoinedAccounts(payload.settings.promoteJoinedAccounts !== false);
           setIntegrations((current) => ({
@@ -529,6 +532,7 @@ function App() {
         setAutoRefill(payload.settings.autoRefill !== false);
         setThreshold(Number(payload.settings.threshold) || 10);
         setCheckInterval(Number(payload.settings.checkInterval) || 60);
+        setConcurrency(Math.min(10, Math.max(1, Number(payload.settings.concurrency) || 3)));
         setKickWindow(payload.settings.kickWindow === '7d' ? '7d' : '5h');
         setPromoteJoinedAccounts(payload.settings.promoteJoinedAccounts !== false);
         setIntegrations((current) => ({
@@ -626,7 +630,7 @@ function App() {
     try {
       await apiRequest('/api/settings', {
         method: 'PATCH',
-        body: JSON.stringify({ autoRefill, promoteJoinedAccounts, threshold: Number(threshold), checkInterval: Number(checkInterval), kickWindow }),
+        body: JSON.stringify({ autoRefill, promoteJoinedAccounts, threshold: Number(threshold), checkInterval: Number(checkInterval), concurrency: Number(concurrency), kickWindow }),
       });
       await refreshState(false);
       notify('自动化设置已保存');
@@ -701,6 +705,44 @@ function App() {
       await refreshState(false).catch(() => {});
       const message = status === 'phone_required' ? '账号需要手机号验证，自动登录已停止，请完成接码后重试' : status === 'browser_required' ? '需要浏览器验证，请打开授权链接' : status === 'waiting_code' ? '正在等待验证码' : '账号获取失败，请检查账号状态';
       notify(message, ['phone_required', 'browser_required', 'waiting_code'].includes(status) ? 'info' : 'error');
+    }
+  }
+
+  async function acquireMissingFreeJson() {
+    if (batchAcquire.loading) return;
+    const missing = accountRecords.filter((account) => !account.sub2apiStatus?.exportable);
+    if (!missing.length) {
+      notify('所有 Free 账号都已有可导出的 JSON', 'info');
+      return;
+    }
+    const missingIds = new Set(missing.map((account) => account.id));
+    setAcquireStates((current) => {
+      const next = { ...current };
+      for (const account of missing) next[account.id] = { loading: true, status: 'queued', message: '等待批量获取' };
+      return next;
+    });
+    setBatchAcquire({ loading: true, result: { totalMissing: missing.length, concurrency } });
+    try {
+      const result = await apiRequest('/api/children/acquire-missing-json', { method: 'POST', body: '{}' });
+      setAcquireStates((current) => {
+        const next = { ...current };
+        for (const item of result.results || []) {
+          next[item.id] = { loading: false, status: normalizeAcquireStatus(item), message: item.message || '', browserRequired: Boolean(item.browserRequired) };
+        }
+        return next;
+      });
+      await refreshState(false);
+      setBatchAcquire({ loading: false, result });
+      const summary = `批量获取完成：成功 ${result.acquired || 0} 个，失败 ${result.failed || 0} 个，跳过 ${result.skipped || 0} 个`;
+      notify(summary, result.failed || result.skipped ? 'info' : 'success');
+    } catch (error) {
+      setAcquireStates((current) => {
+        const next = { ...current };
+        for (const id of missingIds) if (next[id]?.loading) next[id] = { loading: false, status: 'failed', message: error.message || '批量获取失败' };
+        return next;
+      });
+      setBatchAcquire({ loading: false, result: { totalMissing: missing.length, concurrency, error: error.message || '批量获取失败' } });
+      notify(`批量获取 Free JSON 失败：${error.message}`, 'error');
     }
   }
 
@@ -913,9 +955,9 @@ function App() {
 
       {view === 'run' && <RunView activeMother={activeMother} activeChildren={activeChildren} trackedChildren={trackedChildren} readyChildren={readyChildren} exhausted={exhausted} canRefillAll={anyExhausted || anyOpenSeat} lowQuota={lowQuota} seatsOpen={seatsOpen} stage={stage} progress={progress} isRunning={isRunning} isProcessing={isProcessing} lastSync={lastSync} runCheck={runCheck} refillSeats={refillSeats} setShowMother={() => openMother(activeMother)} setSelectedTeam={setSelectedTeam} mothers={mothers} autoRefill={autoRefill} />}
       {view === 'teams' && <TeamManagementView teams={teamRecords} openTeam={openMother} openDetail={openTeamDetail} setShowImport={() => setShowImport(true)} exportTeamSub2Api={exportTeamSub2Api} pushTeamSub2Api={pushTeamSub2Api} />}
-      {view === 'free' && <FreeAccountsView children={filteredAccounts} allChildren={accountRecords} mothers={mothers} search={search} setSearch={setSearch} setShowImport={() => setShowImport(true)} addAccount={() => openAccount()} exportSub2Api={exportSub2Api} pushSub2Api={pushSub2Api} removeChild={removeChild} deleteFreeAccount={deleteFreeAccount} openJsonImport={openJsonImport} editAccount={openAccount} acquireAccount={acquireAccount} acquireStates={acquireStates} />}
+      {view === 'free' && <FreeAccountsView children={filteredAccounts} allChildren={accountRecords} mothers={mothers} search={search} setSearch={setSearch} setShowImport={() => setShowImport(true)} addAccount={() => openAccount()} exportSub2Api={exportSub2Api} pushSub2Api={pushSub2Api} removeChild={removeChild} deleteFreeAccount={deleteFreeAccount} openJsonImport={openJsonImport} editAccount={openAccount} acquireAccount={acquireAccount} acquireMissingFreeJson={acquireMissingFreeJson} acquireStates={acquireStates} batchAcquire={batchAcquire} concurrency={concurrency} />}
       {view === 'history' && <HistoryView history={history} page={historyPage} pageSize={historyPageSize} meta={historyMeta} loading={historyLoading} error={historyError} onPageChange={changeHistoryPage} onPageSizeChange={changeHistoryPageSize} onRetry={reloadHistory} />}
-      {view === 'settings' && <SettingsView autoRefill={autoRefill} setAutoRefill={setAutoRefill} promoteJoinedAccounts={promoteJoinedAccounts} setPromoteJoinedAccounts={setPromoteJoinedAccounts} threshold={threshold} setThreshold={setThreshold} checkInterval={checkInterval} setCheckInterval={setCheckInterval} kickWindow={kickWindow} setKickWindow={setKickWindow} integrations={integrations} openIntegration={setShowIntegration} proxy={proxySettings} openProxy={() => setShowProxy(true)} saveSettings={saveSettings} />}
+      {view === 'settings' && <SettingsView autoRefill={autoRefill} setAutoRefill={setAutoRefill} promoteJoinedAccounts={promoteJoinedAccounts} setPromoteJoinedAccounts={setPromoteJoinedAccounts} threshold={threshold} setThreshold={setThreshold} checkInterval={checkInterval} setCheckInterval={setCheckInterval} concurrency={concurrency} setConcurrency={setConcurrency} kickWindow={kickWindow} setKickWindow={setKickWindow} integrations={integrations} openIntegration={setShowIntegration} proxy={proxySettings} openProxy={() => setShowProxy(true)} saveSettings={saveSettings} />}
     </main>
 
     {showImport && <Modal title="导入账号" onClose={closeImport}><div className="modal-intro">Sub2API 混合文件会按 `plan_type` 自动分流：Team 记录合并到对应空间并保留多个所有者，Free 记录进入普通账号池。完整凭据只提交服务端，不写入浏览器存储。</div><label className="file-picker"><span>选择 Sub2API JSON</span><input type="file" accept="application/json,.json" onChange={importSub2ApiFile} /><small>{importFileName || '未选择文件'}</small></label><div className="segmented">{[['email-code', '邮箱 / 接码地址'], ['password-2fa', '邮箱 / 密码 / 2FA']].map(([id, label]) => <button key={id} className={importMode === id ? 'selected' : ''} onClick={() => setImportMode(id)}>{label}</button>)}</div><textarea className="import-area" value={importText} onChange={(event) => { setImportAccounts(null); setImportFileName(''); setImportText(event.target.value); }} placeholder={importMode === 'email-code' ? 'name@example.com | sms-provider://address\nname2@example.com | https://mailbox.example/...' : 'name@example.com----password----2fa-secret'} /><div className="modal-foot"><span className="muted">{importAccounts?.length ? `${importAccounts.length} 个 JSON 账号待导入` : '支持粘贴账号信息；不会生成演示账号。'}</span><button className="button primary" onClick={importChildren}><ArrowDownToLine size={15} />开始导入</button></div></Modal>}
@@ -1022,15 +1064,18 @@ function CredentialState({ account }) {
   return <span className="credential-state"><i className={status.hasPassword ? 'set' : ''} title={status.hasPassword ? '密码已录入' : '密码未录入'}>密</i><i className={status.hasTotp ? 'set' : ''} title={status.hasTotp ? '2FA 已录入' : '2FA 未录入'}>2FA</i></span>;
 }
 
-function FreeAccountsView({ children, allChildren, mothers, search, setSearch, setShowImport, addAccount, exportSub2Api, pushSub2Api, removeChild, deleteFreeAccount, openJsonImport, editAccount, acquireAccount, acquireStates }) {
+function FreeAccountsView({ children, allChildren, mothers, search, setSearch, setShowImport, addAccount, exportSub2Api, pushSub2Api, removeChild, deleteFreeAccount, openJsonImport, editAccount, acquireAccount, acquireMissingFreeJson, acquireStates, batchAcquire, concurrency }) {
   const [filter, setFilter] = useState('all');
   const visible = children.filter((account) => filter === 'all' || (filter === 'free' && !joinedTeamsFor(account).some((entry) => entry.status === 'active')) || (filter === 'team' && joinedTeamsFor(account).some((entry) => entry.status === 'active')) || (filter === 'cooldown' && (['kicked', 'cooldown'].includes(account.status) || joinedTeamsFor(account).some((entry) => ['kicked', 'cooldown'].includes(entry.status)))));
   const freeCount = allChildren.filter((account) => !joinedTeamsFor(account).some((entry) => entry.status === 'active')).length;
   const teamCount = allChildren.filter((account) => joinedTeamsFor(account).some((entry) => entry.status === 'active')).length;
   const readyCount = allChildren.filter((account) => account.status === 'ready').length;
+  const missingJsonCount = allChildren.filter((account) => !account.sub2apiStatus?.exportable).length;
+  const batchResult = batchAcquire?.result;
   return <section className="free-maintenance">
     <section className="metrics"><Metric label="普通账号" value={allChildren.length} detail="不含 Team 所有者" icon={Users} tone="blue" /><Metric label="未加入 Team" value={freeCount} detail="可进入补位队列" icon={UserRound} tone="green" /><Metric label="已加入 Team" value={teamCount} detail="可同时保留多个空间" icon={LayoutDashboard} tone="amber" /><Metric label="待处理" value={readyCount} detail="等待加入或配置" icon={Clock3} tone="slate" /></section>
-    <section className="content-panel account-panel"><div className="content-toolbar"><div><h2>Free 账号维护</h2><p>只记录普通账号；这里维护邮箱、凭据、加入过的 Team 和 Sub2API，不展示额度。</p></div><div className="toolbar-actions"><button className="button ghost" onClick={exportSub2Api}><Download size={15} />导出 Sub2API</button><button className="button secondary" onClick={pushSub2Api}><ExternalLink size={15} />推送到 Sub2API</button><button className="button ghost" onClick={setShowImport}><ArrowDownToLine size={15} />导入账号</button><button className="button primary" onClick={addAccount}><Plus size={15} />新增账号</button></div></div>
+    <section className="content-panel account-panel"><div className="content-toolbar"><div><h2>Free 账号维护</h2><p>只记录普通账号；这里维护邮箱、凭据、加入过的 Team 和 Sub2API，不展示额度。</p></div><div className="toolbar-actions"><button className="button ghost" onClick={exportSub2Api}><Download size={15} />导出 Sub2API</button><button className="button secondary" onClick={pushSub2Api}><ExternalLink size={15} />推送到 Sub2API</button><button className="button secondary" onClick={acquireMissingFreeJson} disabled={batchAcquire?.loading || !missingJsonCount}><CloudDownload size={15} />{batchAcquire?.loading ? '批量获取中' : `批量获取 JSON${missingJsonCount ? ` (${missingJsonCount})` : ''}`}</button><button className="button ghost" onClick={setShowImport}><ArrowDownToLine size={15} />导入账号</button><button className="button primary" onClick={addAccount}><Plus size={15} />新增账号</button></div></div>
+      {(batchAcquire?.loading || batchResult) && <div className={`batch-operation ${batchResult?.error ? 'failed' : batchAcquire?.loading ? 'running' : 'complete'}`}><div className="batch-operation-icon">{batchAcquire?.loading ? <RefreshCw size={16} /> : batchResult?.error ? <AlertTriangle size={16} /> : <CheckCircle2 size={16} />}</div><div><strong>{batchAcquire?.loading ? `正在按 ${concurrency} 并发获取 Free JSON` : batchResult?.error ? '批量获取失败' : '批量获取已完成'}</strong><span>{batchAcquire?.loading ? `待处理 ${batchResult?.totalMissing || missingJsonCount} 个缺少 JSON 的账号` : batchResult?.error || `成功 ${batchResult?.acquired || 0} 个 · 失败 ${batchResult?.failed || 0} 个 · 跳过 ${batchResult?.skipped || 0} 个 · 并发 ${batchResult?.concurrency || concurrency}`}</span></div></div>}
       <div className="filter-row"><div className="search-box"><ListFilter size={16} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索邮箱、账号或 Team" /></div><div className="segmented compact-segmented">{[['all', '全部'], ['free', '未加入'], ['team', '已加入'], ['cooldown', '冷却']].map(([id, label]) => <button key={id} className={filter === id ? 'selected' : ''} onClick={() => setFilter(id)}>{label}</button>)}</div><span className="result-count">显示 {visible.length} / {allChildren.length}</span></div>
       <div className="table-wrap"><table className="data-table account-table"><thead><tr><th>账号</th><th>状态</th><th>登录凭据</th><th>当前 Team</th><th>加入过的 Team</th><th>Sub2API</th><th /></tr></thead><tbody>{visible.map((account) => { const joinedTeams = joinedTeamsFor(account); const activeTeams = joinedTeams.filter((entry) => entry.status === 'active'); const historyTeams = joinedTeams.filter((entry) => entry.status !== 'active'); const acquireState = acquireStates?.[account.id]; return <tr key={account.id}><td><div className="account-cell"><div className="queue-avatar">{(account.email || '?')[0].toUpperCase()}</div><div><strong>{account.email || '未设置邮箱'}</strong><small className="mono">{account.id} · {account.plan || '未检测'}</small></div></div></td><td><StatusBadge status={account.status} /></td><td><div className="account-credential-cell"><CredentialState account={account} /><AcquireStatus state={acquireState} /></div></td><td>{activeTeams.length ? <div className="team-tags">{activeTeams.map((entry) => <span key={entry.team}>{teamNameForId(mothers, entry.team)}</span>)}</div> : <span className="muted">Free 池</span>}</td><td><div className="team-history-cell"><strong>{joinedTeams.length} 个空间</strong>{historyTeams.slice(-3).map((entry) => <small key={`${entry.team}-${entry.removedAt || entry.cooldownAt || entry.joinedAt}`}>{teamNameForId(mothers, entry.team)} · {entry.status === 'kicked' ? '已移出' : entry.status === 'cooldown' ? '冷却中' : '历史'}{entry.retryAfter ? ` · ${teamRetryLabel(entry)}` : entry.status === 'cooldown' ? ' · 等待额度刷新' : ''}</small>)}</div></td><td><span className={`sub2api-state ${account.sub2apiStatus?.imported ? 'ready' : ''}`}>{account.sub2apiStatus?.imported ? '已记录' : '未记录'}</span>{account.sub2apiStatus?.exportable && <small>可导出</small>}</td><td><div className="row-actions"><button className="icon-button small" title="获取 Free JSON" onClick={() => acquireAccount(account.id, 'free-json')} disabled={Boolean(acquireState?.loading)}><CloudDownload size={15} /></button><button className="icon-button small" title="刷新 AT" onClick={() => acquireAccount(account.id, 'refresh-at')} disabled={Boolean(acquireState?.loading)}><RefreshCw size={15} /></button><button className="icon-button small" title="编辑账号" onClick={() => editAccount(account)}><Settings2 size={15} /></button><button className="icon-button small" title="导入 Free Sub2API JSON" aria-label="导入 Free Sub2API JSON" onClick={() => openJsonImport(account.id)}><FileText size={15} /></button><button className="icon-button small" title="移出当前 Team" aria-label="移出当前 Team" onClick={() => removeChild(account.id)} disabled={!account.team}><UserMinus size={15} /></button><button className="icon-button small danger-hover" title="删除 Free 账号" aria-label="删除 Free 账号" onClick={() => deleteFreeAccount(account.id)}><Trash2 size={15} /></button></div></td></tr>; })}</tbody></table></div>{!visible.length && <div className="empty-state compact-empty"><UserRound size={26} /><strong>没有匹配的账号</strong><span>导入账号后会显示在这里。</span></div>}</section>
   </section>;
@@ -1086,7 +1131,7 @@ function HistoryView({ history, page, pageSize, meta, loading, error, onPageChan
     </div>
   </section>;
 }
-function SettingsView({ autoRefill, setAutoRefill, promoteJoinedAccounts, setPromoteJoinedAccounts, threshold, setThreshold, checkInterval, setCheckInterval, kickWindow, setKickWindow, integrations, openIntegration, proxy, openProxy, saveSettings }) {
+function SettingsView({ autoRefill, setAutoRefill, promoteJoinedAccounts, setPromoteJoinedAccounts, threshold, setThreshold, checkInterval, setCheckInterval, concurrency, setConcurrency, kickWindow, setKickWindow, integrations, openIntegration, proxy, openProxy, saveSettings }) {
   const sub2apiGroupIdSet = Number.isFinite(Number(integrations.sub2api.groupId)) && Number(integrations.sub2api.groupId) > 0;
   const sub2apiReady = integrations.sub2api.enabled && integrations.sub2api.baseUrl && integrations.sub2api.apiKeySet && (sub2apiGroupIdSet || String(integrations.sub2api.groupName || '').trim());
   const sub2apiTarget = integrations.sub2api.groupName || (integrations.sub2api.groupId ? `分组 ${integrations.sub2api.groupId}` : '未指定同步分组');
@@ -1100,6 +1145,7 @@ function SettingsView({ autoRefill, setAutoRefill, promoteJoinedAccounts, setPro
       <div className="setting-row kick-window-row"><div><strong>自动踢出窗口</strong><p>5h 和 7d 只能选择一个作为自动踢出条件，额度预警不会改变这个选择。</p></div><div className="segmented setting-segmented">{[['5h', '5h 耗尽'], ['7d', '7d 满额']].map(([id, label]) => <button key={id} className={kickWindow === id ? 'selected' : ''} onClick={() => setKickWindow(id)}>{label}</button>)}</div></div>
       <div className="setting-row"><div><strong>额度预警阈值</strong><p>低于此百分比时标记为“额度偏低”，但不会立即移除。</p></div><div className="number-input"><input type="number" min="1" max="50" value={threshold} onChange={(event) => setThreshold(event.target.value)} /><span>%</span></div></div>
       <div className="setting-row"><div><strong>检测周期</strong><p>自动轮询 Team 空间和所有已加入的账号。</p></div><select className="select-control" value={checkInterval} onChange={(event) => setCheckInterval(event.target.value)}><option value="30">30 秒</option><option value="60">60 秒</option><option value="300">5 分钟</option></select></div>
+      <div className="setting-row"><div><strong>全局并发数</strong><p>统一限制 Free 登录、Team 检测、OAuth 刷新和 Sub2API 推送的同时请求数。</p></div><div className="number-input"><input type="number" min="1" max="10" value={concurrency} onChange={(event) => setConcurrency(Math.min(10, Math.max(1, Number(event.target.value) || 1)))} /><span>个</span></div></div>
       <div className="save-row"><span className="muted">设置保存在服务端</span><button className="button primary" onClick={saveSettings}><Check size={15} />保存设置</button></div>
     </section>
     <section className="content-panel integration-panel">
@@ -1138,7 +1184,7 @@ function ProxyModal({ proxy = defaultProxySettings, onClose, onSave, onAdd, onRe
       <label><span>请求超时</span><div className="number-input"><input type="number" min="5" max="120" value={Math.round(Number(form.timeoutMs || 15000) / 1000)} onChange={(event) => update('timeoutMs', Math.min(120000, Math.max(5000, Number(event.target.value || 15) * 1000)))} /><span>秒</span></div></label>
       <label><span>最大重试次数</span><select className="select-control" value={form.maxRetries ?? 2} onChange={(event) => update('maxRetries', Number(event.target.value))}>{[0, 1, 2, 3, 4, 5].map((value) => <option value={value} key={value}>{value} 次</option>)}</select></label>
     </div>
-    <div className="proxy-entry-editor"><label><span>添加代理</span><small className="field-hint">每行一条，支持 HTTP / SOCKS5、账号密码和本机代理</small></label><textarea className="proxy-input" value={input} onChange={(event) => setInput(event.target.value)} placeholder={'http://127.0.0.1:7897\nsocks5://username:password@host:3010\nhost:3010:username:password\nusername:password@host:3010\nhost:3010@username:password'} /><div className="proxy-entry-actions"><span className="muted">凭据仅保存在服务端，列表只显示脱敏地址</span><button className="button secondary" disabled={adding || !input.trim()} onClick={addEntries}><Plus size={15} />{adding ? '添加中…' : '添加代理'}</button></div></div>
+    <div className="proxy-entry-editor"><label><span>添加代理</span><small className="field-hint">每行一条，支持 HTTP / SOCKS5 / SOCKS5H、账号密码和本机代理</small></label><textarea className="proxy-input" value={input} onChange={(event) => setInput(event.target.value)} placeholder={'http://127.0.0.1:7897\nsocks5h://username:password@host:3010\nsocks5h://username:password\\@host:3010\nhost:3010:username:password\nusername:password@host:3010\nhost:3010@username:password'} /><div className="proxy-entry-actions"><span className="muted">凭据仅保存在服务端，列表只显示脱敏地址</span><button className="button secondary" disabled={adding || !input.trim()} onClick={addEntries}><Plus size={15} />{adding ? '添加中…' : '添加代理'}</button></div></div>
     <div className="proxy-list"><div className="proxy-list-head"><strong>代理池</strong><span>{entries.length} 条</span></div>{entries.length ? entries.map((entry) => <div className="proxy-entry" key={entry.id}><div className="proxy-entry-status"><i className={entry.healthy === false ? 'unhealthy' : ''} /><div><strong>{entry.display}</strong><span>{entry.label || (entry.sourceType === 'local' ? '本机代理' : '家宽代理')} · {entry.protocol?.toUpperCase() || 'HTTP'}{entry.hasAuth ? ' · 已认证' : ''}</span></div></div><div className="proxy-entry-meta"><span className={entry.healthy === false ? 'proxy-health unhealthy' : 'proxy-health'}>{entry.healthy === false ? '待恢复' : '健康'}</span>{entry.failures ? <small>失败 {entry.failures} 次</small> : null}<button className="icon-button danger" title="删除代理" aria-label="删除代理" onClick={() => onRemove(entry.id)}><Trash2 size={15} /></button></div></div>) : <div className="proxy-empty"><SlidersHorizontal size={20} /><span>还没有代理，添加后启用代理池</span></div>}</div>
     <div className="modal-foot"><span className="muted">关闭代理池时，系统恢复直连。</span><button className="button primary" onClick={() => onSave({ ...form, timeoutMs: Number(form.timeoutMs) || 15000, maxRetries: Number(form.maxRetries) || 0 })}><Check size={15} />保存设置</button></div>
   </Modal>;

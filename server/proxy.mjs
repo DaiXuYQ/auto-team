@@ -14,13 +14,23 @@ function hostPort(value) {
   return port >= 1 && port <= 65535 ? { host: match[1], port } : null;
 }
 
+function normalizeHost(value) {
+  const host = String(value || '').trim();
+  return host.replace(/^\[|\]$/g, '');
+}
+
+function hostForUrl(value) {
+  const host = normalizeHost(value);
+  return host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
+}
+
 function encodePart(value) {
   return encodeURIComponent(String(value || ''));
 }
 
 function proxyUrlFromParts(protocol, host, port, username = '', password = '') {
   const auth = username || password ? `${encodePart(username)}:${encodePart(password)}@` : '';
-  return `${protocol}//${auth}${host}:${port}`;
+  return `${protocol}//${auth}${hostForUrl(host)}:${port}`;
 }
 
 function credentialsFrom(value) {
@@ -32,7 +42,11 @@ function credentialsFrom(value) {
 
 function normalizedProtocol(protocol) {
   const value = String(protocol || 'http:').toLowerCase().replace(/:$/, '');
-  return value === 'socks5h' ? 'socks5:' : `${value}:`;
+  // SOCKS5H keeps destination DNS resolution inside the proxy. Treat the
+  // common SOCKS5 spellings as that mode so a proxy cannot resolve targets
+  // locally by accident.
+  if (value === 'socks' || value === 'socks5' || value === 'socks5h') return 'socks5h:';
+  return `${value}:`;
 }
 
 function sourceTypeForHost(host) {
@@ -41,7 +55,10 @@ function sourceTypeForHost(host) {
 }
 
 export function parseProxyInput(input) {
-  let value = String(input || '').trim().replace(/\\@/g, '@');
+  // Proxy lists are often copied from shell snippets where @ is escaped.
+  // Remove only backslashes immediately before an authority separator so
+  // credentials containing other backslashes remain unchanged.
+  let value = String(input || '').trim().replace(/\\+(?=@)/g, '');
   if (!value) throw new Error('proxy_required');
   let protocol = 'http:';
   let host;
@@ -53,10 +70,14 @@ export function parseProxyInput(input) {
     const parsed = new URL(value);
     protocol = normalizedProtocol(parsed.protocol);
     if (!SUPPORTED_PROTOCOLS.has(protocol)) throw new Error('unsupported_proxy_protocol');
-    host = parsed.hostname.replace(/^\[|\]$/g, '');
+    host = normalizeHost(parsed.hostname);
     port = Number(parsed.port || (protocol === 'http:' || protocol === 'https:' ? 8080 : 1080));
-    username = decodeURIComponent(parsed.username || '');
-    password = decodeURIComponent(parsed.password || '');
+    try {
+      username = decodeURIComponent(parsed.username || '');
+      password = decodeURIComponent(parsed.password || '');
+    } catch {
+      throw new Error('invalid_proxy_credentials');
+    }
   } else {
     const at = value.lastIndexOf('@');
     if (at > 0) {
@@ -65,20 +86,20 @@ export function parseProxyInput(input) {
       const leftHost = hostPort(left);
       const rightHost = hostPort(right);
       if (leftHost && !rightHost) {
-        host = leftHost.host; port = leftHost.port;
+        host = normalizeHost(leftHost.host); port = leftHost.port;
         [username, password] = credentialsFrom(right);
       } else if (rightHost) {
-        host = rightHost.host; port = rightHost.port;
+        host = normalizeHost(rightHost.host); port = rightHost.port;
         [username, password] = credentialsFrom(left);
       } else throw new Error('invalid_proxy_host');
     } else {
       const parts = value.split(':').map((part) => part.trim());
       if (parts.length >= 4 && /^\d+$/.test(parts[1])) {
-        host = parts.shift(); port = Number(parts.shift()); username = parts.shift() || ''; password = parts.join(':');
+        host = normalizeHost(parts.shift()); port = Number(parts.shift()); username = parts.shift() || ''; password = parts.join(':');
       } else {
         const parsedHost = hostPort(value);
         if (!parsedHost) throw new Error('invalid_proxy_format');
-        host = parsedHost.host; port = parsedHost.port;
+        host = normalizeHost(parsedHost.host); port = parsedHost.port;
       }
     }
   }

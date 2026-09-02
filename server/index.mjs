@@ -36,6 +36,7 @@ const emptyState = {
     kickOnExhausted: true,
     kickWindow: '5h',
     promoteJoinedAccounts: true,
+    concurrency: 3,
     integrations: {
       sub2api: { baseUrl: '', apiKey: '', groupId: null, groupName: '', enabled: false },
       mailbox: { serviceType: 'manual', endpoint: '', apiKey: '', enabled: false },
@@ -79,6 +80,11 @@ async function loadState() {
 }
 
 let state = await loadState();
+function normalizeConcurrency(value, fallback = 3) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? Math.min(10, Math.max(1, Math.floor(numeric))) : fallback;
+}
+state.settings.concurrency = normalizeConcurrency(state.settings.concurrency);
 const storedProxyTimeout = Number(state.settings.proxy?.timeoutMs);
 const storedProxyRetries = Number(state.settings.proxy?.maxRetries);
 const storedProxyEntries = (Array.isArray(state.settings.proxy?.entries) ? state.settings.proxy.entries : []).flatMap((entry) => {
@@ -112,7 +118,51 @@ state.mothers = (Array.isArray(state.mothers) ? state.mothers : []).map((mother)
   tokenScope: 'team',
   planType: mother.planType || 'team',
 }));
-const proxyFetch = createProxyFetch(() => state.settings.proxy);
+let activeOutboundRequests = 0;
+const outboundRequestQueue = [];
+
+function drainOutboundRequestQueue() {
+  const limit = normalizeConcurrency(state.settings.concurrency);
+  while (activeOutboundRequests < limit && outboundRequestQueue.length) {
+    activeOutboundRequests += 1;
+    outboundRequestQueue.shift()();
+  }
+}
+
+function withOutboundConcurrency(operation) {
+  return new Promise((resolve, reject) => {
+    outboundRequestQueue.push(async () => {
+      try {
+        resolve(await operation());
+      } catch (error) {
+        reject(error);
+      } finally {
+        activeOutboundRequests = Math.max(0, activeOutboundRequests - 1);
+        drainOutboundRequestQueue();
+      }
+    });
+    drainOutboundRequestQueue();
+  });
+}
+
+async function mapWithConcurrency(items, operation, limit = state.settings.concurrency) {
+  const values = Array.from(items || []);
+  if (!values.length) return [];
+  const results = new Array(values.length);
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(values.length, normalizeConcurrency(limit)) }, async () => {
+    while (cursor < values.length) {
+      const index = cursor;
+      cursor += 1;
+      results[index] = await operation(values[index], index);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+const rawProxyFetch = createProxyFetch(() => state.settings.proxy);
+const proxyFetch = (...args) => withOutboundConcurrency(() => rawProxyFetch(...args));
 state.children = (Array.isArray(state.children) ? state.children : []).map((child) => ({
   ...child,
   // Free credentials stay independent from short-lived Team workspace tokens.
@@ -1630,7 +1680,22 @@ function applyLoggedInChildToken(child, result) {
   setChildLoginState(child, 'ready', '已完成登录，Free JSON 已生成');
 }
 
-async function acquireChildAuth(child, { refresh = false, verificationCode = '', callbackUrl = '', allowCredentialLogin = false } = {}) {
+const childAuthQueues = new Map();
+
+async function acquireChildAuth(child, options = {}) {
+  if (!child) return { ok: false, status: 404, message: 'child_not_found' };
+  const key = String(child.id || child.email || 'unknown');
+  const previous = childAuthQueues.get(key) || Promise.resolve();
+  const current = previous.catch(() => {}).then(() => acquireChildAuthInternal(child, options));
+  childAuthQueues.set(key, current);
+  try {
+    return await current;
+  } finally {
+    if (childAuthQueues.get(key) === current) childAuthQueues.delete(key);
+  }
+}
+
+async function acquireChildAuthInternal(child, { refresh = false, verificationCode = '', callbackUrl = '', allowCredentialLogin = false } = {}) {
   if (!child) return { ok: false, status: 404, message: 'child_not_found' };
   if (child.accessToken && !refresh && !freeTokenNeedsRefresh(child)) {
     setChildLoginState(child, 'ready', '已有可用 AT');
@@ -1886,31 +1951,31 @@ async function checkTeam(motherId) {
   }
   const members = state.children.filter((child) => isChildMemberOfTeam(child, mother.team));
   const kickWindow = selectedKickWindow(mother);
-  const results = [];
-  let renewedTeamTokens = 0;
-  let renewedFreeTokens = 0;
-  let reloggedFreeAccounts = 0;
-  for (const child of members) {
-    const teamOwner = teamOwnerRecords(mother).find((owner) => String(owner.email || '').toLowerCase() === String(child.email || '').toLowerCase());
-    const workspaceToken = workspaceTokenFor(child, mother.accountId) || workspaceTokenFor(child, mother.team);
-    const importedOwnerToken = teamTokenDetails(teamOwner?.accessToken, mother.accountId)?.accessToken || '';
-    const quotaToken = workspaceToken?.accessToken || importedOwnerToken;
-    let result = await probeUsage(quotaToken, mother.accountId);
-    let tokenRecovery = null;
-    if (result.status === 401 || result.message === 'missing_token') {
-      tokenRecovery = await renewUnauthorizedTeamToken(mother, child);
-      if (tokenRecovery.ok) {
-        renewedTeamTokens += 1;
-        if (tokenRecovery.freeRefreshed) renewedFreeTokens += 1;
-        if (tokenRecovery.credentialLogin) reloggedFreeAccounts += 1;
-        const renewedToken = workspaceTokenFor(child, mother.accountId) || workspaceTokenFor(child, mother.team);
-        result = await probeUsage(renewedToken?.accessToken || '', mother.accountId);
+  const results = await mapWithConcurrency(members, async (child) => {
+    try {
+      const teamOwner = teamOwnerRecords(mother).find((owner) => String(owner.email || '').toLowerCase() === String(child.email || '').toLowerCase());
+      const workspaceToken = workspaceTokenFor(child, mother.accountId) || workspaceTokenFor(child, mother.team);
+      const importedOwnerToken = teamTokenDetails(teamOwner?.accessToken, mother.accountId)?.accessToken || '';
+      const quotaToken = workspaceToken?.accessToken || importedOwnerToken;
+      let result = await probeUsage(quotaToken, mother.accountId);
+      let tokenRecovery = null;
+      if (result.status === 401 || result.message === 'missing_token') {
+        tokenRecovery = await renewUnauthorizedTeamToken(mother, child);
+        if (tokenRecovery.ok) {
+          const renewedToken = workspaceTokenFor(child, mother.accountId) || workspaceTokenFor(child, mother.team);
+          result = await probeUsage(renewedToken?.accessToken || '', mother.accountId);
+        }
       }
+      applyQuotaResult(child, result, mother.team, kickWindow);
+      const membership = membershipFor(child, mother.team);
+      return { id: child.id, email: child.email, ...result, quotaSource: quotaToken ? 'team' : 'team_token_missing', quota5h: membership?.quota5h ?? null, quota7d: membership?.quota7d ?? null, tokenRecovery: tokenRecovery ? { attempted: true, ok: tokenRecovery.ok, status: tokenRecovery.status, code: tokenRecovery.code || null, message: tokenRecovery.message, freeRefreshed: tokenRecovery.freeRefreshed, credentialLogin: Boolean(tokenRecovery.credentialLogin), credentialLoginAttempted: Boolean(tokenRecovery.credentialLoginAttempted), needsInput: Boolean(tokenRecovery.needsInput), browserRequired: Boolean(tokenRecovery.browserRequired) } : null };
+    } catch (error) {
+      return { id: child.id, email: child.email, ok: false, status: 502, message: error?.message || 'quota_probe_failed', quota5h: null, quota7d: null, tokenRecovery: null };
     }
-    applyQuotaResult(child, result, mother.team, kickWindow);
-    const membership = membershipFor(child, mother.team);
-    results.push({ id: child.id, email: child.email, ...result, quotaSource: quotaToken ? 'team' : 'team_token_missing', quota5h: membership?.quota5h ?? null, quota7d: membership?.quota7d ?? null, tokenRecovery: tokenRecovery ? { attempted: true, ok: tokenRecovery.ok, status: tokenRecovery.status, code: tokenRecovery.code || null, message: tokenRecovery.message, freeRefreshed: tokenRecovery.freeRefreshed, credentialLogin: Boolean(tokenRecovery.credentialLogin), credentialLoginAttempted: Boolean(tokenRecovery.credentialLoginAttempted), needsInput: Boolean(tokenRecovery.needsInput), browserRequired: Boolean(tokenRecovery.browserRequired) } : null });
-  }
+  });
+  const renewedTeamTokens = results.filter((result) => result.tokenRecovery?.ok).length;
+  const renewedFreeTokens = results.filter((result) => result.tokenRecovery?.ok && result.tokenRecovery.freeRefreshed).length;
+  const reloggedFreeAccounts = results.filter((result) => result.tokenRecovery?.ok && result.tokenRecovery.credentialLogin).length;
   const sub2apiPush = renewedTeamTokens > 0
     ? await pushRenewedTeamJson(mother)
     : { attempted: false, ok: null, status: null, message: null, pushed: 0, failed: 0 };
@@ -2236,27 +2301,92 @@ async function withMaintenanceLock(owner, operation) {
   }
 }
 
+function freeAuthBatchResult(child, acquired, extra = {}) {
+  return {
+    id: child.id,
+    email: child.email,
+    ok: acquired.ok === true,
+    status: acquired.status || null,
+    code: acquired.code || null,
+    message: acquired.message || acquired.child?.login?.message || null,
+    source: acquired.source || null,
+    needsInput: Boolean(acquired.needsInput),
+    browserRequired: Boolean(acquired.browserRequired),
+    ...extra,
+  };
+}
+
 async function prepareFreeJsonPool() {
-  const results = [];
-  for (const child of state.children) {
-    if (child.accessToken || (!child.refreshToken && !(child.email && child.password)) || freeAuthRequiresManualInput(child)) continue;
-    if (freeAuthRetryBackoffActive(child)) continue;
-    const acquired = await ensureChildFreeAuth(child);
-    results.push({
-      id: child.id,
-      email: child.email,
-      ok: acquired.ok === true,
-      status: acquired.status || null,
-      code: acquired.code || null,
-      source: acquired.source || null,
-      needsInput: Boolean(acquired.needsInput),
-      browserRequired: Boolean(acquired.browserRequired),
-    });
-  }
+  const candidates = state.children.filter((child) => (
+    freeTokenNeedsRefresh(child)
+    && Boolean(child.refreshToken || (child.email && child.password))
+    && !freeAuthRequiresManualInput(child)
+    && !freeAuthRetryBackoffActive(child)
+  ));
+  const results = await mapWithConcurrency(candidates, async (child) => {
+    try {
+      return freeAuthBatchResult(child, await ensureChildFreeAuth(child));
+    } catch (error) {
+      return freeAuthBatchResult(child, { ok: false, status: 502, code: 'free_auth_failed', message: error?.message || 'free_auth_failed' });
+    }
+  });
   return {
     attempted: results.length,
     acquired: results.filter((result) => result.ok).length,
     failed: results.filter((result) => !result.ok).length,
+    results,
+  };
+}
+
+async function acquireMissingFreeJson() {
+  const missing = state.children.filter((child) => !child.accessToken);
+  const candidates = [];
+  const skipped = [];
+  for (const child of missing) {
+    if (freeAuthRequiresManualInput(child)) {
+      skipped.push(freeAuthBatchResult(child, {
+        ok: false,
+        status: 202,
+        code: child.loginStatus || child.status || 'verification_required',
+        message: child.loginMessage || '账号需要人工完成登录验证',
+        needsInput: true,
+        browserRequired: child.loginBrowserRequired,
+      }, { skipped: true }));
+      continue;
+    }
+    if (!child.refreshToken && !(child.email && child.password)) {
+      skipped.push(freeAuthBatchResult(child, {
+        ok: false,
+        status: 400,
+        code: 'credentials_required',
+        message: '缺少 refresh token 或邮箱密码',
+      }, { skipped: true }));
+      continue;
+    }
+    candidates.push(child);
+  }
+  const attempted = await mapWithConcurrency(candidates, async (child) => {
+    try {
+      const result = await acquireChildAuth(child, { refresh: true, allowCredentialLogin: true });
+      return freeAuthBatchResult(child, result);
+    } catch (error) {
+      return freeAuthBatchResult(child, { ok: false, status: 502, code: 'free_auth_failed', message: error?.message || 'free_auth_failed' });
+    }
+  });
+  const results = [...attempted, ...skipped];
+  const acquired = attempted.filter((result) => result.ok).length;
+  const failed = attempted.length - acquired;
+  addHistory('批量获取 Free JSON', `缺少 JSON ${missing.length} 个，并发 ${normalizeConcurrency(state.settings.concurrency)}，成功 ${acquired} 个，失败 ${failed} 个，跳过 ${skipped.length} 个`, failed || skipped.length ? 'partial' : 'success');
+  await persist();
+  return {
+    ok: failed === 0 && skipped.length === 0,
+    status: failed || skipped.length ? 207 : 200,
+    concurrency: normalizeConcurrency(state.settings.concurrency),
+    totalMissing: missing.length,
+    attempted: attempted.length,
+    acquired,
+    failed,
+    skipped: skipped.length,
     results,
   };
 }
@@ -2698,9 +2828,7 @@ async function pushSub2ApiEntries(entries = [], historyLabel = '推送 Sub2API')
   const group = await resolveSub2ApiGroup(config);
   if (!group.ok) return { ok: false, status: group.status || 400, message: group.message, pushed: [], failed: [] };
   const groupId = group.id;
-  const pushed = [];
-  const failed = [];
-  for (const entry of entries) {
+  const outcomes = await mapWithConcurrency(entries, async (entry) => {
     const payload = { ...entry.payload, group_ids: [groupId] };
     const email = entry.email || payload.email || payload.credentials?.email || '';
     try {
@@ -2722,12 +2850,14 @@ async function pushSub2ApiEntries(entries = [], historyLabel = '推送 Sub2API')
       const result = existing?.id
         ? await sub2ApiRequest(config, `/admin/accounts/${encodeURIComponent(existing.id)}`, { method: 'PUT', body: { ...payload, group_ids: [groupId] } })
         : await sub2ApiRequest(config, '/admin/accounts', { method: 'POST', body: payload });
-      if (!result.ok) { failed.push({ id: entry.id, motherId: entry.motherId, email, status: result.status, message: result.message }); continue; }
-      pushed.push({ id: entry.id, motherId: entry.motherId, email, targetGroupId: groupId, targetGroupName: group.name || config.groupName || '', action: existing?.id ? 'updated' : 'created' });
+      if (!result.ok) return { ok: false, value: { id: entry.id, motherId: entry.motherId, email, status: result.status, message: result.message } };
+      return { ok: true, value: { id: entry.id, motherId: entry.motherId, email, targetGroupId: groupId, targetGroupName: group.name || config.groupName || '', action: existing?.id ? 'updated' : 'created' } };
     } catch (error) {
-      failed.push({ id: entry.id, motherId: entry.motherId, email, status: 0, message: error?.name === 'TimeoutError' ? 'timeout' : 'network_error' });
+      return { ok: false, value: { id: entry.id, motherId: entry.motherId, email, status: 0, message: error?.name === 'TimeoutError' ? 'timeout' : 'network_error' } };
     }
-  }
+  });
+  const pushed = outcomes.filter((outcome) => outcome.ok).map((outcome) => outcome.value);
+  const failed = outcomes.filter((outcome) => !outcome.ok).map((outcome) => outcome.value);
   addHistory(historyLabel, `${group.name || `分组 ${groupId}`} 推送 ${pushed.length} 个账号${failed.length ? `，失败 ${failed.length} 个` : ''}`, failed.length ? 'partial' : 'success');
   await persist();
   return { ok: failed.length === 0, status: failed.length ? 207 : 200, targetGroupId: groupId, targetGroupName: group.name || config.groupName || '', pushed, failed };
@@ -2771,7 +2901,8 @@ const mcpTools = [
   { name: 'check_all_teams', description: '检测所有已配置真实凭据的 Team。', inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
   { name: 'refill_team', description: '对一个 Team 执行移除已耗尽账号并从待加入池补位。', inputSchema: { type: 'object', properties: { teamId: { type: 'string', description: 'Team 记录 id、accountId 或 team id。' } }, required: ['teamId'], additionalProperties: false } },
   { name: 'refill_all_teams', description: '对所有已配置真实凭据的 Team 执行移除和补位。', inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
-  { name: 'update_settings', description: '更新自动补位、加入账号角色、额度预警阈值、检测周期和自动踢出窗口。', inputSchema: { type: 'object', properties: { autoRefill: { type: 'boolean' }, promoteJoinedAccounts: { type: 'boolean' }, threshold: { type: 'number', minimum: 1, maximum: 100 }, checkInterval: { type: 'number', minimum: 30 }, kickWindow: { type: 'string', enum: ['5h', '7d'] } }, additionalProperties: false } },
+  { name: 'acquire_missing_free_json', description: '按全局并发设置，为所有尚无可导出 JSON 的 Free 账号获取 AT/RT。', inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
+  { name: 'update_settings', description: '更新自动补位、加入账号角色、额度预警阈值、检测周期、并发数和自动踢出窗口。', inputSchema: { type: 'object', properties: { autoRefill: { type: 'boolean' }, promoteJoinedAccounts: { type: 'boolean' }, threshold: { type: 'number', minimum: 1, maximum: 100 }, checkInterval: { type: 'number', minimum: 30 }, concurrency: { type: 'integer', minimum: 1, maximum: 10 }, kickWindow: { type: 'string', enum: ['5h', '7d'] } }, additionalProperties: false } },
 ];
 
 function mcpAuthOk(req) {
@@ -2836,13 +2967,16 @@ async function mcpCallTool(name, args = {}) {
     return withMaintenanceLock('mcp_refill_team', () => refillTeam(motherId));
   }
   if (name === 'refill_all_teams') return withMaintenanceLock('mcp_refill_all', () => refillAllTeams());
+  if (name === 'acquire_missing_free_json') return withMaintenanceLock('mcp_acquire_missing_free_json', () => acquireMissingFreeJson());
   if (name === 'update_settings') {
     const input = args && typeof args === 'object' ? args : {};
     if (input.autoRefill !== undefined) state.settings.autoRefill = Boolean(input.autoRefill);
     if (input.promoteJoinedAccounts !== undefined) state.settings.promoteJoinedAccounts = Boolean(input.promoteJoinedAccounts);
     if (input.threshold !== undefined) state.settings.threshold = Math.min(100, Math.max(1, Number(input.threshold) || state.settings.threshold));
     if (input.checkInterval !== undefined) state.settings.checkInterval = Math.max(30, Number(input.checkInterval) || state.settings.checkInterval);
+    if (input.concurrency !== undefined) state.settings.concurrency = normalizeConcurrency(input.concurrency, state.settings.concurrency);
     if (input.kickWindow !== undefined) state.settings.kickWindow = input.kickWindow === '7d' ? '7d' : '5h';
+    drainOutboundRequestQueue();
     configureMaintenanceTimer();
     addHistory('更新设置', 'Agent 通过 MCP 更新自动化策略');
     await persist();
@@ -2946,13 +3080,15 @@ async function handleApi(req, res, url) {
   if (method === 'GET' && url.pathname === '/api/health') return sendJson(res, 200, { ok: true, updatedAt: state.updatedAt });
   if (method === 'PATCH' && url.pathname === '/api/settings') {
     const autoRefillWasEnabled = state.settings.autoRefill === true;
-    const allowed = ['autoRefill', 'promoteJoinedAccounts', 'threshold', 'checkInterval', 'kickOnExhausted', 'kickWindow'];
+    const allowed = ['autoRefill', 'promoteJoinedAccounts', 'threshold', 'checkInterval', 'concurrency', 'kickOnExhausted', 'kickWindow'];
     for (const key of allowed) {
       if (body[key] === undefined) continue;
       if (key === 'autoRefill' || key === 'promoteJoinedAccounts' || key === 'kickOnExhausted') state.settings[key] = Boolean(body[key]);
       else if (key === 'kickWindow') state.settings.kickWindow = body[key] === '7d' ? '7d' : '5h';
+      else if (key === 'concurrency') state.settings.concurrency = normalizeConcurrency(body[key], state.settings.concurrency);
       else state.settings[key] = Math.max(1, Number(body[key]) || state.settings[key]);
     }
+    drainOutboundRequestQueue();
     configureMaintenanceTimer();
     addHistory('更新设置', '自动化策略已更新');
     await persist();
@@ -3389,6 +3525,10 @@ async function handleApi(req, res, url) {
   }
   if (method === 'POST' && url.pathname === '/api/maintenance/refill-all') {
     const result = await withMaintenanceLock('http_refill_all', () => refillAllTeams());
+    return sendJson(res, result.status === 409 ? 409 : 200, result);
+  }
+  if (method === 'POST' && url.pathname === '/api/children/acquire-missing-json') {
+    const result = await withMaintenanceLock('http_acquire_missing_free_json', () => acquireMissingFreeJson());
     return sendJson(res, result.status === 409 ? 409 : 200, result);
   }
   if (method === 'POST' && url.pathname === '/api/sub2api/export') {

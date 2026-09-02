@@ -43,8 +43,11 @@ function normalizeProxy(proxy) {
     throw new Error('sentinel_socks_auth_unsupported');
   }
   const port = parsed.port || (parsed.protocol.startsWith('socks') ? '1080' : '8080');
+  // Chromium's --proxy-server flag expects the socks5 spelling; keep the
+  // socks5h alias at the Node request boundary where it is meaningful.
+  const browserProtocol = parsed.protocol === 'socks5h:' ? 'socks5:' : parsed.protocol;
   return {
-    server: `${parsed.protocol}//${parsed.hostname}:${port}`,
+    server: `${browserProtocol}//${parsed.hostname}:${port}`,
     username,
     password,
   };
