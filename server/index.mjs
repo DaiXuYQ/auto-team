@@ -35,6 +35,7 @@ const emptyState = {
     checkInterval: 60,
     kickOnExhausted: true,
     kickWindow: '5h',
+    kickAfterHours: 12,
     promoteJoinedAccounts: true,
     concurrency: 3,
     integrations: {
@@ -160,6 +161,15 @@ function normalizeConcurrency(value, fallback = 3) {
   const numeric = Number(value);
   return Number.isFinite(numeric) ? Math.min(10, Math.max(1, Math.floor(numeric))) : fallback;
 }
+function normalizeKickWindow(value, fallback = '5h') {
+  return ['5h', '7d', 'time'].includes(String(value || '').trim()) ? String(value).trim() : fallback;
+}
+function normalizeKickAfterHours(value, fallback = 12) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? Math.min(720, Math.max(1, Math.floor(numeric))) : fallback;
+}
+state.settings.kickWindow = normalizeKickWindow(state.settings.kickWindow);
+state.settings.kickAfterHours = normalizeKickAfterHours(state.settings.kickAfterHours);
 state.settings.concurrency = normalizeConcurrency(state.settings.concurrency);
 const storedProxyTimeout = Number(state.settings.proxy?.timeoutMs);
 const storedProxyRetries = Number(state.settings.proxy?.maxRetries);
@@ -317,7 +327,7 @@ function membershipFor(child, teamId, create = false) {
   if (!Array.isArray(child.workspaceHistory)) child.workspaceHistory = [];
   let entry = child.workspaceHistory.find((item) => item.team === teamId && item.status === 'active');
   if (!entry && create) {
-    entry = { team: teamId, joinedAt: child.joinedAt || now(), status: 'active' };
+    entry = { team: teamId, joinedAt: now(), status: 'active' };
     child.workspaceHistory.push(entry);
   }
   return entry || null;
@@ -1519,8 +1529,9 @@ async function syncMotherWorkspace(mother, { query = '', force = false } = {}) {
       child.memberId = member.id || child.memberId;
       child.memberSnapshot = member;
       if (child.status !== 'kicked') {
-        const membership = membershipFor(child, mother.team, true);
-        membership.joinedAt = membership.joinedAt || now();
+        const existingMembership = membershipFor(child, mother.team);
+        const membership = existingMembership || membershipFor(child, mother.team, true);
+        if (!existingMembership && member.createdTime) membership.joinedAt = member.createdTime;
         membership.source = membership.source || 'member_sync';
         membership.role = member.role || membership.role || null;
         // `team` remains a current-space convenience field; history holds all active memberships.
@@ -1711,18 +1722,23 @@ async function probeMother(mother) {
 }
 
 function selectedKickWindow(mother = null) {
-  // Rotating spaces use the long window so a seat is only replaced after its
-  // weekly allowance is exhausted. Fixed spaces follow the global setting.
+  const configured = normalizeKickWindow(state.settings?.kickWindow);
+  // A time-based policy is explicit and applies to every Team rotation mode.
+  if (configured === 'time') return 'time';
+  // Rotating spaces use the long quota window so a seat is only replaced after
+  // its weekly allowance is exhausted. Fixed spaces follow the global setting.
   if (mother?.rotationMode === 'rotating') return '7d';
-  return state.settings?.kickWindow === '7d' ? '7d' : '5h';
+  return configured;
 }
 
 function quotaIsExhausted(child, result, window = selectedKickWindow()) {
+  if (window === 'time') return false;
   const selected = window === '7d' ? result?.secondary : result?.primary;
   return Boolean(result?.ok && selected?.usedPercent != null && selected.usedPercent >= 99.99);
 }
 
 function quotaRetryAfter(child, window = selectedKickWindow(), teamId = null) {
+  if (window === 'time') return new Date(Date.now() + normalizeKickAfterHours(state.settings?.kickAfterHours) * 60 * 60 * 1000).toISOString();
   const membership = teamId ? latestMembershipHistoryFor(child, teamId) : null;
   const resetAt = window === '7d'
     ? (membership?.quota7dResetAt || (child.team === teamId ? child.quota7dResetAt : null))
@@ -1735,14 +1751,25 @@ function quotaRetryAfter(child, window = selectedKickWindow(), teamId = null) {
 }
 
 function quotaKickReason(child, window = selectedKickWindow()) {
+  if (window === 'time') return 'time_elapsed';
   return window === '7d' ? 'quota_7d' : 'quota_5h';
 }
 
 function membershipQuotaIsExhausted(child, teamId, window = selectedKickWindow()) {
+  if (window === 'time') return false;
   const membership = latestMembershipHistoryFor(child, teamId);
   if (!membership) return false;
   if (membership.quotaStatus === 'exhausted' && membership.quotaStatusWindow === window) return true;
   return quotaIsExhausted(child, membership.lastProbe, window);
+}
+
+function timeKickExpired(child, teamId, afterHours = state.settings?.kickAfterHours) {
+  const membership = membershipFor(child, teamId);
+  const joinedAt = membership?.joinedAt || (child?.team === teamId ? child.joinedAt : null);
+  const joinedTimestamp = Date.parse(joinedAt || '');
+  if (!Number.isFinite(joinedTimestamp)) return false;
+  const hours = normalizeKickAfterHours(afterHours);
+  return Date.now() >= joinedTimestamp + hours * 60 * 60 * 1000;
 }
 
 function applyQuotaResult(child, result, teamId = null, window = selectedKickWindow(), { createMembership = false } = {}) {
@@ -2318,6 +2345,8 @@ async function checkTeam(motherId) {
     renewedTeamTokens,
     renewedFreeTokens,
     reloggedTeamAccounts,
+    kickWindow,
+    kickAfterHours: kickWindow === 'time' ? normalizeKickAfterHours(state.settings?.kickAfterHours) : null,
     bannedAccounts: bannedAccounts.map((result) => ({ id: result.id, email: result.email, reason: result.banReason })),
     sub2apiPush,
     managerRecovery,
@@ -2526,12 +2555,16 @@ async function refillTeamInternal(motherId, mother) {
     }
   }
   const rotationBudgetBefore = dailyRotationBudget(mother);
-  updateRotationProgress(mother, 'kick', { message: `正在检查封禁和额度耗尽账号（今日 ${rotationBudgetBefore.count}/${rotationBudgetBefore.limit}）` });
-  const active = state.children.filter((child) => isChildMemberOfTeam(child, mother.team));
+  const kickAfterHours = normalizeKickAfterHours(state.settings?.kickAfterHours);
   const kickWindow = selectedKickWindow(mother);
+  const kickDescription = kickWindow === 'time' ? `加入超过 ${kickAfterHours} 小时的账号` : '额度耗尽账号';
+  updateRotationProgress(mother, 'kick', { message: `正在检查封禁和${kickDescription}（今日 ${rotationBudgetBefore.count}/${rotationBudgetBefore.limit}）` });
+  const active = state.children.filter((child) => isChildMemberOfTeam(child, mother.team));
   const removalCandidates = active.filter((child) => childIsBanned(child)
-    || membershipQuotaIsExhausted(child, mother.team, kickWindow)
-    || (child.team === mother.team && child.lastProbe?.ok === true && quotaIsExhausted(child, child.lastProbe, kickWindow)))
+    || (kickWindow === 'time'
+      ? timeKickExpired(child, mother.team, kickAfterHours)
+      : membershipQuotaIsExhausted(child, mother.team, kickWindow)
+        || (child.team === mother.team && child.lastProbe?.ok === true && quotaIsExhausted(child, child.lastProbe, kickWindow))))
     .sort((left, right) => Number(childIsBanned(right)) - Number(childIsBanned(left)));
   const rotationLimitSkipped = [];
   const kicked = [];
@@ -2701,7 +2734,7 @@ async function refillTeamInternal(motherId, mother) {
   const ok = kickFailures.length === 0 && joinFailures.length === 0 && !pushFailed;
   finishRotationProgress(mother, ok ? 'completed' : 'partial', rotationLimitSkipped.length ? `已达到今日轮转上限 ${rotationBudgetAfter.count}/${rotationBudgetAfter.limit}` : ok ? '轮换链路执行完成' : '轮换完成，但存在未成功步骤', { kicked: kicked.length, joined: confirmedJoined.length, pushed: joinedSub2apiPush.pushed || 0, skipped: (joinedSub2apiPush.skipped || 0) + rotationLimitSkipped.length, failed: kickFailures.length + joinFailures.length + (joinedSub2apiPush.failed || 0) });
   await persist();
-  return { ok, status: ok ? 200 : 207, kicked: kicked.map(publicChild), joined: confirmedJoined.map(publicChild), kickFailures, joinFailures, rotationLimitSkipped, dailyRotationUsage: rotationBudgetAfter, sub2apiPush: joinedSub2apiPush, rotationProgress: mother.rotationProgress, seatsInUse: mother.used, seatsOpen: Number.isFinite(Number(mother.seats)) && Number.isFinite(Number(mother.used)) ? Math.max(0, mother.seats - mother.used) : null, seatSnapshot: mother.seatSnapshot || workspace.seatSnapshot || null };
+  return { ok, status: ok ? 200 : 207, kicked: kicked.map(publicChild), joined: confirmedJoined.map(publicChild), kickFailures, joinFailures, rotationLimitSkipped, kickWindow, kickAfterHours: kickWindow === 'time' ? kickAfterHours : null, dailyRotationUsage: rotationBudgetAfter, sub2apiPush: joinedSub2apiPush, rotationProgress: mother.rotationProgress, seatsInUse: mother.used, seatsOpen: Number.isFinite(Number(mother.seats)) && Number.isFinite(Number(mother.used)) ? Math.max(0, mother.seats - mother.used) : null, seatSnapshot: mother.seatSnapshot || workspace.seatSnapshot || null };
 }
 
 async function refillAllTeams() {
@@ -3569,10 +3602,10 @@ const mcpTools = [
   { name: 'get_history', description: '获取额度检测、移除、加入和设置变更记录。', inputSchema: { type: 'object', properties: { limit: { type: 'integer', minimum: 1, maximum: 200, description: '最多返回多少条，默认 50。' } }, additionalProperties: false } },
   { name: 'check_team_quota', description: '检测一个 Team 及其成员的 5h / 7d 额度，并同步席位和成员快照。', inputSchema: { type: 'object', properties: { teamId: { type: 'string', description: 'Team 记录 id、accountId 或 team id。' } }, required: ['teamId'], additionalProperties: false } },
   { name: 'check_all_teams', description: '检测所有已配置真实凭据的 Team。', inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
-  { name: 'refill_team', description: '对一个 Team 执行移除已耗尽账号并从待加入池补位。', inputSchema: { type: 'object', properties: { teamId: { type: 'string', description: 'Team 记录 id、accountId 或 team id。' } }, required: ['teamId'], additionalProperties: false } },
+  { name: 'refill_team', description: '对一个 Team 按当前踢出条件移除账号并从待加入池补位。', inputSchema: { type: 'object', properties: { teamId: { type: 'string', description: 'Team 记录 id、accountId 或 team id。' } }, required: ['teamId'], additionalProperties: false } },
   { name: 'refill_all_teams', description: '对所有已配置真实凭据的 Team 执行移除和补位。', inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
   { name: 'acquire_missing_free_json', description: '按全局并发设置，为所有尚无可导出 JSON 的 Free 账号获取 AT/RT。', inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
-  { name: 'update_settings', description: '更新自动补位、加入账号角色、额度预警阈值、检测周期、并发数和自动踢出窗口。', inputSchema: { type: 'object', properties: { autoRefill: { type: 'boolean' }, promoteJoinedAccounts: { type: 'boolean' }, threshold: { type: 'number', minimum: 1, maximum: 100 }, checkInterval: { type: 'number', minimum: 30 }, concurrency: { type: 'integer', minimum: 1, maximum: 10 }, kickWindow: { type: 'string', enum: ['5h', '7d'] } }, additionalProperties: false } },
+  { name: 'update_settings', description: '更新自动补位、加入账号角色、额度预警阈值、检测周期、并发数和自动踢出窗口。', inputSchema: { type: 'object', properties: { autoRefill: { type: 'boolean' }, promoteJoinedAccounts: { type: 'boolean' }, threshold: { type: 'number', minimum: 1, maximum: 100 }, checkInterval: { type: 'number', minimum: 30 }, concurrency: { type: 'integer', minimum: 1, maximum: 10 }, kickWindow: { type: 'string', enum: ['5h', '7d', 'time'] }, kickAfterHours: { type: 'number', minimum: 1, maximum: 720 } }, additionalProperties: false } },
 ];
 
 function mcpAuthOk(req) {
@@ -3645,7 +3678,8 @@ async function mcpCallTool(name, args = {}) {
     if (input.threshold !== undefined) state.settings.threshold = Math.min(100, Math.max(1, Number(input.threshold) || state.settings.threshold));
     if (input.checkInterval !== undefined) state.settings.checkInterval = Math.max(30, Number(input.checkInterval) || state.settings.checkInterval);
     if (input.concurrency !== undefined) state.settings.concurrency = normalizeConcurrency(input.concurrency, state.settings.concurrency);
-    if (input.kickWindow !== undefined) state.settings.kickWindow = input.kickWindow === '7d' ? '7d' : '5h';
+    if (input.kickWindow !== undefined) state.settings.kickWindow = normalizeKickWindow(input.kickWindow, state.settings.kickWindow);
+    if (input.kickAfterHours !== undefined) state.settings.kickAfterHours = normalizeKickAfterHours(input.kickAfterHours, state.settings.kickAfterHours);
     drainOutboundRequestQueue();
     configureMaintenanceTimer();
     addHistory('更新设置', 'Agent 通过 MCP 更新自动化策略');
@@ -3750,11 +3784,12 @@ async function handleApi(req, res, url) {
   if (method === 'GET' && url.pathname === '/api/health') return sendJson(res, 200, { ok: true, updatedAt: state.updatedAt });
   if (method === 'PATCH' && url.pathname === '/api/settings') {
     const autoRefillWasEnabled = state.settings.autoRefill === true;
-    const allowed = ['autoRefill', 'promoteJoinedAccounts', 'threshold', 'checkInterval', 'concurrency', 'kickOnExhausted', 'kickWindow'];
+    const allowed = ['autoRefill', 'promoteJoinedAccounts', 'threshold', 'checkInterval', 'concurrency', 'kickOnExhausted', 'kickWindow', 'kickAfterHours'];
     for (const key of allowed) {
       if (body[key] === undefined) continue;
       if (key === 'autoRefill' || key === 'promoteJoinedAccounts' || key === 'kickOnExhausted') state.settings[key] = Boolean(body[key]);
-      else if (key === 'kickWindow') state.settings.kickWindow = body[key] === '7d' ? '7d' : '5h';
+      else if (key === 'kickWindow') state.settings.kickWindow = normalizeKickWindow(body[key], state.settings.kickWindow);
+      else if (key === 'kickAfterHours') state.settings.kickAfterHours = normalizeKickAfterHours(body[key], state.settings.kickAfterHours);
       else if (key === 'concurrency') state.settings.concurrency = normalizeConcurrency(body[key], state.settings.concurrency);
       else state.settings[key] = Math.max(1, Number(body[key]) || state.settings[key]);
     }
