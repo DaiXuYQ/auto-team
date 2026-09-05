@@ -1,6 +1,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { loginFreeAccount } from './openai-login.mjs';
+import { classifyChallenge, loginFreeAccount } from './openai-login.mjs';
+
+test('classifies explicit account suspension before generic HTTP 403 verification', () => {
+  assert.equal(classifyChallenge('', '{"error":{"code":"account_deactivated","message":"Your account has been deactivated"}}', 403), 'account_banned');
+  assert.equal(classifyChallenge('', '{"detail":"account suspended"}', 400), 'account_banned');
+  assert.equal(classifyChallenge('', '{"error":"turnstile_required"}', 403), 'protocol_verification_required');
+});
 
 function workspaceCookie(workspaces) {
   return `${Buffer.from(JSON.stringify({ workspaces })).toString('base64url')}.signature`;

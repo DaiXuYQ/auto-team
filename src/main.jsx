@@ -984,6 +984,24 @@ function App() {
     }
   }
 
+  async function batchDeleteBannedAccounts(ids) {
+    const uniqueIds = [...new Set((ids || []).filter(Boolean))];
+    if (!uniqueIds.length) return null;
+    if (!window.confirm(`确认批量删除 ${uniqueIds.length} 个封禁账号的本地记录？仍在 Team 中的账号会自动跳过。`)) return null;
+    try {
+      const payload = await apiRequest('/api/children/batch-delete', { method: 'POST', body: JSON.stringify({ ids: uniqueIds, bannedOnly: true }) });
+      applyStatePayload(payload.state || payload, setChildren, setMothers);
+      await refreshState(false);
+      const deleted = payload.deleted?.length || 0;
+      const skipped = payload.skipped?.length || 0;
+      notify(`批量删除完成：删除 ${deleted} 个${skipped ? `，跳过 ${skipped} 个仍在 Team 或状态不匹配的账号` : ''}`, skipped ? 'info' : 'success');
+      return payload;
+    } catch (error) {
+      notify(`批量删除封禁账号失败：${error.message}`, 'error');
+      return null;
+    }
+  }
+
   async function saveMother(next) {
     if (!String(next.accountId || next.team || '').trim()) {
       notify('请填写 Team ID（chatgpt_account_id）', 'error');
@@ -1020,7 +1038,7 @@ function App() {
 
       {view === 'run' && <RunView activeMother={activeMother} activeChildren={activeChildren} trackedChildren={trackedChildren} readyChildren={readyChildren} exhausted={exhausted} canRefillAll={anyExhausted || anyOpenSeat || kickWindow === 'time'} lowQuota={lowQuota} seatsOpen={seatsOpen} stage={stage} progress={progress} isRunning={isRunning} isProcessing={isProcessing} lastSync={lastSync} runCheck={runCheck} refillSeats={refillSeats} setShowMother={() => openMother(activeMother)} setSelectedTeam={setSelectedTeam} mothers={mothers} autoRefill={autoRefill} />}
       {view === 'teams' && <TeamManagementView teams={teamRecords} openTeam={openMother} openDetail={openTeamDetail} setShowImport={() => setShowImport(true)} exportTeamSub2Api={exportTeamSub2Api} pushTeamSub2Api={pushTeamSub2Api} />}
-      {view === 'free' && <FreeAccountsView children={filteredAccounts} allChildren={accountRecords} mothers={mothers} search={search} setSearch={setSearch} setShowImport={() => setShowImport(true)} addAccount={() => openAccount()} exportSub2Api={exportSub2Api} pushSub2Api={pushSub2Api} removeChild={removeChild} deleteFreeAccount={deleteFreeAccount} openJsonImport={openJsonImport} editAccount={openAccount} acquireAccount={acquireAccount} acquireMissingFreeJson={acquireMissingFreeJson} acquireStates={acquireStates} batchAcquire={batchAcquire} concurrency={concurrency} />}
+      {view === 'free' && <FreeAccountsView children={filteredAccounts} allChildren={accountRecords} mothers={mothers} search={search} setSearch={setSearch} setShowImport={() => setShowImport(true)} addAccount={() => openAccount()} exportSub2Api={exportSub2Api} pushSub2Api={pushSub2Api} removeChild={removeChild} deleteFreeAccount={deleteFreeAccount} batchDeleteBannedAccounts={batchDeleteBannedAccounts} openJsonImport={openJsonImport} editAccount={openAccount} acquireAccount={acquireAccount} acquireMissingFreeJson={acquireMissingFreeJson} acquireStates={acquireStates} batchAcquire={batchAcquire} concurrency={concurrency} />}
       {view === 'history' && <HistoryView history={history} page={historyPage} pageSize={historyPageSize} meta={historyMeta} loading={historyLoading} error={historyError} onPageChange={changeHistoryPage} onPageSizeChange={changeHistoryPageSize} onRetry={reloadHistory} />}
       {view === 'settings' && <SettingsView autoRefill={autoRefill} setAutoRefill={setAutoRefill} promoteJoinedAccounts={promoteJoinedAccounts} setPromoteJoinedAccounts={setPromoteJoinedAccounts} threshold={threshold} setThreshold={setThreshold} checkInterval={checkInterval} setCheckInterval={setCheckInterval} concurrency={concurrency} setConcurrency={setConcurrency} kickWindow={kickWindow} setKickWindow={setKickWindow} kickAfterHours={kickAfterHours} setKickAfterHours={setKickAfterHours} integrations={integrations} openIntegration={setShowIntegration} proxy={proxySettings} openProxy={() => setShowProxy(true)} saveSettings={saveSettings} />}
     </main>
@@ -1178,21 +1196,76 @@ function CredentialState({ account }) {
   return <span className="credential-state"><i className={status.hasPassword ? 'set' : ''} title={status.hasPassword ? '密码已录入' : '密码未录入'}>密</i><i className={status.hasTotp ? 'set' : ''} title={status.hasTotp ? '2FA 已录入' : '2FA 未录入'}>2FA</i></span>;
 }
 
-function FreeAccountsView({ children, allChildren, mothers, search, setSearch, setShowImport, addAccount, exportSub2Api, pushSub2Api, removeChild, deleteFreeAccount, openJsonImport, editAccount, acquireAccount, acquireMissingFreeJson, acquireStates, batchAcquire, concurrency }) {
+function FreeAccountsView({ children, allChildren, mothers, search, setSearch, setShowImport, addAccount, exportSub2Api, pushSub2Api, removeChild, deleteFreeAccount, batchDeleteBannedAccounts, openJsonImport, editAccount, acquireAccount, acquireMissingFreeJson, acquireStates, batchAcquire, concurrency }) {
   const [filter, setFilter] = useState('all');
+  const [selectedBannedIds, setSelectedBannedIds] = useState([]);
+  const [batchDeleting, setBatchDeleting] = useState(false);
   const isBanned = (account) => account.banStatus === 'banned' || account.status === 'banned';
-  const visible = children.filter((account) => filter === 'all' || (filter === 'free' && !isBanned(account) && !joinedTeamsFor(account).some((entry) => entry.status === 'active')) || (filter === 'team' && joinedTeamsFor(account).some((entry) => entry.status === 'active')) || (filter === 'cooldown' && (['kicked', 'cooldown'].includes(account.status) || joinedTeamsFor(account).some((entry) => ['kicked', 'cooldown'].includes(entry.status)))) || (filter === 'banned' && isBanned(account)));
-  const freeCount = allChildren.filter((account) => !isBanned(account) && !joinedTeamsFor(account).some((entry) => entry.status === 'active')).length;
-  const teamCount = allChildren.filter((account) => joinedTeamsFor(account).some((entry) => entry.status === 'active')).length;
-  const bannedCount = allChildren.filter(isBanned).length;
-  const missingJsonCount = allChildren.filter((account) => !isBanned(account) && !account.sub2apiStatus?.exportable).length;
+  const hasActiveTeam = (account) => joinedTeamsFor(account).some((entry) => entry.status === 'active');
+  const isCooldown = (account) => ['kicked', 'cooldown'].includes(account.status) || joinedTeamsFor(account).some((entry) => ['kicked', 'cooldown'].includes(entry.status));
+  const isMissingJson = (account) => !isBanned(account) && !account.sub2apiStatus?.exportable;
+  const isVerification = (account) => !isBanned(account) && ['login_pending', 'login_required', 'phone_verification_required', 'browser_verification_required', 'verification_required', 'waiting_code'].includes(account.login?.status || account.loginStatus || account.status);
+  const isDeletableBanned = (account) => isBanned(account) && !hasActiveTeam(account);
+  const matchesFilter = (account, id) => id === 'all'
+    || (id === 'free' && !isBanned(account) && !hasActiveTeam(account))
+    || (id === 'team' && hasActiveTeam(account))
+    || (id === 'cooldown' && isCooldown(account))
+    || (id === 'missing-json' && isMissingJson(account))
+    || (id === 'verification' && isVerification(account))
+    || (id === 'banned' && isBanned(account));
+  const visible = children.filter((account) => matchesFilter(account, filter));
+  const filterOptions = [
+    ['all', '全部', allChildren.length],
+    ['free', '未加入', allChildren.filter((account) => matchesFilter(account, 'free')).length],
+    ['team', '已加入', allChildren.filter((account) => matchesFilter(account, 'team')).length],
+    ['cooldown', '冷却', allChildren.filter((account) => matchesFilter(account, 'cooldown')).length],
+    ['missing-json', '缺 JSON', allChildren.filter((account) => matchesFilter(account, 'missing-json')).length],
+    ['verification', '待验证', allChildren.filter((account) => matchesFilter(account, 'verification')).length],
+    ['banned', '封禁', allChildren.filter((account) => matchesFilter(account, 'banned')).length],
+  ];
+  const freeCount = filterOptions.find(([id]) => id === 'free')[2];
+  const teamCount = filterOptions.find(([id]) => id === 'team')[2];
+  const bannedCount = filterOptions.find(([id]) => id === 'banned')[2];
+  const missingJsonCount = filterOptions.find(([id]) => id === 'missing-json')[2];
+  const selectedSet = new Set(selectedBannedIds);
+  const selectableVisibleIds = visible.filter(isDeletableBanned).map((account) => account.id);
+  const allVisibleSelected = selectableVisibleIds.length > 0 && selectableVisibleIds.every((id) => selectedSet.has(id));
+  const someVisibleSelected = selectableVisibleIds.some((id) => selectedSet.has(id));
   const batchResult = batchAcquire?.result;
+
+  useEffect(() => {
+    const validIds = new Set(allChildren.filter(isDeletableBanned).map((account) => account.id));
+    setSelectedBannedIds((current) => {
+      const next = current.filter((id) => validIds.has(id));
+      return next.length === current.length ? current : next;
+    });
+  }, [allChildren]);
+
+  const toggleVisibleSelection = (checked) => {
+    setSelectedBannedIds((current) => {
+      const next = new Set(current);
+      selectableVisibleIds.forEach((id) => checked ? next.add(id) : next.delete(id));
+      return [...next];
+    });
+  };
+
+  const deleteSelected = async () => {
+    setBatchDeleting(true);
+    try {
+      const result = await batchDeleteBannedAccounts(selectedBannedIds);
+      if (result) setSelectedBannedIds([]);
+    } finally {
+      setBatchDeleting(false);
+    }
+  };
+
   return <section className="free-maintenance">
     <section className="metrics"><Metric label="普通账号" value={allChildren.length} detail="不含 Team 所有者" icon={Users} tone="blue" /><Metric label="未加入 Team" value={freeCount} detail="可进入补位队列" icon={UserRound} tone="green" /><Metric label="已加入 Team" value={teamCount} detail="可同时保留多个空间" icon={LayoutDashboard} tone="amber" /><Metric label="已封禁" value={bannedCount} detail="永久排除自动补位" icon={ShieldAlert} tone="slate" /></section>
     <section className="content-panel account-panel"><div className="content-toolbar"><div><h2>Free 账号维护</h2><p>只记录普通账号；这里维护邮箱、凭据、加入过的 Team 和 Sub2API，不展示额度。</p></div><div className="toolbar-actions"><button className="button ghost" onClick={exportSub2Api}><Download size={15} />导出 Sub2API</button><button className="button secondary" onClick={pushSub2Api}><ExternalLink size={15} />推送到 Sub2API</button><button className="button secondary" onClick={acquireMissingFreeJson} disabled={batchAcquire?.loading || !missingJsonCount}><CloudDownload size={15} />{batchAcquire?.loading ? '批量获取中' : `批量获取 JSON${missingJsonCount ? ` (${missingJsonCount})` : ''}`}</button><button className="button ghost" onClick={setShowImport}><ArrowDownToLine size={15} />导入账号</button><button className="button primary" onClick={addAccount}><Plus size={15} />新增账号</button></div></div>
       {(batchAcquire?.loading || batchResult) && <div className={`batch-operation ${batchResult?.error ? 'failed' : batchAcquire?.loading ? 'running' : 'complete'}`}><div className="batch-operation-icon">{batchAcquire?.loading ? <RefreshCw size={16} /> : batchResult?.error ? <AlertTriangle size={16} /> : <CheckCircle2 size={16} />}</div><div><strong>{batchAcquire?.loading ? `正在按 ${concurrency} 并发获取 Free JSON` : batchResult?.error ? '批量获取失败' : '批量获取已完成'}</strong><span>{batchAcquire?.loading ? `待处理 ${batchResult?.totalMissing || missingJsonCount} 个缺少 JSON 的账号` : batchResult?.error || `成功 ${batchResult?.acquired || 0} 个 · 失败 ${batchResult?.failed || 0} 个 · 跳过 ${batchResult?.skipped || 0} 个 · 并发 ${batchResult?.concurrency || concurrency}`}</span></div></div>}
-      <div className="filter-row"><div className="search-box"><ListFilter size={16} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索邮箱、账号或 Team" /></div><div className="segmented compact-segmented">{[['all', '全部'], ['free', '未加入'], ['team', '已加入'], ['cooldown', '冷却'], ['banned', '封禁']].map(([id, label]) => <button key={id} className={filter === id ? 'selected' : ''} onClick={() => setFilter(id)}>{label}</button>)}</div><span className="result-count">显示 {visible.length} / {allChildren.length}</span></div>
-      <div className="table-wrap"><table className="data-table account-table"><thead><tr><th>账号</th><th>状态</th><th>登录凭据</th><th>当前 Team</th><th>加入过的 Team</th><th>Sub2API</th><th /></tr></thead><tbody>{visible.map((account) => { const joinedTeams = joinedTeamsFor(account); const activeTeams = joinedTeams.filter((entry) => entry.status === 'active'); const historyTeams = joinedTeams.filter((entry) => entry.status !== 'active'); const acquireState = acquireStates?.[account.id]; const banned = isBanned(account); return <tr className={banned ? 'banned-account-row' : ''} key={account.id}><td><div className="account-cell"><div className="queue-avatar">{(account.email || '?')[0].toUpperCase()}</div><div><strong>{account.email || '未设置邮箱'}</strong><small className="mono">{account.id} · {account.plan || '未检测'}</small>{banned && <small className="ban-reason" title={account.banReason || ''}>{account.banReason || 'OpenAI 账号已停用'}{account.bannedAt ? ` · ${displayTime(account.bannedAt)}` : ''}</small>}</div></div></td><td><StatusBadge status={banned ? 'banned' : account.status} /></td><td><div className="account-credential-cell"><CredentialState account={account} /><AcquireStatus state={acquireState} /></div></td><td>{activeTeams.length ? <div className="team-tags">{activeTeams.map((entry) => <span key={entry.team}>{teamNameForId(mothers, entry.team)}</span>)}</div> : <span className="muted">Free 池</span>}</td><td><div className="team-history-cell"><strong>{joinedTeams.length} 个空间</strong>{historyTeams.slice(-3).map((entry) => <small key={`${entry.team}-${entry.removedAt || entry.cooldownAt || entry.joinedAt}`}>{teamNameForId(mothers, entry.team)} · {entry.status === 'kicked' ? '已移出' : entry.status === 'cooldown' ? '冷却中' : '历史'}{entry.reason === 'account_banned' ? ' · 封禁' : entry.reason === 'time_elapsed' ? ` · 按时间轮转${entry.retryAfter ? ` · ${teamRetryLabel(entry)}` : ''}` : entry.retryAfter ? ` · ${teamRetryLabel(entry)}` : entry.status === 'cooldown' ? ' · 等待额度刷新' : ''}</small>)}</div></td><td><span className={`sub2api-state ${account.sub2apiStatus?.imported ? 'ready' : ''}`}>{account.sub2apiStatus?.imported ? '已记录' : '未记录'}</span>{account.sub2apiStatus?.exportable && <small>可导出</small>}</td><td><div className="row-actions"><button className="icon-button small" title={banned ? '封禁账号不能再获取 Free JSON' : '获取 Free JSON'} onClick={() => acquireAccount(account.id, 'free-json')} disabled={banned || Boolean(acquireState?.loading)}><CloudDownload size={15} /></button><button className="icon-button small" title={banned ? '封禁账号不能再刷新 AT' : '刷新 AT'} onClick={() => acquireAccount(account.id, 'refresh-at')} disabled={banned || Boolean(acquireState?.loading)}><RefreshCw size={15} /></button><button className="icon-button small" title="编辑账号" onClick={() => editAccount(account)}><Settings2 size={15} /></button><button className="icon-button small" title={banned ? '封禁账号不能再导入凭据' : '导入 Free Sub2API JSON'} aria-label="导入 Free Sub2API JSON" onClick={() => openJsonImport(account.id)} disabled={banned}><FileText size={15} /></button><button className="icon-button small" title="移出当前 Team" aria-label="移出当前 Team" onClick={() => removeChild(account.id)} disabled={!account.team}><UserMinus size={15} /></button><button className="icon-button small danger-hover" title="删除 Free 账号" aria-label="删除 Free 账号" onClick={() => deleteFreeAccount(account.id)}><Trash2 size={15} /></button></div></td></tr>; })}</tbody></table></div>{!visible.length && <div className="empty-state compact-empty"><UserRound size={26} /><strong>没有匹配的账号</strong><span>导入账号后会显示在这里。</span></div>}</section>
+      <div className="filter-row"><div className="search-box"><ListFilter size={16} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索邮箱、账号或 Team" /></div><div className="segmented compact-segmented account-status-filters">{filterOptions.map(([id, label, count]) => <button key={id} className={filter === id ? 'selected' : ''} onClick={() => setFilter(id)}>{label}<small>{count}</small></button>)}</div><span className="result-count">显示 {visible.length} / {allChildren.length}</span></div>
+      <div className="bulk-delete-bar"><span><ShieldAlert size={14} />只可批量删除已封禁且不在 Team 中的账号</span><button className="button danger" disabled={!selectedBannedIds.length || batchDeleting} onClick={deleteSelected}><Trash2 size={15} />{batchDeleting ? '正在删除' : `删除已选封禁 (${selectedBannedIds.length})`}</button></div>
+      <div className="table-wrap"><table className="data-table account-table"><thead><tr><th className="bulk-select-cell"><input type="checkbox" aria-label="全选当前结果中的可删除封禁账号" title="全选当前筛选结果中的可删除封禁账号" checked={allVisibleSelected} disabled={!selectableVisibleIds.length} ref={(node) => { if (node) node.indeterminate = someVisibleSelected && !allVisibleSelected; }} onChange={(event) => toggleVisibleSelection(event.target.checked)} /></th><th>账号</th><th>状态</th><th>登录凭据</th><th>当前 Team</th><th>加入过的 Team</th><th>Sub2API</th><th /></tr></thead><tbody>{visible.map((account) => { const joinedTeams = joinedTeamsFor(account); const activeTeams = joinedTeams.filter((entry) => entry.status === 'active'); const historyTeams = joinedTeams.filter((entry) => entry.status !== 'active'); const acquireState = acquireStates?.[account.id]; const banned = isBanned(account); const deletable = isDeletableBanned(account); return <tr className={banned ? 'banned-account-row' : ''} key={account.id}><td className="bulk-select-cell"><span title={!banned ? '仅封禁账号可批量选择' : !deletable ? '账号仍在 Team 中，请先移出 Team' : '选择此封禁账号'}><input type="checkbox" aria-label={`选择 ${account.email || account.id}`} checked={selectedSet.has(account.id)} disabled={!deletable} onChange={(event) => setSelectedBannedIds((current) => event.target.checked ? [...new Set([...current, account.id])] : current.filter((id) => id !== account.id))} /></span></td><td><div className="account-cell"><div className="queue-avatar">{(account.email || '?')[0].toUpperCase()}</div><div><strong>{account.email || '未设置邮箱'}</strong><small className="mono">{account.id} · {account.plan || '未检测'}</small>{banned && <small className="ban-reason" title={account.banReason || ''}>{account.banReason || 'OpenAI 账号已停用'}{account.bannedAt ? ` · ${displayTime(account.bannedAt)}` : ''}</small>}</div></div></td><td><StatusBadge status={banned ? 'banned' : account.status} /></td><td><div className="account-credential-cell"><CredentialState account={account} /><AcquireStatus state={acquireState} /></div></td><td>{activeTeams.length ? <div className="team-tags">{activeTeams.map((entry) => <span key={entry.team}>{teamNameForId(mothers, entry.team)}</span>)}</div> : <span className="muted">Free 池</span>}</td><td><div className="team-history-cell"><strong>{joinedTeams.length} 个空间</strong>{historyTeams.slice(-3).map((entry) => <small key={`${entry.team}-${entry.removedAt || entry.cooldownAt || entry.joinedAt}`}>{teamNameForId(mothers, entry.team)} · {entry.status === 'kicked' ? '已移出' : entry.status === 'cooldown' ? '冷却中' : '历史'}{entry.reason === 'account_banned' ? ' · 封禁' : entry.reason === 'time_elapsed' ? ` · 按时间轮转${entry.retryAfter ? ` · ${teamRetryLabel(entry)}` : ''}` : entry.retryAfter ? ` · ${teamRetryLabel(entry)}` : entry.status === 'cooldown' ? ' · 等待额度刷新' : ''}</small>)}</div></td><td><span className={`sub2api-state ${account.sub2apiStatus?.imported ? 'ready' : ''}`}>{account.sub2apiStatus?.imported ? '已记录' : '未记录'}</span>{account.sub2apiStatus?.exportable && <small>可导出</small>}</td><td><div className="row-actions"><button className="icon-button small" title={banned ? '封禁账号不能再获取 Free JSON' : '获取 Free JSON'} onClick={() => acquireAccount(account.id, 'free-json')} disabled={banned || Boolean(acquireState?.loading)}><CloudDownload size={15} /></button><button className="icon-button small" title={banned ? '封禁账号不能再刷新 AT' : '刷新 AT'} onClick={() => acquireAccount(account.id, 'refresh-at')} disabled={banned || Boolean(acquireState?.loading)}><RefreshCw size={15} /></button><button className="icon-button small" title="编辑账号" onClick={() => editAccount(account)}><Settings2 size={15} /></button><button className="icon-button small" title={banned ? '封禁账号不能再导入凭据' : '导入 Free Sub2API JSON'} aria-label="导入 Free Sub2API JSON" onClick={() => openJsonImport(account.id)} disabled={banned}><FileText size={15} /></button><button className="icon-button small" title="移出当前 Team" aria-label="移出当前 Team" onClick={() => removeChild(account.id)} disabled={!account.team}><UserMinus size={15} /></button><button className="icon-button small danger-hover" title="删除 Free 账号" aria-label="删除 Free 账号" onClick={() => deleteFreeAccount(account.id)}><Trash2 size={15} /></button></div></td></tr>; })}</tbody></table></div>{!visible.length && <div className="empty-state compact-empty"><UserRound size={26} /><strong>没有匹配的账号</strong><span>可以切换状态筛选或导入新账号。</span></div>}</section>
   </section>;
 }
 

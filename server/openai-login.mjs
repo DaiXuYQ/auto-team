@@ -201,6 +201,12 @@ function responseErrorMessage(payload, body = '', fallback = '') {
   return raw && raw.length <= 500 ? raw : fallback;
 }
 
+function explicitAccountBanMessage(value = '') {
+  const text = string(value).toLowerCase();
+  if (/account[_ .-]*(?:deactivated|disabled|suspended|banned|terminated)|user[_ .-]*(?:deactivated|disabled|suspended|banned|terminated)|account[^\n]{0,120}(?:deleted|deactivated|disabled|suspended|banned|terminated)|账号已停用|账户已停用|账号已被删除|账户已被删除|账号已封|账号被封|封号|被封禁|账户被封|停用/.test(text)) return string(value);
+  return '';
+}
+
 function classifyChallenge(url, body = '', status = 0) {
   let path = '';
   try { path = new URL(url, AUTH_BASE_URL).pathname.toLowerCase(); } catch { path = string(url).toLowerCase(); }
@@ -208,6 +214,7 @@ function classifyChallenge(url, body = '', status = 0) {
   if (/email-verification|email_otp|passwordless/.test(path)) return 'email_otp_required';
   if (status < 400) return '';
   const value = `${url} ${body}`.toLowerCase();
+  if (explicitAccountBanMessage(value)) return 'account_banned';
   if (status === 403 || /turnstile|captcha|unsupported_country|country_region/.test(value)) return 'protocol_verification_required';
   if (/mfa|two-factor|two_factor|totp|authenticator|one-time-password/.test(value)) return 'totp_required';
   if (/email-verification|email_otp|passwordless/.test(value)) return 'email_otp_required';
@@ -506,7 +513,11 @@ class LoginRunner {
         throw new OpenAiLoginError('authorize_state_invalid', 'OAuth 登录会话已失效', 409);
       }
       const challenge = classifyChallenge(result.location || '', result.text, result.status);
-      throw new OpenAiLoginError(challenge || 'authorize_failed', challenge ? '登录需要浏览器验证' : responseErrorMessage(result.payload, result.text, '登录邮箱提交失败'), result.status || 502, { browserRequired: Boolean(challenge) });
+      const browserRequired = challenge === 'protocol_verification_required';
+      const message = challenge === 'account_banned'
+        ? responseErrorMessage(result.payload, result.text, 'OpenAI 账号已被停用或封禁')
+        : browserRequired ? '登录需要浏览器验证' : responseErrorMessage(result.payload, result.text, '登录邮箱提交失败');
+      throw new OpenAiLoginError(challenge || 'authorize_failed', message, result.status || 502, { browserRequired });
     }
     return pageUrl(result.payload, result.location || `${AUTH_BASE_URL}/email-verification`);
   }
@@ -560,7 +571,11 @@ class LoginRunner {
     });
     if (!result.ok) {
       const challenge = classifyChallenge(result.location || '', result.text, result.status);
-      throw new OpenAiLoginError(challenge || 'password_invalid', challenge ? '密码登录触发协议验证' : responseErrorMessage(result.payload, result.text, '账号密码校验失败'), result.status || 400, { needsInput: Boolean(challenge) });
+      const browserRequired = challenge === 'protocol_verification_required';
+      const message = challenge === 'account_banned'
+        ? responseErrorMessage(result.payload, result.text, 'OpenAI 账号已被停用或封禁')
+        : browserRequired ? '密码登录触发协议验证' : responseErrorMessage(result.payload, result.text, '账号密码校验失败');
+      throw new OpenAiLoginError(challenge || 'password_invalid', message, result.status || 400, { needsInput: challenge === 'totp_required', browserRequired });
     }
     return pageUrl(result.payload, result.location);
   }
@@ -573,7 +588,11 @@ class LoginRunner {
     });
     if (!result.ok) {
       const challenge = classifyChallenge(result.location || '', result.text, result.status);
-      throw new OpenAiLoginError(challenge || 'otp_send_failed', challenge ? '登录需要浏览器验证' : responseErrorMessage(result.payload, result.text, '无法发送邮箱验证码'), result.status || 502, { browserRequired: Boolean(challenge) });
+      const browserRequired = challenge === 'protocol_verification_required';
+      const message = challenge === 'account_banned'
+        ? responseErrorMessage(result.payload, result.text, 'OpenAI 账号已被停用或封禁')
+        : browserRequired ? '登录需要浏览器验证' : responseErrorMessage(result.payload, result.text, '无法发送邮箱验证码');
+      throw new OpenAiLoginError(challenge || 'otp_send_failed', message, result.status || 502, { browserRequired });
     }
     return pageUrl(result.payload, result.location || `${AUTH_BASE_URL}/email-verification`);
   }
@@ -811,4 +830,4 @@ export async function loginFreeAccount(options = {}) {
   }
 }
 
-export { generateTotp };
+export { generateTotp, classifyChallenge };

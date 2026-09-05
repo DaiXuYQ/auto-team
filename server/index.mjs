@@ -4169,6 +4169,34 @@ async function handleApi(req, res, url) {
     await persist();
     return sendJson(res, 200, { ok: true, state: publicState({ includeHistory: false }) });
   }
+  if (method === 'POST' && url.pathname === '/api/children/batch-delete') {
+    const ids = [...new Set((Array.isArray(body.ids) ? body.ids : []).map((id) => String(id || '').trim()).filter(Boolean))].slice(0, 1000);
+    if (!ids.length) return sendJson(res, 400, { message: 'child_ids_required' });
+    const bannedOnly = body.bannedOnly !== false;
+    const deleted = [];
+    const skipped = [];
+    for (const id of ids) {
+      const child = findChild(id);
+      if (!child) {
+        skipped.push({ id, reason: 'child_not_found' });
+        continue;
+      }
+      if (bannedOnly && !childIsBanned(child)) {
+        skipped.push({ id, email: child.email || '', reason: 'child_not_banned' });
+        continue;
+      }
+      if (childHasActiveTeamMembership(child)) {
+        skipped.push({ id, email: child.email || '', reason: 'child_has_active_team_memberships' });
+        continue;
+      }
+      deleted.push({ id, email: child.email || '' });
+    }
+    const deletedIds = new Set(deleted.map((item) => item.id));
+    state.children = state.children.filter((child) => !deletedIds.has(child.id));
+    addHistory('批量删除 Free 账号', `删除 ${deleted.length} 个封禁账号，跳过 ${skipped.length} 个`, skipped.length ? 'partial' : 'success');
+    await persist();
+    return sendJson(res, 200, { ok: skipped.length === 0, deleted, skipped, state: publicState({ includeHistory: false }) });
+  }
   if (method === 'PATCH' && segments[1] === 'children' && segments[2]) {
     const child = findChild(segments[2]);
     if (!child) return sendJson(res, 404, { message: 'child_not_found' });
