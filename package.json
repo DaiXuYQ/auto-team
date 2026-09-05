@@ -7,6 +7,7 @@
     "dev": "vite --host 0.0.0.0",
     "server": "node server/index.mjs",
     "mcp": "node server/mcp-stdio.mjs",
+    "test": "node --test server/*.test.mjs",
     "build": "vite build",
     "preview": "vite preview --host 0.0.0.0"
   },

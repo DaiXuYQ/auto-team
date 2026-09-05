@@ -39,6 +39,7 @@ const emptyState = {
     concurrency: 3,
     integrations: {
       sub2api: { baseUrl: '', apiKey: '', groupId: null, groupName: '', enabled: false },
+      sub2apis: [],
       mailbox: { serviceType: 'manual', endpoint: '', apiKey: '', enabled: false },
     },
     proxy: { enabled: false, strategy: 'failover', timeoutMs: 15000, maxRetries: 2, entries: [] },
@@ -80,6 +81,81 @@ async function loadState() {
 }
 
 let state = await loadState();
+const DEFAULT_SUB2API_ID = 'sub2api_default';
+
+function normalizeSub2ApiConfig(input = {}, index = 0) {
+  const groupId = Number(input.groupId);
+  return {
+    id: String(input.id || (index === 0 ? DEFAULT_SUB2API_ID : `sub2api_${index + 1}`)).trim(),
+    name: String(input.name || input.label || (index === 0 ? '默认 Sub2API' : `Sub2API ${index + 1}`)).trim(),
+    baseUrl: String(input.baseUrl || '').trim(),
+    apiKey: String(input.apiKey || '').trim(),
+    groupId: Number.isFinite(groupId) && groupId > 0 ? groupId : null,
+    groupName: String(input.groupName || '').trim(),
+    enabled: input.enabled === true,
+  };
+}
+
+function normalizeSub2ApiIntegrations() {
+  const integrations = state.settings.integrations || (state.settings.integrations = structuredClone(emptyState.settings.integrations));
+  const configured = Array.isArray(integrations.sub2apis) && integrations.sub2apis.length
+    ? integrations.sub2apis
+    : [{ ...(integrations.sub2api || {}), id: DEFAULT_SUB2API_ID, name: integrations.sub2api?.name || '默认 Sub2API' }];
+  const seen = new Set();
+  integrations.sub2apis = configured.map((item, index) => {
+    const normalized = normalizeSub2ApiConfig(item, index);
+    if (!normalized.id || seen.has(normalized.id)) normalized.id = `sub2api_${index + 1}`;
+    seen.add(normalized.id);
+    return normalized;
+  });
+  integrations.sub2api = { ...integrations.sub2apis[0] };
+  const fallbackId = integrations.sub2apis[0]?.id || DEFAULT_SUB2API_ID;
+  for (const mother of state.mothers || []) {
+    if (!String(mother.sub2apiIntegrationId || '').trim()) mother.sub2apiIntegrationId = fallbackId;
+  }
+}
+
+function sub2ApiConfigs() {
+  return state.settings?.integrations?.sub2apis || [];
+}
+
+function sub2ApiConfigById(id) {
+  const target = String(id || '').trim();
+  return sub2ApiConfigs().find((config) => config.id === target) || null;
+}
+
+function sub2ApiConfigForMother(mother) {
+  const selectedId = String(mother?.sub2apiIntegrationId || '').trim();
+  return selectedId ? sub2ApiConfigById(selectedId) : sub2ApiConfigs()[0] || null;
+}
+
+function publicSub2ApiConfig(config = {}) {
+  return {
+    id: config.id || DEFAULT_SUB2API_ID,
+    name: config.name || 'Sub2API',
+    baseUrl: config.baseUrl || '',
+    enabled: config.enabled === true,
+    groupId: Number.isFinite(Number(config.groupId)) ? Number(config.groupId) : null,
+    groupName: config.groupName || '',
+    apiKeySet: Boolean(config.apiKey),
+  };
+}
+
+function replaceSub2ApiConfigs(inputs) {
+  const current = new Map(sub2ApiConfigs().map((config) => [config.id, config]));
+  const source = Array.isArray(inputs) && inputs.length
+    ? inputs
+    : [{ id: DEFAULT_SUB2API_ID, name: '默认 Sub2API', enabled: false }];
+  state.settings.integrations.sub2apis = source.map((input, index) => {
+    const existing = current.get(String(input?.id || '')) || {};
+    const apiKey = input?.apiKey === undefined ? existing.apiKey : input.apiKey;
+    return normalizeSub2ApiConfig({ ...existing, ...(input || {}), apiKey }, index);
+  });
+  state.settings.integrations.sub2api = { ...state.settings.integrations.sub2apis[0] };
+  normalizeSub2ApiIntegrations();
+}
+
+normalizeSub2ApiIntegrations();
 function normalizeConcurrency(value, fallback = 3) {
   const numeric = Number(value);
   return Number.isFinite(numeric) ? Math.min(10, Math.max(1, Math.floor(numeric))) : fallback;
@@ -114,6 +190,7 @@ state.mothers = (Array.isArray(state.mothers) ? state.mothers : []).map((mother)
   team: mother.accountId || mother.team || mother.id,
   teamName: mother.teamName || mother.displayName || '',
   rotationMode: mother.rotationMode === 'rotating' ? 'rotating' : 'fixed',
+  dailyRotationLimit: normalizeDailyRotationLimit(mother.dailyRotationLimit),
   primaryOwnerEmail: mother.primaryOwnerEmail || mother.email || '',
   tokenScope: 'team',
   planType: mother.planType || 'team',
@@ -195,6 +272,39 @@ for (const entry of await readdir(dataDir).catch(() => [])) {
 }
 
 function now() { return new Date().toISOString(); }
+function normalizeDailyRotationLimit(value, fallback = 3) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? Math.min(100, Math.max(1, Math.floor(numeric))) : fallback;
+}
+function localDateKey(date = new Date()) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+function dailyRotationUsage(mother, { mutate = false } = {}) {
+  const date = localDateKey();
+  const stored = mother?.dailyRotationUsage && typeof mother.dailyRotationUsage === 'object'
+    ? mother.dailyRotationUsage
+    : {};
+  const count = stored.date === date && Number.isFinite(Number(stored.count))
+    ? Math.max(0, Math.floor(Number(stored.count)))
+    : 0;
+  const usage = { date, count };
+  if (mutate && mother) mother.dailyRotationUsage = usage;
+  return usage;
+}
+function dailyRotationBudget(mother) {
+  const limit = normalizeDailyRotationLimit(mother?.dailyRotationLimit);
+  const usage = dailyRotationUsage(mother);
+  return { ...usage, limit, remaining: Math.max(0, limit - usage.count) };
+}
+function consumeDailyRotation(mother) {
+  const usage = dailyRotationUsage(mother, { mutate: true });
+  usage.count += 1;
+  mother.dailyRotationUsage = usage;
+  return dailyRotationBudget(mother);
+}
 function addHistory(action, detail, result = 'success') {
   state.history = [{ id: randomUUID(), time: now(), action, detail, result }, ...state.history].slice(0, 200);
 }
@@ -239,6 +349,7 @@ function teamManagerContexts(mother) {
     ...(Array.isArray(mother.ownerAccounts) ? mother.ownerAccounts.map((owner) => ({ ...owner, source: 'team_owner' })) : []),
   ];
   for (const child of state.children) {
+    if (childIsBanned(child)) continue;
     if (!isChildMemberOfTeam(child, mother.team) || (!childIsWorkspaceOwner(child, mother) && !childMatchesKnownTeamOwner(child, mother))) continue;
     const workspaceToken = workspaceTokenFor(child, workspaceId);
     if (!workspaceToken?.accessToken) continue;
@@ -300,6 +411,7 @@ function teamOwnerCandidateChildren(mother) {
   ].filter(Boolean).map((email) => String(email).trim().toLowerCase()));
   const linkedIds = new Set((mother?.ownerAccounts || []).map((owner) => String(owner?.linkedFreeAccountId || '')).filter(Boolean));
   return state.children.filter((child) => {
+    if (childIsBanned(child)) return false;
     if (!isChildMemberOfTeam(child, mother?.team)) return false;
     const email = String(child.email || '').trim().toLowerCase();
     const isOwner = childIsWorkspaceOwner(child, mother) || childMatchesKnownTeamOwner(child, mother) || ownerEmails.has(email) || linkedIds.has(String(child.id));
@@ -317,20 +429,9 @@ async function recoverTeamManagerToken(mother, { force = false } = {}) {
     const refreshed = await refreshOpenAiAccessToken(record.refreshToken, record.clientId, OPENAI_REQUEST_TIMEOUT_MS, proxyFetch);
     if (!refreshed.ok) continue;
     const claims = refreshed.claims || accessTokenClaims(refreshed.accessToken);
+    if (claims.accountId !== workspaceId) continue;
     record.refreshToken = refreshed.refreshToken || record.refreshToken;
     record.idToken = refreshed.idToken || record.idToken;
-    await persist();
-    if (claims.accountId !== workspaceId) {
-      const temporary = { ...record, accessToken: refreshed.accessToken, workspaceTokens: {}, workspaceHistory: [] };
-      const exchanged = await switchWorkspace(temporary, { workspaceId });
-      const workspaceToken = workspaceTokenFor(temporary, workspaceId);
-      if (!exchanged.ok || !workspaceToken?.accessToken) continue;
-      record.accessToken = workspaceToken.accessToken;
-      record.expiresAt = workspaceToken.expiresAt || record.expiresAt || null;
-      addHistory('刷新 Team 管理凭据', `${record.email || mother.email} 已通过 refresh token 重新切换到 ${mother.team}`);
-      await persist();
-      return { ok: true, status: 200, source: 'team_refresh_and_workspace_exchange' };
-    }
     record.accessToken = refreshed.accessToken;
     record.expiresAt = claims.expiresAt || record.expiresAt || null;
     addHistory('刷新 Team 管理凭据', `${record.email || mother.email} 已通过 refresh token 恢复 ${mother.team}`);
@@ -365,8 +466,8 @@ async function recoverTeamManagerToken(mother, { force = false } = {}) {
     const workspaceToken = workspaceTokenFor(temporary, workspaceId);
     if (!workspaceToken?.accessToken) continue;
     record.accessToken = workspaceToken.accessToken;
-    record.refreshToken = temporary.refreshToken || record.refreshToken || '';
-    record.idToken = temporary.idToken || record.idToken || '';
+    record.refreshToken = workspaceToken.refreshToken || record.refreshToken || '';
+    record.idToken = workspaceToken.idToken || record.idToken || '';
     record.expiresAt = workspaceToken.expiresAt || record.expiresAt || null;
     record.teamAuthSessions = {};
     addHistory('重新登录 Team 所有者', `${record.email} 已通过邮箱、密码和 2FA 恢复 ${mother.team}`);
@@ -375,16 +476,22 @@ async function recoverTeamManagerToken(mother, { force = false } = {}) {
   }
   return { ok: false, status: lastFailure?.status || 401, message: lastFailure?.message || 'workspace_owner_token_required', code: lastFailure?.code || null };
 }
-function saveWorkspaceToken(child, workspaceId, accessToken, claims = {}) {
+function saveWorkspaceToken(child, workspaceId, accessToken, claims = {}, oauth = {}) {
   if (!child || !workspaceId || !accessToken) return null;
   if (!child.workspaceTokens || typeof child.workspaceTokens !== 'object' || Array.isArray(child.workspaceTokens)) child.workspaceTokens = {};
+  const previous = child.workspaceTokens[workspaceId] || {};
   const record = {
+    ...previous,
     accessToken,
     accountId: claims.accountId || workspaceId,
     userId: claims.userId || child.chatgptUserId || null,
     expiresAt: claims.expiresAt || null,
+    refreshToken: oauth.refreshToken ?? previous.refreshToken ?? '',
+    idToken: oauth.idToken ?? previous.idToken ?? '',
+    clientId: oauth.clientId ?? previous.clientId ?? child.clientId ?? '',
+    sub2api: oauth.sub2api ?? previous.sub2api ?? null,
     acquiredAt: now(),
-    source: 'workspace_session_exchange',
+    source: oauth.source || 'workspace_session_exchange',
   };
   child.workspaceTokens[workspaceId] = record;
   return record;
@@ -399,6 +506,7 @@ function latestMembershipHistoryFor(child, teamId) {
 }
 function canRejoinTeam(child, teamId) {
   if (!child || !teamId) return false;
+  if (child.banStatus === 'banned' || child.status === 'banned') return false;
   if (membershipHistoryFor(child, teamId).some((entry) => entry.status === 'active')) return false;
   const last = [...membershipHistoryFor(child, teamId)].reverse().find((entry) => ['kicked', 'cooldown'].includes(entry.status));
   if (!last) return true;
@@ -466,13 +574,26 @@ function publicChild(child, teamId = null) {
       imported: Boolean(child.sub2apiImported || child.sub2api?.imported || child.importSource === 'sub2api' || accessToken),
       exportable: Boolean(accessToken),
       importedAt: child.importedAt || null,
+      synced: child.sub2api?.synced === true,
+      integrationId: child.sub2api?.integrationId || null,
+      integrationName: child.sub2api?.integrationName || '',
+      accountId: child.sub2api?.accountId || null,
+      groupId: child.sub2api?.groupId || null,
+      groupName: child.sub2api?.groupName || '',
+      message: child.sub2api?.message || '',
+      syncedAt: child.sub2api?.syncedAt || null,
     },
     tokenScope: 'free',
+    banStatus: child.banStatus === 'banned' || child.status === 'banned' ? 'banned' : 'clear',
+    bannedAt: child.bannedAt || null,
+    banReason: child.banReason || '',
+    banEvidence: child.banEvidence || null,
     joinedTeams,
   };
 }
 function publicMother(mother) {
   const { accessToken, refreshToken, idToken, password, totp, secret, cookies, sessionJson, credentials, authSession, teamAuthSessions, workspaceTokens, workspaceHistory, verificationCode, loginUrl, token, ownerAccounts, ...safe } = mother;
+  const sub2apiConfig = sub2ApiConfigForMother(mother);
   const safeOwners = Array.isArray(ownerAccounts) ? ownerAccounts.map((owner) => ({
     email: owner.email || '',
     name: owner.name || '',
@@ -484,6 +605,10 @@ function publicMother(mother) {
   })) : [];
   return {
     ...safe,
+    dailyRotationLimit: normalizeDailyRotationLimit(mother.dailyRotationLimit),
+    dailyRotationUsage: dailyRotationBudget(mother),
+    sub2apiIntegrationId: mother.sub2apiIntegrationId || sub2apiConfig?.id || null,
+    sub2apiIntegrationName: sub2apiConfig?.name || '',
     ownerAccounts: safeOwners,
     token: accessToken ? preview(accessToken) : token?.startsWith('待') ? token : preview(token),
     hasAccessToken: Boolean(accessToken || (token && !token.startsWith('待'))),
@@ -576,12 +701,15 @@ function publicTeam(mother) {
     currentAccounts.unshift({ id: mother.chatgptUserId || `owner_${mother.id}`, email: mother.email, ...publicTeamOwnerRecord(mother, mother.email), accountType: 'team-owner', status: 'active', quota5h: null, quota7d: null, joinedTeams: [{ team: teamId, status: 'active', joinedAt: mother.createdAt || null }] });
   }
   const primaryOwner = currentAccounts.find((account) => String(account.email || '').toLowerCase() === primaryOwnerEmail.toLowerCase()) || currentAccounts.find((account) => account.accountType === 'team-owner');
+  const sub2apiConfig = sub2ApiConfigForMother(mother);
   return {
     id: mother.id,
     teamId,
     name: displayName,
     displayName,
     rotationMode: mother.rotationMode === 'rotating' ? 'rotating' : 'fixed',
+    dailyRotationLimit: normalizeDailyRotationLimit(mother.dailyRotationLimit),
+    dailyRotationUsage: dailyRotationBudget(mother),
     owner: { email: primaryOwner?.email || mother.email || '', name: primaryOwner?.name || mother.name || '', userId: primaryOwner?.id || mother.chatgptUserId || null },
     primaryOwnerEmail,
     owners: currentAccounts.filter((account) => account.accountType === 'team-owner').map((account) => ({ email: account.email || '', name: account.name || '', userId: account.id || null })),
@@ -593,6 +721,9 @@ function publicTeam(mother) {
     status: mother.status || 'unconfigured',
     lastCheck: mother.lastCheck || null,
     lastSync: mother.lastWorkspaceSyncAt || null,
+    sub2apiIntegrationId: mother.sub2apiIntegrationId || sub2apiConfig?.id || null,
+    sub2apiIntegrationName: sub2apiConfig?.name || '',
+    rotationProgress: mother.rotationProgress || null,
     currentAccounts,
   };
 }
@@ -609,10 +740,12 @@ function publicHistory() {
 }
 function publicState({ includeHistory = true } = {}) {
   const integrations = state.settings?.integrations || {};
+  const safeSub2Apis = sub2ApiConfigs().map(publicSub2ApiConfig);
   const safeSettings = {
     ...state.settings,
     integrations: {
-      sub2api: { baseUrl: integrations.sub2api?.baseUrl || '', enabled: integrations.sub2api?.enabled === true, groupId: Number.isFinite(Number(integrations.sub2api?.groupId)) ? Number(integrations.sub2api.groupId) : null, groupName: integrations.sub2api?.groupName || '', apiKeySet: Boolean(integrations.sub2api?.apiKey) },
+      sub2api: safeSub2Apis[0] || publicSub2ApiConfig(integrations.sub2api),
+      sub2apis: safeSub2Apis,
       mailbox: { serviceType: integrations.mailbox?.serviceType || 'manual', endpoint: integrations.mailbox?.endpoint || '', enabled: integrations.mailbox?.enabled === true, apiKeySet: Boolean(integrations.mailbox?.apiKey) },
     },
     proxy: publicProxySettings(state.settings),
@@ -677,7 +810,13 @@ async function bodyOf(req) {
 }
 function findMother(id) { return state.mothers.find((mother) => mother.id === id); }
 function findChild(id) { return state.children.find((child) => child.id === id); }
-function canonicalTeamId(mother) { return mother?.accountId || mother?.team || mother?.id || ''; }
+function configuredTeamId(mother) {
+  const accountId = String(mother?.accountId || '').trim();
+  if (accountId) return accountId;
+  const team = String(mother?.team || '').trim();
+  return team && team !== String(mother?.id || '').trim() ? team : '';
+}
+function canonicalTeamId(mother) { return configuredTeamId(mother) || mother?.id || ''; }
 function teamDisplayName(mother) { return mother?.teamName || mother?.displayName || '未命名 Team'; }
 function primaryOwnerRecord(mother) {
   const primaryEmail = String(mother?.primaryOwnerEmail || mother?.email || '').toLowerCase();
@@ -703,7 +842,7 @@ function mergeImportedMother(mother, item) {
     if (existing) Object.assign(existing, Object.fromEntries(Object.entries(owner).filter(([, value]) => value !== '' && value !== null && value !== undefined)));
     else mother.ownerAccounts.push(owner);
   }
-  const primaryFields = ['teamName', 'seats', 'used', 'accountId', 'team', 'subscription', 'seatSnapshot'];
+  const primaryFields = ['teamName', 'seats', 'used', 'accountId', 'team', 'subscription', 'seatSnapshot', 'dailyRotationLimit'];
   for (const key of primaryFields) {
     if ((mother[key] === '' || mother[key] === null || mother[key] === undefined) && imported[key] !== '' && imported[key] !== null && imported[key] !== undefined) mother[key] = imported[key];
   }
@@ -787,7 +926,7 @@ function linkFreeAccountsToImportedTeams() {
     if (teamIds.length && !child.team) {
       child.team = teamIds[0];
       child.joinedAt = child.joinedAt || now();
-      child.status = child.accessToken ? 'active' : 'login_required';
+      if (!childIsBanned(child)) child.status = child.accessToken ? 'active' : 'login_required';
     }
   }
 }
@@ -844,8 +983,9 @@ async function fetchChatGptJson(accessToken, requestPath, options = {}) {
     const text = await response.text().catch(() => '');
     let payload = {};
     try { payload = text ? JSON.parse(text) : {}; } catch { payload = { raw: text.slice(0, 500) }; }
-    const detail = payload && typeof payload === 'object' ? payload.detail || payload.error || payload.message : '';
-    return { ok: response.ok, status: response.status, payload, latencyMs: Date.now() - started, message: response.ok ? 'ok' : String(detail || `http_${response.status}`), location: response.headers.get('location') };
+    const detail = payload && typeof payload === 'object' ? payload.detail || payload.error_description || payload.error?.message || payload.error?.code || payload.error || payload.message : '';
+    const message = typeof detail === 'string' ? detail : detail ? JSON.stringify(detail) : `http_${response.status}`;
+    return { ok: response.ok, status: response.status, payload, latencyMs: Date.now() - started, message: response.ok ? 'ok' : message, errorCode: payload?.code || payload?.error?.code || null, location: response.headers.get('location') };
   } catch (error) {
     return { ok: false, status: 0, payload: {}, latencyMs: Date.now() - started, message: error?.name === 'TimeoutError' ? 'timeout' : 'network_error' };
   }
@@ -1058,7 +1198,7 @@ function applyFreeSub2ApiAccount(child, account, fields = credentialFields(accou
   child.sub2apiImported = true;
   child.importedAt = now();
   child.authAt = now();
-  child.status = child.team ? 'active' : 'ready';
+  if (!childIsBanned(child)) child.status = child.team ? 'active' : 'ready';
   setChildLoginState(child, 'ready', '已录入 Sub2API Free JSON');
 }
 
@@ -1106,7 +1246,9 @@ function motherFromImportedAccount(item) {
     team: item.team || item.workspaceName || fields.accountId || '',
     teamName: item.teamName || item.displayName || item.workspaceName || item.workspace_name || '',
     rotationMode: item.rotationMode === 'rotating' ? 'rotating' : 'fixed',
+    dailyRotationLimit: normalizeDailyRotationLimit(item.dailyRotationLimit ?? item.daily_rotation_limit),
     primaryOwnerEmail: item.primaryOwnerEmail || item.primary_owner_email || fields.email || '',
+    sub2apiIntegrationId: sub2ApiConfigById(item.sub2apiIntegrationId)?.id || sub2ApiConfigs()[0]?.id || DEFAULT_SUB2API_ID,
     seats: item.seats == null ? null : Number(item.seats),
     used: item.used == null ? null : Number(item.used),
     accessToken: fields.accessToken,
@@ -1137,10 +1279,82 @@ async function probeUsage(accessToken, accountId) {
     const response = await proxyFetch(`${CHATGPT_BASE_URL}/backend-api/wham/usage`, { headers: chatGptHeaders(accessToken, accountId, '/backend-api/wham/usage', '/backend-api/wham/usage'), signal: AbortSignal.timeout(OPENAI_REQUEST_TIMEOUT_MS) });
     const payload = await response.json().catch(() => ({}));
     const limit = payload.rate_limit || payload.rateLimit || payload;
-    return { ok: response.ok, status: response.status, message: response.ok ? 'ok' : (payload.detail || payload.error || `http_${response.status}`), latencyMs: Date.now() - started, planType: payload.plan_type || payload.planType, limitReached: Boolean(limit.limit_reached ?? limit.limitReached), primary: readWindow(limit.primary_window || limit.primaryWindow), secondary: readWindow(limit.secondary_window || limit.secondaryWindow), source: 'wham/usage' };
+    const errorValue = payload?.detail || payload?.error_description || payload?.error?.message || payload?.error?.code || payload?.error;
+    const errorMessage = typeof errorValue === 'string' ? errorValue : errorValue ? JSON.stringify(errorValue) : `http_${response.status}`;
+    return { ok: response.ok, status: response.status, message: response.ok ? 'ok' : errorMessage, errorCode: payload?.code || payload?.error?.code || null, latencyMs: Date.now() - started, planType: payload.plan_type || payload.planType, limitReached: Boolean(limit.limit_reached ?? limit.limitReached), primary: readWindow(limit.primary_window || limit.primaryWindow), secondary: readWindow(limit.secondary_window || limit.secondaryWindow), source: 'wham/usage' };
   } catch (error) {
     return { ok: false, status: 0, message: error?.name === 'TimeoutError' ? 'timeout' : 'network_error', latencyMs: Date.now() - started, primary: readWindow(), secondary: readWindow() };
   }
+}
+
+// K12's liveness flow distinguishes an explicit OpenAI account suspension from
+// ordinary expired-token/network failures. Only run it after the quota probe
+// fails, so healthy accounts do not spend an extra Responses request.
+async function probeAccountLiveness(accessToken, accountId) {
+  if (!accessToken) return { ok: false, status: 0, message: 'missing_token', banned: false };
+  const started = Date.now();
+  try {
+    const response = await proxyFetch(`${CHATGPT_BASE_URL}/backend-api/codex/responses`, {
+      method: 'POST',
+      headers: {
+        accept: 'text/event-stream, application/json',
+        'content-type': 'application/json',
+        authorization: `Bearer ${accessToken}`,
+        'openai-beta': 'responses=experimental',
+        originator: 'opencode',
+        ...(accountId ? { 'chatgpt-account-id': accountId } : {}),
+      },
+      body: JSON.stringify({ model: 'gpt-5', input: [{ role: 'user', content: [{ type: 'input_text', text: 'hi' }] }], instructions: 'You are a helpful assistant.', stream: true, store: false }),
+      signal: AbortSignal.timeout(Math.max(10000, Math.min(45000, OPENAI_REQUEST_TIMEOUT_MS * 3))),
+    });
+    const raw = await response.text().catch(() => '');
+    let payload = {};
+    try { payload = raw ? JSON.parse(raw) : {}; } catch { payload = {}; }
+    const value = payload?.error?.message || payload?.error?.code || payload?.detail || payload?.message || raw.slice(0, 500) || `http_${response.status}`;
+    const message = typeof value === 'string' ? value : JSON.stringify(value);
+    return { ok: response.ok, status: response.status, message: response.ok ? 'ok' : message, banned: !response.ok && Boolean(explicitAccountBanMessage(message)), latencyMs: Date.now() - started, source: 'codex/responses' };
+  } catch (error) {
+    return { ok: false, status: 0, message: error?.name === 'TimeoutError' ? 'timeout' : 'network_error', banned: false, latencyMs: Date.now() - started, source: 'codex/responses' };
+  }
+}
+
+function explicitAccountBanMessage(...values) {
+  for (const value of values) {
+    const message = value instanceof Error
+      ? value.message
+      : typeof value === 'string'
+        ? value
+        : value && typeof value === 'object'
+          ? [value.message, value.errorCode, value.code].filter(Boolean).join(' ')
+          : '';
+    if (/account_deactivated|account disabled|account has been (?:deleted|deactivated|disabled|suspended|banned|terminated)|account.*(?:suspended|banned|terminated|deactivated|disabled)|user.*(?:suspended|banned|terminated|deactivated|disabled)|账号已停用|账户已停用|账号已被删除|账户已被删除|账号已封|账号被封|封号|被封禁|账户被封|停用/i.test(message)) return message;
+  }
+  return '';
+}
+
+function childIsBanned(child) {
+  return child?.banStatus === 'banned' || child?.status === 'banned';
+}
+
+function markChildBanned(child, mother, evidence = {}) {
+  if (!child) return false;
+  const detectedAt = now();
+  const reason = explicitAccountBanMessage(evidence) || 'OpenAI 账号已被停用或封禁';
+  const wasBanned = childIsBanned(child);
+  child.banStatus = 'banned';
+  child.status = 'banned';
+  child.bannedAt = child.bannedAt || detectedAt;
+  child.banReason = child.banReason || reason;
+  child.banEvidence = {
+    teamId: canonicalTeamId(mother) || null,
+    source: evidence.source || 'team_quota_probe',
+    status: Number.isFinite(Number(evidence.status)) ? Number(evidence.status) : null,
+    code: evidence.errorCode || evidence.code || null,
+    message: reason,
+    detectedAt,
+  };
+  if (!wasBanned) addHistory('检测到封号', `${child.email} 已确认封禁，永久移出 Free 补位池`, 'partial');
+  return !wasBanned;
 }
 
 function normalizeSubscription(payload, accountId) {
@@ -1312,7 +1526,7 @@ async function syncMotherWorkspace(mother, { query = '', force = false } = {}) {
         // `team` remains a current-space convenience field; history holds all active memberships.
         child.team = child.team || mother.team;
         child.joinedAt = child.joinedAt || membership.joinedAt;
-        child.status = child.accessToken ? 'active' : 'ready';
+        if (!childIsBanned(child)) child.status = child.accessToken ? 'active' : 'ready';
       }
     }
   }
@@ -1376,7 +1590,7 @@ async function promoteJoinedMemberToOwner(mother, child, workspaceId) {
   child.accountUserId = member.accountUserId || child.accountUserId;
   child.memberId = member.id;
   child.memberSnapshot = member;
-  child.status = 'active';
+  if (!childIsBanned(child)) child.status = 'active';
   child.team = mother.team;
   child.joinedAt = child.joinedAt || now();
   const membership = membershipFor(child, mother.team, true);
@@ -1449,9 +1663,9 @@ function upsertTeamOwnerFromChild(mother, child, workspaceId, workspaceToken) {
     email: child.email,
     name: child.name || existing.name || child.email,
     accessToken: workspaceToken.accessToken,
-    refreshToken: child.refreshToken || existing.refreshToken || '',
-    idToken: child.idToken || existing.idToken || '',
-    clientId: child.clientId || existing.clientId || '',
+    refreshToken: workspaceToken.refreshToken || existing.refreshToken || '',
+    idToken: workspaceToken.idToken || existing.idToken || '',
+    clientId: workspaceToken.clientId || child.clientId || existing.clientId || '',
     chatgptUserId: workspaceToken.userId || child.chatgptUserId || existing.chatgptUserId || '',
     accountId: workspaceId,
     team: mother.team || workspaceId,
@@ -1593,8 +1807,8 @@ function applyQuotaResult(child, result, teamId = null, window = selectedKickWin
     membership.quotaStatus = quotaIsExhausted(child, result, window) ? 'exhausted' : (result.ok ? 'available' : 'unknown');
     membership.quotaStatusWindow = window;
   }
-  if (shouldUpdateAccount && quotaIsExhausted(child, result, window)) child.status = 'exhausted';
-  else if (shouldUpdateAccount && (result.primary?.usedPercent != null || result.secondary?.usedPercent != null)) {
+  if (!childIsBanned(child) && shouldUpdateAccount && quotaIsExhausted(child, result, window)) child.status = 'exhausted';
+  else if (!childIsBanned(child) && shouldUpdateAccount && (result.primary?.usedPercent != null || result.secondary?.usedPercent != null)) {
     const remaining = [membership?.quota5h ?? child.quota5h, membership?.quota7d ?? child.quota7d].filter((value) => value != null);
     child.status = remaining.length && Math.min(...remaining) <= state.settings.threshold ? 'warning' : result.ok ? 'active' : child.status;
   }
@@ -1647,6 +1861,9 @@ function applyRefreshedChildToken(child, result) {
   child.accessToken = result.accessToken;
   child.refreshToken = result.refreshToken || child.refreshToken;
   child.idToken = result.idToken || child.idToken;
+  child.clientId = result.clientId || child.clientId;
+  child.organizationId = result.organizationId || child.organizationId;
+  child.subscriptionExpiresAt = result.subscriptionExpiresAt || child.subscriptionExpiresAt;
   child.accountId = claims.accountId || child.accountId;
   child.chatgptUserId = claims.userId || child.chatgptUserId;
   child.expiresAt = claims.expiresAt || (result.expiresIn ? new Date(Date.now() + result.expiresIn * 1000).toISOString() : child.expiresAt);
@@ -1657,7 +1874,7 @@ function applyRefreshedChildToken(child, result) {
   child.authSession = null;
   child.loginUrl = null;
   child.loginBrowserRequired = false;
-  child.status = child.team ? 'active' : 'ready';
+  if (!childIsBanned(child)) child.status = child.team ? 'active' : 'ready';
   setChildLoginState(child, 'ready', '已通过 refresh token 获取新的 AT');
 }
 
@@ -1666,6 +1883,9 @@ function applyLoggedInChildToken(child, result) {
   child.accessToken = result.accessToken;
   child.refreshToken = result.refreshToken || child.refreshToken;
   child.idToken = result.idToken || child.idToken;
+  child.clientId = result.clientId || child.clientId;
+  child.organizationId = result.organizationId || child.organizationId;
+  child.subscriptionExpiresAt = result.subscriptionExpiresAt || child.subscriptionExpiresAt;
   child.accountId = claims.accountId || child.accountId;
   child.chatgptUserId = claims.userId || child.chatgptUserId;
   child.expiresAt = claims.expiresAt || child.expiresAt;
@@ -1676,8 +1896,27 @@ function applyLoggedInChildToken(child, result) {
   child.authSession = null;
   child.loginUrl = null;
   child.loginBrowserRequired = false;
-  child.status = child.team ? 'active' : 'ready';
-  setChildLoginState(child, 'ready', '已完成登录，Free JSON 已生成');
+  if (result.sub2api) {
+    child.sub2api = {
+      ...(child.sub2api || {}),
+      imported: true,
+      integrationId: result.sub2api.integrationId || null,
+      integrationName: result.sub2api.integrationName || '',
+      accountId: result.sub2api.accountId || null,
+      groupId: result.sub2api.groupId || null,
+      groupName: result.sub2api.groupName || '',
+      action: result.sub2api.action || '',
+      synced: result.sub2api.synced === true,
+      message: result.sub2api.message || '',
+      syncedAt: result.sub2api.synced ? now() : null,
+    };
+  }
+  if (!childIsBanned(child)) child.status = child.team ? 'active' : 'ready';
+  setChildLoginState(child, 'ready', result.sub2api?.synced
+    ? '已完成 Codex OAuth，Free JSON 已生成并同步 Sub2API'
+    : result.sub2api
+      ? `已生成 Free JSON，Sub2API 同步未完成：${result.sub2api.message || 'unknown_error'}`
+      : '已完成登录，Free JSON 已生成');
 }
 
 const childAuthQueues = new Map();
@@ -1697,6 +1936,7 @@ async function acquireChildAuth(child, options = {}) {
 
 async function acquireChildAuthInternal(child, { refresh = false, verificationCode = '', callbackUrl = '', allowCredentialLogin = false } = {}) {
   if (!child) return { ok: false, status: 404, message: 'child_not_found' };
+  if (childIsBanned(child)) return { ok: false, status: 409, code: 'account_banned', message: child.banReason || '账号已封禁，不能刷新或重新获取 JSON', banned: true, child: publicChild(child) };
   if (child.accessToken && !refresh && !freeTokenNeedsRefresh(child)) {
     setChildLoginState(child, 'ready', '已有可用 AT');
     await persist();
@@ -1713,8 +1953,14 @@ async function acquireChildAuthInternal(child, { refresh = false, verificationCo
       await persist();
       return { ok: true, status: 200, source: 'refresh_token', child: publicChild(child) };
     }
+    const refreshBanMessage = explicitAccountBanMessage(refreshed);
+    if (refreshBanMessage) {
+      markChildBanned(child, null, { source: 'free_refresh_token', status: refreshed.status, code: refreshed.code, message: refreshBanMessage });
+      await persist();
+      return { ok: false, status: refreshed.status || 403, code: 'account_banned', message: refreshBanMessage, banned: true, child: publicChild(child) };
+    }
     setChildLoginState(child, 'login_required', 'refresh token 已失效，需要重新登录获取 AT');
-    child.status = 'login_required';
+    if (!childIsBanned(child)) child.status = 'login_required';
     await persist();
     if (!allowCredentialLogin) {
       return { ok: false, status: refreshed.status || 502, code: 'refresh_failed', message: 'refresh token 已失效，需要重新登录', child: publicChild(child) };
@@ -1730,12 +1976,17 @@ async function acquireChildAuthInternal(child, { refresh = false, verificationCo
     await persist();
     return { ok: false, status: 400, code: 'credentials_required', message: '请先填写邮箱和密码', child: publicChild(child) };
   }
+  if (!child.totp && !child.secret) {
+    setChildLoginState(child, 'waiting_code', 'Codex OAuth 登录需要现有 2FA Secret');
+    await persist();
+    return { ok: false, status: 202, code: 'totp_required', message: '请先填写账号现有的 2FA Secret', needsInput: true, child: publicChild(child) };
+  }
   if (child.loginStatus === 'phone_verification_required' && !verificationCode && !callbackUrl) {
     child.authSession = null;
     child.loginUrl = null;
   }
   setChildLoginState(child, 'authenticating', '正在使用邮箱、密码和 2FA 登录 OpenAI');
-  child.status = 'login_pending';
+  if (!childIsBanned(child)) child.status = 'login_pending';
   child.loginBrowserRequired = false;
   await persist();
   const mailboxConfig = state.settings?.integrations?.mailbox || {};
@@ -1751,6 +2002,8 @@ async function acquireChildAuthInternal(child, { refresh = false, verificationCo
     username: sentinelProxyEntry.username || '',
     password: sentinelProxyEntry.password || '',
   } : null;
+  const oauthAdapter = sub2ApiOAuthAdapter(sub2ApiConfigs()[0], child, { scope: 'free' });
+  const authSession = oauthSessionForAdapter(child.authSession, oauthAdapter);
   const login = await loginFreeAccount({
     email: child.email,
     password: child.password,
@@ -1759,20 +2012,23 @@ async function acquireChildAuthInternal(child, { refresh = false, verificationCo
     mailboxHeaders,
     sentinelProxy,
     verificationCode,
-    callbackUrl: callbackUrl || consumeOAuthCallback(child.authSession?.state),
-    session: child.authSession,
+    callbackUrl: callbackUrl || consumeOAuthCallback(authSession?.state),
+    session: authSession,
     workspaceId: '',
     workspaceMode: 'free',
     fetch: proxyFetch,
     timeoutMs: OPENAI_REQUEST_TIMEOUT_MS,
     onProgress: (phase, message) => setChildLoginState(child, phase, message),
+    ...(oauthAdapter || {}),
   });
   if (login.ok) {
     applyLoggedInChildToken(child, login);
-    addHistory('登录 Free 账号', `${child.email} 已完成登录并生成 AT/RT`);
+    addHistory('登录 Free 账号', `${child.email} 已完成 Codex OAuth 并生成 Free JSON${login.sub2api?.synced ? `，已同步到 ${login.sub2api.integrationName || 'Sub2API'}` : ''}`);
     await persist();
-    return { ok: true, status: 200, code: 'ready', source: 'email_password_2fa', format: 'free-json', child: publicChild(child), exportable: true };
+    return { ok: true, status: 200, code: 'ready', source: login.sub2api ? 'sub2api_oauth_email_password_2fa' : 'email_password_2fa', format: 'free-json', sub2api: login.sub2api || null, child: publicChild(child), exportable: true };
   }
+  const loginBanMessage = explicitAccountBanMessage(login);
+  if (loginBanMessage) markChildBanned(child, null, { source: 'free_oauth_login', status: login.status, code: login.code, message: loginBanMessage });
   const phoneRequired = login.code === 'phone_verification_required';
   child.authSession = phoneRequired ? null : login.session || child.authSession || null;
   child.loginUrl = login.authUrl || null;
@@ -1785,15 +2041,16 @@ async function acquireChildAuthInternal(child, { refresh = false, verificationCo
     : browserRequired ? '登录需要浏览器验证，请打开授权链接完成验证后重试'
     : login.message || (waiting ? '登录需要验证码，请填写验证码后重试' : '登录失败，请检查凭据或稍后重试');
   setChildLoginState(child, status, message);
-  child.status = phoneRequired ? 'phone_verification_required' : status === 'waiting_code' || status === 'verification_required' ? 'login_pending' : 'login_required';
+  if (!childIsBanned(child)) child.status = phoneRequired ? 'phone_verification_required' : status === 'waiting_code' || status === 'verification_required' ? 'login_pending' : 'login_required';
   addHistory('登录 Free 账号', `${child.email} ${message}`, 'partial');
   await persist();
-  return { ok: false, status: login.status || 202, code: login.code || (browserRequired ? 'verification_required' : 'login_failed'), message, stage: login.stage, browserRequired, needsInput: login.needsInput, authUrl: login.authUrl || null, child: publicChild(child) };
+  return { ok: false, status: login.status || 202, code: loginBanMessage ? 'account_banned' : login.code || (browserRequired ? 'verification_required' : 'login_failed'), message: loginBanMessage || message, banned: Boolean(loginBanMessage), stage: login.stage, browserRequired, needsInput: login.needsInput, authUrl: login.authUrl || null, child: publicChild(child) };
 }
 
 async function acquireTeamAuth(mother, child, { verificationCode = '', callbackUrl = '', force = false } = {}) {
   const workspaceId = String(mother?.accountId || '').trim();
   if (!mother || !child || !workspaceId) return { ok: false, status: 400, code: 'workspace_id_required', message: '请先配置目标 Team ID' };
+  if (childIsBanned(child)) return { ok: false, status: 409, code: 'account_banned', message: child.banReason || '账号已封禁，不能生成 Team JSON', banned: true, child: publicChild(child, mother.team) };
   const existing = workspaceTokenFor(child, workspaceId);
   if (existing?.accessToken && !force) {
     return { ok: true, status: 200, code: 'ready', source: 'stored_team_token', format: 'team-json', tokenScope: 'team', child: publicChild(child, mother.team) };
@@ -1819,6 +2076,8 @@ async function acquireTeamAuth(mother, child, { verificationCode = '', callbackU
     username: sentinelProxyEntry.username || '',
     password: sentinelProxyEntry.password || '',
   } : null;
+  const oauthAdapter = sub2ApiOAuthAdapter(sub2ApiConfigForMother(mother), child, { scope: 'team', workspaceId });
+  const compatibleSession = oauthSessionForAdapter(session, oauthAdapter);
   child.teamLoginStatus = 'authenticating';
   child.teamLoginMessage = `正在通过 OAuth 登录并选择 Team ${workspaceId}`;
   await persist();
@@ -1830,15 +2089,18 @@ async function acquireTeamAuth(mother, child, { verificationCode = '', callbackU
     mailboxHeaders,
     sentinelProxy,
     verificationCode,
-    callbackUrl: callbackUrl || consumeOAuthCallback(session?.state),
-    session,
+    callbackUrl: callbackUrl || consumeOAuthCallback(compatibleSession?.state),
+    session: compatibleSession,
     workspaceId,
     workspaceMode: 'team',
     fetch: proxyFetch,
     timeoutMs: OPENAI_REQUEST_TIMEOUT_MS,
     onProgress: (phase, message) => { child.teamLoginStatus = phase; child.teamLoginMessage = message; },
+    ...(oauthAdapter || {}),
   });
   if (!login.ok) {
+    const banMessage = explicitAccountBanMessage(login);
+    if (banMessage) markChildBanned(child, mother, { source: 'team_oauth_login', status: login.status, code: login.code, message: banMessage });
     child.teamAuthSessions[workspaceId] = login.session || session || null;
     child.teamLoginStatus = login.stage || 'login_required';
     child.teamLoginMessage = login.message || 'Team OAuth 登录失败';
@@ -1846,8 +2108,9 @@ async function acquireTeamAuth(mother, child, { verificationCode = '', callbackU
     return {
       ok: false,
       status: login.status || 202,
-      code: login.code || 'team_login_failed',
-      message: login.message || 'Team OAuth 登录失败',
+      code: banMessage ? 'account_banned' : login.code || 'team_login_failed',
+      message: banMessage || login.message || 'Team OAuth 登录失败',
+      banned: Boolean(banMessage),
       stage: login.stage,
       needsInput: Boolean(login.needsInput),
       browserRequired: Boolean(login.browserRequired),
@@ -1862,25 +2125,39 @@ async function acquireTeamAuth(mother, child, { verificationCode = '', callbackU
     await persist();
     return { ok: false, status: 502, code: 'team_workspace_mismatch', message: 'OAuth 登录后未选择目标 Team 空间', accountId: claims.accountId || null, child: publicChild(child, mother.team) };
   }
-  child.refreshToken = login.refreshToken || child.refreshToken || '';
-  child.idToken = login.idToken || child.idToken || '';
   child.cookies = login.cookies || child.cookies || null;
-  const workspaceToken = saveWorkspaceToken(child, workspaceId, login.accessToken, claims);
+  const workspaceToken = saveWorkspaceToken(child, workspaceId, login.accessToken, claims, {
+    refreshToken: login.refreshToken || '',
+    idToken: login.idToken || '',
+    clientId: login.clientId || child.clientId || '',
+    sub2api: login.sub2api || null,
+    source: 'team_oauth_email_password_2fa',
+  });
   delete child.teamAuthSessions[workspaceId];
   child.teamLoginStatus = 'ready';
-  child.teamLoginMessage = '已通过 OAuth 登录并生成 Team JSON';
+  child.teamLoginMessage = login.sub2api?.synced ? '已通过 Codex OAuth 生成 Team JSON 并同步 Sub2API' : '已通过 OAuth 登录并生成 Team JSON';
   child.pendingWorkspaceId = null;
   const membership = membershipFor(child, mother.team, true);
   membership.workspaceTokenStatus = 'ready';
   membership.workspaceTokenUpdatedAt = workspaceToken.acquiredAt;
   if (childIsWorkspaceOwner(child, mother) || childMatchesKnownTeamOwner(child, mother)) upsertTeamOwnerFromChild(mother, child, workspaceId, workspaceToken);
-  addHistory('生成 Team JSON', `${child.email} 已通过 OAuth 登录并选择 ${mother.team}`);
+  addHistory('生成 Team JSON', `${child.email} 已通过 OAuth 登录并选择 ${mother.team}${login.sub2api?.synced ? `，已同步到 ${login.sub2api.integrationName || 'Sub2API'}` : ''}`);
   await persist();
-  return { ok: true, status: 200, code: 'ready', source: 'oauth_email_password_2fa_team', format: 'team-json', tokenScope: 'team', accountId: workspaceId, expiresAt: workspaceToken.expiresAt, exportable: true, child: publicChild(child, mother.team) };
+  return { ok: true, status: 200, code: 'ready', source: login.sub2api ? 'sub2api_oauth_email_password_2fa_team' : 'oauth_email_password_2fa_team', format: 'team-json', tokenScope: 'team', accountId: workspaceId, expiresAt: workspaceToken.expiresAt, sub2api: login.sub2api || null, exportable: true, child: publicChild(child, mother.team) };
 }
 
-function canAutoPushRenewedTeamJson() {
-  const config = state.settings?.integrations?.sub2api || {};
+function hasTeamLoginCredentials(child) {
+  return Boolean(child?.email && child?.password && (child?.totp || child?.secret));
+}
+
+function acquireTeamJson(mother, child, { verificationCode = '', callbackUrl = '' } = {}) {
+  return hasTeamLoginCredentials(child)
+    ? acquireTeamAuth(mother, child, { force: true, verificationCode, callbackUrl })
+    : switchWorkspaceWithFreeRecovery(child, mother.accountId, { verificationCode, callbackUrl });
+}
+
+function canAutoPushRenewedTeamJson(mother) {
+  const config = sub2ApiConfigForMother(mother) || {};
   const groupId = Number(config.groupId);
   return config.enabled === true
     && Boolean(sub2ApiRoot(config.baseUrl))
@@ -1890,46 +2167,65 @@ function canAutoPushRenewedTeamJson() {
 
 async function renewUnauthorizedTeamToken(mother, child) {
   if (!mother?.accountId || !child) return { ok: false, status: 400, message: 'workspace_id_or_child_missing', freeRefreshed: false };
-  let switched = await switchWorkspaceWithFreeRecovery(child, mother.accountId, { forceRefreshFirst: Boolean(child.refreshToken) });
-  let teamOAuth = null;
-  if (!switched.ok && child.email && child.password && (child.totp || child.secret)) {
-    teamOAuth = await acquireTeamAuth(mother, child, { force: true });
-    if (teamOAuth.ok) switched = { ok: true, status: 200, freeAuth: { attempted: true, ok: true, source: 'email_password_2fa' } };
+  const workspaceId = String(mother.accountId).trim();
+  const stored = workspaceTokenFor(child, workspaceId) || workspaceTokenFor(child, mother.team);
+  const childEmail = String(child.email || '').trim().toLowerCase();
+  const importedTeamOwner = [mother, ...(Array.isArray(mother.ownerAccounts) ? mother.ownerAccounts : [])]
+    .find((owner) => childEmail && String(owner?.email || '').trim().toLowerCase() === childEmail && String(owner?.accountId || workspaceId).trim() === workspaceId);
+  const teamRefreshToken = stored?.refreshToken || importedTeamOwner?.refreshToken || '';
+  const teamClientId = stored?.clientId || importedTeamOwner?.clientId || child.clientId || '';
+  if (teamRefreshToken) {
+    const refreshed = await refreshOpenAiAccessToken(teamRefreshToken, teamClientId, OPENAI_REQUEST_TIMEOUT_MS, proxyFetch);
+    const claims = refreshed.claims || accessTokenClaims(refreshed.accessToken);
+    if (refreshed.ok && claims.accountId === workspaceId) {
+      const workspaceToken = saveWorkspaceToken(child, workspaceId, refreshed.accessToken, claims, {
+        refreshToken: refreshed.refreshToken || teamRefreshToken,
+        idToken: refreshed.idToken || stored?.idToken || importedTeamOwner?.idToken || '',
+        clientId: teamClientId,
+        source: 'team_refresh_token',
+      });
+      if (childIsWorkspaceOwner(child, mother) || childMatchesKnownTeamOwner(child, mother)) upsertTeamOwnerFromChild(mother, child, workspaceId, workspaceToken);
+      addHistory('刷新 Team JSON', `${child.email} 已使用 ${mother.team} 自己的 refresh token 更新 OAuth 授权`);
+      await persist();
+      return { ok: true, status: 200, message: 'team_token_renewed', source: 'team_refresh_token', freeRefreshed: false, credentialLogin: false, credentialLoginAttempted: false };
+    }
   }
-  const authSource = switched.freeAuth?.source || null;
-  const freeRefreshed = authSource === 'refresh_token';
-  const credentialLogin = authSource === 'email_password_2fa';
-  if (!switched.ok) {
-    const failure = teamOAuth || switched;
+
+  const teamOAuth = await acquireTeamAuth(mother, child, { force: true });
+  if (!teamOAuth.ok) {
     return {
       ok: false,
-      status: failure.status || 502,
-      code: failure.code || 'workspace_token_refresh_failed',
-      message: failure.message || 'workspace_token_refresh_failed',
-      freeRefreshed,
-      credentialLogin,
-      credentialLoginAttempted: Boolean(switched.freeAuth?.attempted),
-      needsInput: Boolean(failure.needsInput),
-      browserRequired: Boolean(failure.browserRequired),
-      authUrl: failure.authUrl || null,
+      status: teamOAuth.status || 502,
+      code: teamOAuth.code || 'team_oauth_refresh_failed',
+      message: teamOAuth.message || 'team_oauth_refresh_failed',
+      freeRefreshed: false,
+      credentialLogin: false,
+      credentialLoginAttempted: true,
+      needsInput: Boolean(teamOAuth.needsInput),
+      browserRequired: Boolean(teamOAuth.browserRequired),
+      authUrl: teamOAuth.authUrl || null,
     };
   }
 
-  const workspaceToken = workspaceTokenFor(child, mother.accountId) || workspaceTokenFor(child, mother.team);
-  if (!workspaceToken?.accessToken) return { ok: false, status: 502, message: 'renewed_workspace_token_missing', freeRefreshed, credentialLogin };
+  const workspaceToken = workspaceTokenFor(child, workspaceId) || workspaceTokenFor(child, mother.team);
+  if (!workspaceToken?.accessToken) return { ok: false, status: 502, message: 'renewed_workspace_token_missing', freeRefreshed: false, credentialLogin: true, credentialLoginAttempted: true };
   if (childIsWorkspaceOwner(child, mother) || childMatchesKnownTeamOwner(child, mother)) {
-    upsertTeamOwnerFromChild(mother, child, mother.accountId, workspaceToken);
+    upsertTeamOwnerFromChild(mother, child, workspaceId, workspaceToken);
   }
-  addHistory('刷新 Team JSON', `${child.email} 的 ${mother.team} 已${credentialLogin ? '重新登录生成 Free JSON' : freeRefreshed ? '刷新 OAuth 授权' : '使用现有 Free AT'}并重新获取 Team Token`);
+  addHistory('刷新 Team JSON', `${child.email} 已重新完成 OAuth 登录并选择 ${mother.team}`);
   await persist();
-  return { ok: true, status: 200, message: 'team_token_renewed', freeRefreshed, credentialLogin, credentialLoginAttempted: Boolean(switched.freeAuth?.attempted) };
+  return { ok: true, status: 200, message: 'team_token_renewed', source: 'team_oauth_email_password_2fa', freeRefreshed: false, credentialLogin: true, credentialLoginAttempted: true };
 }
 
-async function pushRenewedTeamJson(mother) {
-  if (!canAutoPushRenewedTeamJson()) {
+async function pushRenewedTeamJson(mother, { emails = [], mode = 'create_only' } = {}) {
+  if (!canAutoPushRenewedTeamJson(mother)) {
     return { attempted: false, ok: null, status: null, message: 'sub2api_auto_push_not_configured', pushed: 0, failed: 0 };
   }
-  const result = await pushSub2ApiTeams([mother.id]);
+  const entries = teamSub2ApiEntries([mother.id], emails);
+  const result = await pushSub2ApiEntries(entries, mode === 'repair_only' ? '修复 Team Sub2API' : '推送新 Team 账号', {
+    config: sub2ApiConfigForMother(mother),
+    mode,
+  });
   return {
     attempted: true,
     ok: result.ok === true,
@@ -1937,6 +2233,7 @@ async function pushRenewedTeamJson(mother) {
     message: result.message || null,
     pushed: result.pushed?.length || 0,
     failed: result.failed?.length || 0,
+    skipped: result.skipped?.length || 0,
   };
 }
 
@@ -1959,25 +2256,42 @@ async function checkTeam(motherId) {
       const quotaToken = workspaceToken?.accessToken || importedOwnerToken;
       let result = await probeUsage(quotaToken, mother.accountId);
       let tokenRecovery = null;
-      if (result.status === 401 || result.message === 'missing_token') {
+      let liveness = null;
+      const initialBanMessage = explicitAccountBanMessage(result);
+      if (!initialBanMessage && !result.ok) {
+        liveness = await probeAccountLiveness(quotaToken, mother.accountId);
+      }
+      const livenessBanMessage = liveness?.banned ? explicitAccountBanMessage(liveness) || 'OpenAI 账号已被停用或封禁' : '';
+      if (!initialBanMessage && !livenessBanMessage && (result.status === 401 || result.message === 'missing_token')) {
         tokenRecovery = await renewUnauthorizedTeamToken(mother, child);
         if (tokenRecovery.ok) {
           const renewedToken = workspaceTokenFor(child, mother.accountId) || workspaceTokenFor(child, mother.team);
           result = await probeUsage(renewedToken?.accessToken || '', mother.accountId);
+          if (!result.ok) liveness = await probeAccountLiveness(renewedToken?.accessToken || '', mother.accountId);
         }
       }
       applyQuotaResult(child, result, mother.team, kickWindow);
+      const banMessage = initialBanMessage || livenessBanMessage || explicitAccountBanMessage(result, liveness, tokenRecovery);
+      if (banMessage) markChildBanned(child, mother, {
+        source: tokenRecovery && !tokenRecovery.ok ? 'team_oauth_recovery' : 'team_quota_probe',
+        status: tokenRecovery && !tokenRecovery.ok ? tokenRecovery.status : result.status,
+        code: tokenRecovery && !tokenRecovery.ok ? tokenRecovery.code : result.errorCode,
+        message: banMessage,
+      });
       const membership = membershipFor(child, mother.team);
-      return { id: child.id, email: child.email, ...result, quotaSource: quotaToken ? 'team' : 'team_token_missing', quota5h: membership?.quota5h ?? null, quota7d: membership?.quota7d ?? null, tokenRecovery: tokenRecovery ? { attempted: true, ok: tokenRecovery.ok, status: tokenRecovery.status, code: tokenRecovery.code || null, message: tokenRecovery.message, freeRefreshed: tokenRecovery.freeRefreshed, credentialLogin: Boolean(tokenRecovery.credentialLogin), credentialLoginAttempted: Boolean(tokenRecovery.credentialLoginAttempted), needsInput: Boolean(tokenRecovery.needsInput), browserRequired: Boolean(tokenRecovery.browserRequired) } : null };
+      return { id: child.id, email: child.email, ...result, banned: Boolean(banMessage), banReason: banMessage || null, liveness: liveness ? { ok: liveness.ok, status: liveness.status, message: liveness.message, banned: Boolean(liveness.banned), latencyMs: liveness.latencyMs } : null, quotaSource: quotaToken ? 'team' : 'team_token_missing', quota5h: membership?.quota5h ?? null, quota7d: membership?.quota7d ?? null, tokenRecovery: tokenRecovery ? { attempted: true, ok: tokenRecovery.ok, status: tokenRecovery.status, code: tokenRecovery.code || null, message: tokenRecovery.message, freeRefreshed: tokenRecovery.freeRefreshed, credentialLogin: Boolean(tokenRecovery.credentialLogin), credentialLoginAttempted: Boolean(tokenRecovery.credentialLoginAttempted), needsInput: Boolean(tokenRecovery.needsInput), browserRequired: Boolean(tokenRecovery.browserRequired) } : null };
     } catch (error) {
       return { id: child.id, email: child.email, ok: false, status: 502, message: error?.message || 'quota_probe_failed', quota5h: null, quota7d: null, tokenRecovery: null };
     }
   });
-  const renewedTeamTokens = results.filter((result) => result.tokenRecovery?.ok).length;
-  const renewedFreeTokens = results.filter((result) => result.tokenRecovery?.ok && result.tokenRecovery.freeRefreshed).length;
-  const reloggedFreeAccounts = results.filter((result) => result.tokenRecovery?.ok && result.tokenRecovery.credentialLogin).length;
+  const successfulRenewals = results.filter((result) => result.tokenRecovery?.ok && result.ok === true);
+  const renewedTeamTokens = successfulRenewals.length;
+  const renewedEmails = successfulRenewals.map((result) => result.email).filter(Boolean);
+  const renewedFreeTokens = successfulRenewals.filter((result) => result.tokenRecovery.freeRefreshed).length;
+  const reloggedTeamAccounts = successfulRenewals.filter((result) => result.tokenRecovery.credentialLogin).length;
+  const bannedAccounts = results.filter((result) => result.banned === true);
   const sub2apiPush = renewedTeamTokens > 0
-    ? await pushRenewedTeamJson(mother)
+    ? await pushRenewedTeamJson(mother, { emails: renewedEmails, mode: 'repair_only' })
     : { attempted: false, ok: null, status: null, message: null, pushed: 0, failed: 0 };
   if (renewedTeamTokens > 0 && workspace.ok !== true) {
     workspace = await syncMotherWorkspace(mother).catch((error) => ({ ok: false, message: error?.message || 'workspace_sync_failed', members: [] }));
@@ -1985,8 +2299,8 @@ async function checkTeam(motherId) {
   mother.lastCheck = now();
   const renewalDetail = !renewedTeamTokens
     ? ''
-    : `，刷新 ${renewedTeamTokens} 个 Team JSON${reloggedFreeAccounts ? `，重新登录 ${reloggedFreeAccounts} 个 Free 账号` : ''}${sub2apiPush.attempted ? `，Sub2API 推送 ${sub2apiPush.pushed} 个` : '，Sub2API 未推送（未启用或未配置分组）'}`;
-  addHistory('额度检测', `${mother.team} 检测 ${members.length} 个子号，席位 ${mother.used ?? '-'} / ${mother.seats ?? '-'}${renewalDetail}`);
+    : `，刷新 ${renewedTeamTokens} 个 Team JSON${reloggedTeamAccounts ? `，重新完成 ${reloggedTeamAccounts} 个 Team OAuth` : ''}${sub2apiPush.attempted ? `，Sub2API 修复 ${sub2apiPush.pushed} 个` : '，Sub2API 未修复（未启用或未配置分组）'}`;
+  addHistory('额度检测', `${mother.team} 检测 ${members.length} 个子号，席位 ${mother.used ?? '-'} / ${mother.seats ?? '-'}${bannedAccounts.length ? `，发现封禁 ${bannedAccounts.length} 个` : ''}${renewalDetail}`, bannedAccounts.length ? 'partial' : 'success');
   await persist();
   const probesOk = results.every((result) => result.ok === true);
   const syncOk = workspace.ok === true;
@@ -2003,7 +2317,8 @@ async function checkTeam(motherId) {
     probesOk,
     renewedTeamTokens,
     renewedFreeTokens,
-    reloggedFreeAccounts,
+    reloggedTeamAccounts,
+    bannedAccounts: bannedAccounts.map((result) => ({ id: result.id, email: result.email, reason: result.banReason })),
     sub2apiPush,
     managerRecovery,
   };
@@ -2032,9 +2347,95 @@ async function checkAllTeams() {
   };
 }
 
+const ROTATION_STAGES = [
+  ['sync', '同步 Team'],
+  ['kick', '移出耗尽账号'],
+  ['free_auth', '准备 Free 凭据'],
+  ['request', '申请加入'],
+  ['approve', '同意进入'],
+  ['member', '确认 Team 成员'],
+  ['owner', '设置所有者'],
+  ['team_json', '获取 Team JSON'],
+  ['verify', '复核席位'],
+  ['push', '同步 Sub2API'],
+];
+
+function beginRotationProgress(mother) {
+  const startedAt = now();
+  mother.rotationProgress = {
+    status: 'running',
+    current: 'sync',
+    message: '正在同步 Team 席位和成员',
+    account: '',
+    startedAt,
+    updatedAt: startedAt,
+    durationMs: null,
+    steps: ROTATION_STAGES.map(([id, label]) => ({ id, label, status: 'pending', startedAt: null, endedAt: null, durationMs: null })),
+  };
+  updateRotationProgress(mother, 'sync', { message: '正在同步 Team 席位和成员' });
+}
+
+function updateRotationProgress(mother, stage, { message = '', account = '' } = {}) {
+  const progress = mother?.rotationProgress;
+  if (!progress) return;
+  const updatedAt = now();
+  for (const step of progress.steps || []) {
+    if (step.status === 'running' && step.id !== stage) {
+      step.status = 'completed';
+      step.endedAt = updatedAt;
+      step.durationMs = Math.max(0, Date.parse(updatedAt) - Date.parse(step.startedAt || updatedAt));
+    }
+  }
+  const target = (progress.steps || []).find((step) => step.id === stage);
+  if (target) {
+    target.status = 'running';
+    target.startedAt = target.startedAt || updatedAt;
+    target.endedAt = null;
+    target.durationMs = null;
+  }
+  progress.status = 'running';
+  progress.current = stage;
+  progress.message = message || target?.label || stage;
+  progress.account = account || '';
+  progress.updatedAt = updatedAt;
+}
+
+function finishRotationProgress(mother, status, message, summary = {}) {
+  const progress = mother?.rotationProgress;
+  if (!progress) return;
+  const endedAt = now();
+  for (const step of progress.steps || []) {
+    if (step.status === 'running') {
+      step.status = status === 'failed' ? 'failed' : 'completed';
+      step.endedAt = endedAt;
+      step.durationMs = Math.max(0, Date.parse(endedAt) - Date.parse(step.startedAt || endedAt));
+    } else if (step.status === 'pending') {
+      step.status = 'skipped';
+    }
+  }
+  progress.status = status;
+  progress.message = message;
+  progress.account = '';
+  progress.endedAt = endedAt;
+  progress.updatedAt = endedAt;
+  progress.durationMs = Math.max(0, Date.parse(endedAt) - Date.parse(progress.startedAt || endedAt));
+  progress.summary = summary;
+}
+
 async function refillTeam(motherId) {
   const mother = findMother(motherId);
   if (!mother) return { ok: false, status: 404, message: 'mother_not_found' };
+  beginRotationProgress(mother);
+  try {
+    return await refillTeamInternal(motherId, mother);
+  } catch (error) {
+    finishRotationProgress(mother, 'failed', error?.message || '自动轮换失败');
+    await persist();
+    throw error;
+  }
+}
+
+async function refillTeamInternal(motherId, mother) {
   let managerRecovery = await recoverTeamManagerToken(mother);
   let workspace = await syncMotherWorkspace(mother).catch((error) => ({ ok: false, message: error?.message || 'workspace_sync_failed', members: [] }));
   if (!workspace.ok && [401, 403].includes(Number(workspace.status))) {
@@ -2043,6 +2444,7 @@ async function refillTeam(motherId) {
   }
   if (workspace.ok !== true) {
     const message = workspace.message || 'workspace_sync_failed';
+    finishRotationProgress(mother, 'failed', `Team 同步失败：${message}`);
     addHistory('自动补位', `${mother.team} 空间同步失败，跳过远端补位：${message}`, 'partial');
     await persist();
     return {
@@ -2060,8 +2462,10 @@ async function refillTeam(motherId) {
   }
   const ownerRoleRetryFailures = [];
   const workspaceTokenRetryFailures = [];
+  const recoveredTeamJson = [];
   const promoteJoinedAccounts = state.settings?.promoteJoinedAccounts !== false;
   const pendingOwnerRoles = promoteJoinedAccounts ? state.children.filter((child) => {
+    if (childIsBanned(child)) return false;
     if (!isChildMemberOfTeam(child, mother.team)) return false;
     const membership = membershipFor(child, mother.team);
     const ownerRoleStatus = membership?.ownerRoleStatus || child.ownerRoleStatus;
@@ -2080,13 +2484,13 @@ async function refillTeam(motherId) {
       child.ownerRoleUpdatedAt = now();
       child.ownerRoleError = null;
       addHistory('重试 Team 所有者', `${child.email} 已设置为 ${mother.team} 所有者`);
-      const switched = await switchWorkspaceWithFreeRecovery(child, mother.accountId);
+      const switched = await acquireTeamJson(mother, child);
       if (!switched.ok) {
         child.joinStatus = 'owner_confirmed_token_pending';
         membership.joinStatus = 'owner_confirmed_token_pending';
         membership.workspaceTokenStatus = 'pending';
         workspaceTokenRetryFailures.push({ id: child.id, email: child.email, ok: false, status: switched.status || 502, phase: 'workspace_token_retry', message: switched.message || 'workspace_token_exchange_failed' });
-      }
+      } else recoveredTeamJson.push(child);
     } else {
       child.joinStatus = 'owner_role_failed';
       child.ownerRoleStatus = 'failed';
@@ -2097,6 +2501,7 @@ async function refillTeam(motherId) {
     }
   }
   const pendingWorkspaceTokens = state.children.filter((child) => {
+    if (childIsBanned(child)) return false;
     if (!isChildMemberOfTeam(child, mother.team)) return false;
     const membership = membershipFor(child, mother.team);
     const workspaceToken = workspaceTokenFor(child, mother.accountId) || workspaceTokenFor(child, mother.team);
@@ -2105,13 +2510,14 @@ async function refillTeam(motherId) {
       || !teamTokenDetails(workspaceToken?.accessToken, mother.accountId);
   });
   for (const child of pendingWorkspaceTokens) {
-    const switched = await switchWorkspaceWithFreeRecovery(child, mother.accountId);
+    const switched = await acquireTeamJson(mother, child);
     const membership = membershipFor(child, mother.team, true);
     const roleConfirmedStatus = childIsWorkspaceOwner(child, mother) ? 'owner_confirmed' : 'member_confirmed';
     if (switched.ok) {
       child.joinStatus = roleConfirmedStatus;
       membership.joinStatus = roleConfirmedStatus;
       membership.workspaceTokenStatus = 'ready';
+      recoveredTeamJson.push(child);
     } else {
       child.joinStatus = `${roleConfirmedStatus}_token_pending`;
       membership.joinStatus = child.joinStatus;
@@ -2119,13 +2525,22 @@ async function refillTeam(motherId) {
       workspaceTokenRetryFailures.push({ id: child.id, email: child.email, ok: false, status: switched.status || 502, phase: 'workspace_token_retry', message: switched.message || 'workspace_token_exchange_failed' });
     }
   }
+  const rotationBudgetBefore = dailyRotationBudget(mother);
+  updateRotationProgress(mother, 'kick', { message: `正在检查封禁和额度耗尽账号（今日 ${rotationBudgetBefore.count}/${rotationBudgetBefore.limit}）` });
   const active = state.children.filter((child) => isChildMemberOfTeam(child, mother.team));
   const kickWindow = selectedKickWindow(mother);
-  const exhausted = active.filter((child) => membershipQuotaIsExhausted(child, mother.team, kickWindow)
-    || (child.team === mother.team && child.lastProbe?.ok === true && quotaIsExhausted(child, child.lastProbe, kickWindow)));
+  const removalCandidates = active.filter((child) => childIsBanned(child)
+    || membershipQuotaIsExhausted(child, mother.team, kickWindow)
+    || (child.team === mother.team && child.lastProbe?.ok === true && quotaIsExhausted(child, child.lastProbe, kickWindow)))
+    .sort((left, right) => Number(childIsBanned(right)) - Number(childIsBanned(left)));
+  const rotationLimitSkipped = [];
   const kicked = [];
   const kickFailures = [];
-  for (const child of exhausted) {
+  for (const child of removalCandidates) {
+    if (dailyRotationBudget(mother).remaining <= 0) {
+      rotationLimitSkipped.push({ id: child.id, email: child.email, banned: childIsBanned(child) });
+      continue;
+    }
     const currentMemberCount = workspaceMemberCount(mother, active.length + 1);
     if (currentMemberCount - kicked.length <= 1) {
       kickFailures.push({ id: child.id, email: child.email, ok: false, status: 409, message: 'minimum_workspace_member_required' });
@@ -2140,7 +2555,9 @@ async function refillTeam(motherId) {
       kickFailures.push({ id: child.id, email: child.email, ok: false, status: 502, message: 'member_snapshot_unavailable' });
       continue;
     }
-    if (memberIsProtected(member, mother)) {
+    // A fixed primary owner is protected during ordinary rotation, but a
+    // confirmed banned account must still be removed to allow replacement.
+    if (memberIsProtected(member, mother) && !childIsBanned(child)) {
       kickFailures.push({ id: child.id, email: child.email, ok: false, status: 403, message: 'protected_workspace_member' });
       continue;
     }
@@ -2149,32 +2566,36 @@ async function refillTeam(motherId) {
       if (!remote.ok) { kickFailures.push({ id: child.id, email: child.email, ...remote }); continue; }
     }
     const removedAt = now();
-    const retryAfter = quotaRetryAfter(child, kickWindow, mother.team);
-    const retryReason = quotaKickReason(child, kickWindow);
+    const banned = childIsBanned(child);
+    const retryAfter = banned ? null : quotaRetryAfter(child, kickWindow, mother.team);
+    const retryReason = banned ? 'account_banned' : quotaKickReason(child, kickWindow);
     const membership = membershipFor(child, mother.team, true);
     Object.assign(membership, {
       status: 'kicked',
       removedAt,
       reason: retryReason,
       retryAfter,
-      rejoinEligible: Boolean(retryAfter),
+      rejoinEligible: banned ? false : Boolean(retryAfter),
     });
-    child.status = 'kicked';
+    child.status = banned ? 'banned' : 'kicked';
     child.retryReason = retryReason;
-    child.rejoinEligible = Boolean(retryAfter);
+    child.rejoinEligible = banned ? false : Boolean(retryAfter);
     if (child.team === mother.team) {
       const replacement = (child.workspaceHistory || []).find((entry) => entry.status === 'active' && entry.team);
       child.team = replacement?.team || null;
     }
     removeTeamOwnerForChild(mother, child);
-    if (child.team) child.status = 'active';
+    if (child.team && !banned) child.status = 'active';
     kicked.push(child);
+    consumeDailyRotation(mother);
+    await persist();
   }
   const seatsEntitled = Number.isFinite(Number(mother.seats)) ? Number(mother.seats) : 0;
   const usedBeforeRefill = Number.isFinite(Number(mother.used)) ? Number(mother.used) : active.length;
   const open = Math.max(0, seatsEntitled - usedBeforeRefill + kicked.length);
   const candidatePool = state.children.filter((child) => (
-    !freeAuthRequiresManualInput(child)
+    !childIsBanned(child)
+    && !freeAuthRequiresManualInput(child)
     && !freeAuthRetryBackoffActive(child)
     && canRejoinTeam(child, mother.team)
     && Boolean(child.accessToken || child.refreshToken || (child.email && child.password))
@@ -2182,36 +2603,60 @@ async function refillTeam(motherId) {
   ));
   const joined = [];
   const joinFailures = [...ownerRoleRetryFailures, ...workspaceTokenRetryFailures];
-  const candidates = [];
-  for (const child of candidatePool) {
-    if (candidates.length >= open) break;
-    const freeAuth = await ensureChildFreeAuth(child);
-    if (!freeAuth.ok) {
-      joinFailures.push({ id: child.id, email: child.email, ok: false, status: freeAuth.status || 502, phase: 'free_auth', code: freeAuth.code || null, message: freeAuth.message || 'free_auth_required', needsInput: Boolean(freeAuth.needsInput), browserRequired: Boolean(freeAuth.browserRequired), authUrl: freeAuth.authUrl || null });
-      continue;
+  let candidateCursor = 0;
+  while (joined.length < open && candidateCursor < candidatePool.length) {
+    const batchSize = Math.min(open - joined.length, normalizeConcurrency(state.settings.concurrency), candidatePool.length - candidateCursor);
+    const batch = candidatePool.slice(candidateCursor, candidateCursor + batchSize);
+    candidateCursor += batchSize;
+    updateRotationProgress(mother, 'free_auth', { message: `正在并发准备 ${batch.length} 个 Free 账号` });
+    const prepared = await mapWithConcurrency(batch, async (child) => {
+      try {
+        return { child, freeAuth: await ensureChildFreeAuth(child) };
+      } catch (error) {
+        return { child, freeAuth: { ok: false, status: 502, code: 'free_auth_failed', message: error?.message || 'free_auth_failed' } };
+      }
+    });
+    for (const { child, freeAuth } of prepared) {
+      if (joined.length >= open) break;
+      if (!freeAuth.ok) {
+        const banMessage = explicitAccountBanMessage(freeAuth);
+        if (banMessage) markChildBanned(child, mother, { source: 'free_oauth_before_team_join', status: freeAuth.status, code: freeAuth.code, message: banMessage });
+        joinFailures.push({ id: child.id, email: child.email, ok: false, status: freeAuth.status || 502, phase: 'free_auth', code: freeAuth.code || null, message: freeAuth.message || 'free_auth_required', needsInput: Boolean(freeAuth.needsInput), browserRequired: Boolean(freeAuth.browserRequired), authUrl: freeAuth.authUrl || null });
+        continue;
+      }
+      if (!teamManagerContext(mother) || !mother.accountId) { joinFailures.push({ id: child.id, email: child.email, ok: false, status: 400, message: 'workspace_credentials_required' }); continue; }
+      const membership = membershipFor(child, mother.team, true);
+      const remote = await joinWorkspace(child, {
+        motherId,
+        workspaceId: mother.accountId,
+        approve: true,
+        pushTeamJson: false,
+        onProgress: (stage, message) => updateRotationProgress(mother, stage, { message, account: child.email }),
+      });
+      if (!remote.ok) {
+        const banMessage = ['free_auth', 'request', 'team_token'].includes(remote.phase)
+          ? explicitAccountBanMessage(remote, remote.teamAuth)
+          : '';
+        if (banMessage) markChildBanned(child, mother, { source: 'team_join_oauth', status: remote.status, code: remote.code, message: banMessage });
+        if (remote.phase !== 'team_token') child.workspaceHistory = (child.workspaceHistory || []).filter((entry) => entry !== membership);
+        joinFailures.push({ id: child.id, email: child.email, ...remote });
+        continue;
+      }
+      const teamAuth = remote.teamAuth || { ok: false, status: 502, message: 'team_token_not_generated' };
+      child.pendingWorkspaceId = mother.accountId;
+      if (!teamAuth.ok) {
+        const banMessage = explicitAccountBanMessage(teamAuth);
+        if (banMessage) markChildBanned(child, mother, { source: 'team_json_oauth', status: teamAuth.status, code: teamAuth.code, message: banMessage });
+        child.joinStatus = `${promoteJoinedAccounts ? 'owner' : 'member'}_confirmed_token_pending`;
+        membership.joinStatus = child.joinStatus;
+        membership.workspaceTokenStatus = 'pending';
+        joinFailures.push({ id: child.id, email: child.email, ok: false, status: teamAuth.status || 502, phase: 'team_token', code: teamAuth.code || null, message: teamAuth.message || 'team_token_failed', needsInput: Boolean(teamAuth.needsInput), browserRequired: Boolean(teamAuth.browserRequired), authUrl: teamAuth.authUrl || null });
+        continue;
+      }
+      joined.push(child);
     }
-    candidates.push(child);
   }
-  for (const child of candidates) {
-    if (!teamManagerContext(mother) || !mother.accountId) { joinFailures.push({ id: child.id, email: child.email, ok: false, status: 400, message: 'workspace_credentials_required' }); continue; }
-    const membership = membershipFor(child, mother.team, true);
-    const remote = await joinWorkspace(child, { motherId, workspaceId: mother.accountId, approve: true, pushTeamJson: false });
-    if (!remote.ok) {
-      if (remote.phase !== 'team_token') child.workspaceHistory = (child.workspaceHistory || []).filter((entry) => entry !== membership);
-      joinFailures.push({ id: child.id, email: child.email, ...remote });
-      continue;
-    }
-    const teamAuth = remote.teamAuth || { ok: false, status: 502, message: 'team_token_not_generated' };
-    child.pendingWorkspaceId = mother.accountId;
-    if (!teamAuth.ok) {
-      child.joinStatus = `${promoteJoinedAccounts ? 'owner' : 'member'}_confirmed_token_pending`;
-      membership.joinStatus = child.joinStatus;
-      membership.workspaceTokenStatus = 'pending';
-      joinFailures.push({ id: child.id, email: child.email, ok: false, status: teamAuth.status || 502, phase: 'team_token', code: teamAuth.code || null, message: teamAuth.message || 'team_token_failed', needsInput: Boolean(teamAuth.needsInput), browserRequired: Boolean(teamAuth.browserRequired), authUrl: teamAuth.authUrl || null });
-      continue;
-    }
-    joined.push(child);
-  }
+  updateRotationProgress(mother, 'verify', { message: '正在复核成员和席位' });
   const synced = await syncMotherWorkspace(mother, { force: true }).catch(() => ({ ok: false, members: [] }));
   const joinedEmails = new Set((synced.members || []).filter(memberIsActive).map((member) => String(member.email).toLowerCase()));
   const confirmedJoined = [];
@@ -2242,15 +2687,21 @@ async function refillTeam(motherId) {
     }
   }
   if (!synced.seatSnapshot && Number.isFinite(Number(mother.used))) mother.used = Math.max(0, usedBeforeRefill - kicked.length + confirmedJoined.length);
-  const joinedSub2apiPush = confirmedJoined.length > 0
-    ? await pushRenewedTeamJson(mother)
+  const pushAccounts = [...confirmedJoined, ...recoveredTeamJson]
+    .filter((child, index, list) => child?.email && list.findIndex((item) => String(item?.email || '').toLowerCase() === String(child.email).toLowerCase()) === index);
+  updateRotationProgress(mother, 'push', { message: pushAccounts.length ? `正在推送 ${pushAccounts.length} 个新 Team JSON` : '没有新的 Team JSON 需要推送' });
+  const joinedSub2apiPush = pushAccounts.length > 0
+    ? await pushRenewedTeamJson(mother, { emails: pushAccounts.map((child) => child.email), mode: 'create_only' })
     : { attempted: false, ok: null, status: null, message: null, pushed: 0, failed: 0 };
   mother.lastCheck = now();
   const pushDetail = joinedSub2apiPush.attempted ? `，Team JSON 推送 ${joinedSub2apiPush.pushed} 个` : '';
-  addHistory('自动补位', `${mother.team} 移出 ${kicked.length} 个，加入 ${confirmedJoined.length}${pushDetail}${kickFailures.length || joinFailures.length ? `，失败 ${kickFailures.length + joinFailures.length} 个` : ''}`, kickFailures.length || joinFailures.length || joinedSub2apiPush.ok === false ? 'partial' : 'success');
-  await persist();
+  const rotationBudgetAfter = dailyRotationBudget(mother);
+  addHistory('自动补位', `${mother.team} 移出 ${kicked.length} 个，加入 ${confirmedJoined.length}${rotationLimitSkipped.length ? `，${rotationLimitSkipped.length} 个受每日轮转上限限制` : ''}${pushDetail}${kickFailures.length || joinFailures.length ? `，失败 ${kickFailures.length + joinFailures.length} 个` : ''}`, kickFailures.length || joinFailures.length || joinedSub2apiPush.ok === false ? 'partial' : 'success');
   const pushFailed = joinedSub2apiPush.attempted && joinedSub2apiPush.ok === false;
-  return { ok: kickFailures.length === 0 && joinFailures.length === 0 && !pushFailed, status: kickFailures.length || joinFailures.length || pushFailed ? 207 : 200, kicked: kicked.map(publicChild), joined: confirmedJoined.map(publicChild), kickFailures, joinFailures, sub2apiPush: joinedSub2apiPush, seatsInUse: mother.used, seatsOpen: Number.isFinite(Number(mother.seats)) && Number.isFinite(Number(mother.used)) ? Math.max(0, mother.seats - mother.used) : null, seatSnapshot: mother.seatSnapshot || workspace.seatSnapshot || null };
+  const ok = kickFailures.length === 0 && joinFailures.length === 0 && !pushFailed;
+  finishRotationProgress(mother, ok ? 'completed' : 'partial', rotationLimitSkipped.length ? `已达到今日轮转上限 ${rotationBudgetAfter.count}/${rotationBudgetAfter.limit}` : ok ? '轮换链路执行完成' : '轮换完成，但存在未成功步骤', { kicked: kicked.length, joined: confirmedJoined.length, pushed: joinedSub2apiPush.pushed || 0, skipped: (joinedSub2apiPush.skipped || 0) + rotationLimitSkipped.length, failed: kickFailures.length + joinFailures.length + (joinedSub2apiPush.failed || 0) });
+  await persist();
+  return { ok, status: ok ? 200 : 207, kicked: kicked.map(publicChild), joined: confirmedJoined.map(publicChild), kickFailures, joinFailures, rotationLimitSkipped, dailyRotationUsage: rotationBudgetAfter, sub2apiPush: joinedSub2apiPush, rotationProgress: mother.rotationProgress, seatsInUse: mother.used, seatsOpen: Number.isFinite(Number(mother.seats)) && Number.isFinite(Number(mother.used)) ? Math.max(0, mother.seats - mother.used) : null, seatSnapshot: mother.seatSnapshot || workspace.seatSnapshot || null };
 }
 
 async function refillAllTeams() {
@@ -2318,7 +2769,8 @@ function freeAuthBatchResult(child, acquired, extra = {}) {
 
 async function prepareFreeJsonPool() {
   const candidates = state.children.filter((child) => (
-    freeTokenNeedsRefresh(child)
+    !childIsBanned(child)
+    && freeTokenNeedsRefresh(child)
     && Boolean(child.refreshToken || (child.email && child.password))
     && !freeAuthRequiresManualInput(child)
     && !freeAuthRetryBackoffActive(child)
@@ -2339,7 +2791,7 @@ async function prepareFreeJsonPool() {
 }
 
 async function acquireMissingFreeJson() {
-  const missing = state.children.filter((child) => !child.accessToken);
+  const missing = state.children.filter((child) => !childIsBanned(child) && !child.accessToken);
   const candidates = [];
   const skipped = [];
   for (const child of missing) {
@@ -2423,10 +2875,13 @@ function configureMaintenanceTimer() {
 
 async function joinWorkspace(child, body) {
   const mother = findMother(body.motherId);
+  const onProgress = typeof body.onProgress === 'function' ? body.onProgress : () => {};
   if (!child || !mother) return { ok: false, status: 404, message: 'account_not_found' };
+  if (childIsBanned(child)) return { ok: false, status: 409, code: 'account_banned', message: child.banReason || '账号已封禁，不能再加入 Team' };
   if (!body.workspaceId) return { ok: false, status: 400, message: 'workspace_id_required' };
   if (body.approve !== false && !teamManagerContext(mother)) await recoverTeamManagerToken(mother, { force: true });
   if (body.approve !== false && !teamManagerContext(mother)) return { ok: false, status: 400, message: 'workspace_owner_token_required' };
+  if (freeTokenNeedsRefresh(child)) onProgress('free_auth', '正在准备 Free OAuth 凭据');
   const freeAuth = await ensureChildFreeAuth(child, { verificationCode: body.verificationCode, callbackUrl: body.callbackUrl });
   if (!freeAuth.ok) {
     return {
@@ -2442,6 +2897,7 @@ async function joinWorkspace(child, body) {
     };
   }
   const workspaceId = encodeURIComponent(body.workspaceId);
+  onProgress('request', '正在申请加入 Team');
   const requestResult = await fetchChatGptJson(child.accessToken, `/backend-api/accounts/${workspaceId}/invites/request`, {
     method: 'POST', accountId: body.workspaceId,
     targetPath: `/backend-api/accounts/${body.workspaceId}/invites/request`, targetRoute: '/backend-api/accounts/{account_id}/invites/request',
@@ -2456,6 +2912,7 @@ async function joinWorkspace(child, body) {
   if (body.approve !== false) {
     const promoteJoinedAccounts = state.settings?.promoteJoinedAccounts !== false;
     const approvedRole = promoteJoinedAccounts ? 'account-owner' : 'standard-user';
+    onProgress('approve', '正在由 Team 所有者同意申请');
     const approved = await approveWorkspaceRequest(mother, body.workspaceId, child.email, child.pendingInviteId, body.deviceId, approvedRole);
     if (!approved.ok) { await persist(); return { ok: false, status: approved.status || 502, phase: 'admin_approve', request: payload, ...approved }; }
     child.status = 'active';
@@ -2468,8 +2925,10 @@ async function joinWorkspace(child, body) {
     child.joinStatus = membership.joinStatus;
     child.ownerRoleStatus = membership.ownerRoleStatus;
     child.ownerRoleError = null;
+    onProgress('member', '账号已进入 Team，正在确认身份');
     addHistory('同意进入空间', `${mother.email} 已同意 ${child.email} 进入 ${mother.team}`);
     if (promoteJoinedAccounts) {
+      onProgress('owner', '正在设置为 Team 所有者');
       const promoted = await promoteJoinedMemberToOwner(mother, child, body.workspaceId);
       if (!promoted.ok) {
         child.joinStatus = 'owner_role_failed';
@@ -2490,7 +2949,8 @@ async function joinWorkspace(child, body) {
       child.ownerRoleError = null;
       addHistory('设置 Team 所有者', `${child.email} 已设置为 ${mother.team} 所有者`);
     }
-    const teamAuth = await switchWorkspaceWithFreeRecovery(child, mother.accountId, { verificationCode: body.verificationCode, callbackUrl: body.callbackUrl });
+    onProgress('team_json', '正在获取该空间的 Team JSON');
+    const teamAuth = await acquireTeamJson(mother, child, { verificationCode: body.verificationCode, callbackUrl: body.callbackUrl });
     if (!teamAuth.ok) {
       child.joinStatus = `${promoteJoinedAccounts ? 'owner' : 'member'}_confirmed_token_pending`;
       membership.joinStatus = child.joinStatus;
@@ -2499,9 +2959,10 @@ async function joinWorkspace(child, body) {
       return { ok: false, status: teamAuth.status || 502, phase: 'team_token', inviteId: child.pendingInviteId || null, message: teamAuth.message || 'team_token_failed', code: teamAuth.code, needsInput: Boolean(teamAuth.needsInput), browserRequired: Boolean(teamAuth.browserRequired), authUrl: teamAuth.authUrl || null, child: publicChild(child, mother.team) };
     }
     membership.workspaceTokenStatus = 'ready';
+    onProgress('team_json', 'Team JSON 已获取');
     const sub2apiPush = body.pushTeamJson === false
       ? { attempted: false, ok: null, status: null, message: 'deferred_to_batch', pushed: 0, failed: 0 }
-      : await pushRenewedTeamJson(mother);
+      : await pushRenewedTeamJson(mother, { emails: [child.email], mode: 'create_only' });
     await persist();
     const phase = promoteJoinedAccounts ? 'owner_confirmed' : 'member_confirmed';
     return { ok: true, phase, inviteId: child.pendingInviteId || null, payload, freeAuth: { source: freeAuth.source || null }, teamAuth, sub2apiPush };
@@ -2534,6 +2995,7 @@ async function approveWorkspaceRequest(mother, workspaceId, email, inviteId, dev
 
 async function switchWorkspace(child, body) {
   if (!child || !body.workspaceId) return { ok: false, status: 400, message: 'child_and_workspace_required' };
+  if (childIsBanned(child)) return { ok: false, status: 409, code: 'account_banned', message: child.banReason || '账号已封禁，不能切换 Team 空间', banned: true };
   if (!child.accessToken) return { ok: false, status: 400, message: 'access_token_required' };
   const workspaceId = String(body.workspaceId).trim();
   const query = new URLSearchParams({
@@ -2642,8 +3104,184 @@ async function sub2ApiRequest(config, requestPath, { method = 'GET', body } = {}
   return { ok: response.ok, status: response.status, payload, data: payload?.data ?? payload, message: response.ok ? 'ok' : (payload?.message || payload?.error || `http_${response.status}`) };
 }
 
-async function querySub2ApiGroups() {
-  const config = state.settings?.integrations?.sub2api || {};
+function sub2ApiOAuthError(code, message, status = 502) {
+  const error = new Error(String(message || code || 'sub2api_oauth_failed'));
+  error.code = code;
+  error.status = status;
+  return error;
+}
+
+function sub2ApiOAuthMessage(result, fallback) {
+  const value = result?.message || result?.payload?.message || result?.payload?.error || fallback;
+  if (typeof value === 'string') return value;
+  try { return JSON.stringify(value); } catch { return String(fallback || 'sub2api_oauth_failed'); }
+}
+
+function sub2ApiOAuthReady(config) {
+  const groupId = Number(config?.groupId);
+  return config?.enabled === true
+    && Boolean(sub2ApiRoot(config?.baseUrl))
+    && Boolean(String(config?.apiKey || '').trim())
+    && ((Number.isFinite(groupId) && groupId > 0) || Boolean(String(config?.groupName || '').trim()));
+}
+
+function oauthSessionForAdapter(session, adapter) {
+  const authorization = session?.authorization;
+  if (!adapter) return authorization?.source === 'sub2api' ? null : session;
+  if (!authorization || authorization.source !== 'sub2api') return null;
+  return authorization.providerId === adapter.providerId ? session : null;
+}
+
+function sub2ApiOAuthAdapter(config, child, { scope = 'free', workspaceId = '' } = {}) {
+  if (!sub2ApiOAuthReady(config)) return null;
+  const providerId = String(config.id || DEFAULT_SUB2API_ID);
+  let resolvedGroup = null;
+  const ensureGroup = async () => {
+    if (resolvedGroup) return resolvedGroup;
+    const group = await resolveSub2ApiGroup(config);
+    if (!group.ok) throw sub2ApiOAuthError('sub2api_oauth_group_unavailable', group.message || 'Sub2API OAuth 目标分组不可用', group.status || 502);
+    resolvedGroup = group;
+    return group;
+  };
+  return {
+    providerId,
+    authorizationProvider: async () => {
+      await ensureGroup();
+      const result = await sub2ApiRequest(config, '/admin/openai/generate-auth-url', { method: 'POST', body: {} });
+      if (!result.ok) {
+        throw sub2ApiOAuthError('sub2api_oauth_url_failed', sub2ApiOAuthMessage(result, 'Sub2API OAuth 授权链接获取失败'), result.status || 502);
+      }
+      const data = result.data && typeof result.data === 'object' ? result.data : {};
+      const authUrl = String(data.auth_url || data.authUrl || data.url || '').trim();
+      const sessionId = String(data.session_id || data.sessionId || '').trim();
+      let parsed = null;
+      try { parsed = new URL(authUrl); } catch { parsed = null; }
+      const stateValue = String(data.state || parsed?.searchParams.get('state') || '').trim();
+      const redirectUri = String(data.redirect_uri || data.redirectUri || parsed?.searchParams.get('redirect_uri') || 'http://localhost:1455/auth/callback').trim();
+      if (!parsed || !sessionId || !stateValue) {
+        throw sub2ApiOAuthError('sub2api_oauth_url_invalid', 'Sub2API OAuth 响应缺少 auth_url、state 或 session_id', 502);
+      }
+      return { source: 'sub2api', providerId, authUrl, sessionId, state: stateValue, redirectUri };
+    },
+    callbackHandler: async ({ code, state: oauthState, authorization }) => {
+      const group = await ensureGroup();
+      if (!authorization?.sessionId || authorization.providerId !== providerId) {
+        throw sub2ApiOAuthError('sub2api_oauth_session_invalid', 'Sub2API OAuth 会话缺失或连接已切换', 409);
+      }
+      const exchanged = await sub2ApiRequest(config, '/admin/openai/exchange-code', {
+        method: 'POST',
+        body: {
+          session_id: authorization.sessionId,
+          code,
+          state: oauthState,
+          redirect_uri: authorization.redirectUri || undefined,
+        },
+      });
+      if (!exchanged.ok) {
+        throw sub2ApiOAuthError('sub2api_oauth_exchange_failed', sub2ApiOAuthMessage(exchanged, 'Sub2API OAuth 换取凭据失败'), exchanged.status || 502);
+      }
+      const tokenInfo = exchanged.data && typeof exchanged.data === 'object' ? exchanged.data : {};
+      const fields = credentialFields(tokenInfo);
+      if (!fields.accessToken || !fields.refreshToken) {
+        throw sub2ApiOAuthError('sub2api_oauth_token_incomplete', 'Sub2API OAuth 返回缺少 access_token 或 refresh_token', 502);
+      }
+      const accessClaims = accessTokenClaims(fields.accessToken);
+      const claims = {
+        ...accessClaims,
+        email: accessClaims.email || fields.email || child?.email || '',
+        accountId: accessClaims.accountId || fields.accountId || '',
+        userId: accessClaims.userId || fields.chatgptUserId || '',
+        planType: accessClaims.planType || fields.planType || (scope === 'team' ? 'team' : 'free'),
+      };
+      if (scope === 'team' && workspaceId && claims.accountId !== workspaceId) {
+        throw sub2ApiOAuthError('team_workspace_mismatch', 'OAuth 登录后未选择目标 Team 空间', 409);
+      }
+      const sub2api = await syncSub2ApiOAuthAccount(config, group, child, fields, claims, { scope, workspaceId });
+      return {
+        accessToken: fields.accessToken,
+        refreshToken: fields.refreshToken,
+        idToken: fields.idToken,
+        clientId: fields.clientId,
+        organizationId: fields.organizationId,
+        subscriptionExpiresAt: fields.subscriptionExpiresAt,
+        expiresAt: fields.expiresAt,
+        claims,
+        sub2api,
+      };
+    },
+  };
+}
+
+async function syncSub2ApiOAuthAccount(config, group, child, fields, claims, { scope = 'free', workspaceId = '' } = {}) {
+  const email = String(fields.email || claims.email || child?.email || '').trim();
+  const accountId = String(claims.accountId || fields.accountId || workspaceId || '').trim();
+  const metadata = {
+    integrationId: config.id || null,
+    integrationName: config.name || '',
+    groupId: group.id,
+    groupName: group.name || config.groupName || '',
+    accountId: null,
+    action: '',
+    synced: false,
+    message: '',
+  };
+  if (!email || !accountId) return { ...metadata, message: 'sub2api_identity_requires_email_and_chatgpt_account_id' };
+  const record = {
+    ...(child || {}),
+    email,
+    accessToken: fields.accessToken,
+    refreshToken: fields.refreshToken,
+    idToken: fields.idToken,
+    clientId: fields.clientId,
+    organizationId: fields.organizationId,
+    subscriptionExpiresAt: fields.subscriptionExpiresAt,
+    expiresAt: fields.expiresAt || claims.expiresAt,
+    accountId,
+    plan: fields.planType || claims.planType || (scope === 'team' ? 'team' : 'free'),
+    planType: fields.planType || claims.planType || (scope === 'team' ? 'team' : 'free'),
+    tokenScope: scope,
+    team: scope === 'team' ? workspaceId || accountId : child?.team,
+  };
+  const payload = { ...sub2ApiAccountFromChild(record), group_ids: [group.id] };
+  try {
+    const lookup = await sub2ApiRequest(config, `/admin/accounts?page=1&page_size=100&search=${encodeURIComponent(email)}`);
+    if (!lookup.ok) return { ...metadata, message: sub2ApiOAuthMessage(lookup, 'sub2api_lookup_failed') };
+    const lookupItems = (lookupData) => Array.isArray(lookupData)
+      ? lookupData
+      : Array.isArray(lookupData?.items) ? lookupData.items
+        : Array.isArray(lookupData?.accounts) ? lookupData.accounts : [];
+    const matchesIdentity = (item) => {
+      const itemEmail = String(item?.email || item?.credentials?.email || '').trim().toLowerCase();
+      const itemAccountId = String(item?.credentials?.chatgpt_account_id || item?.credentials?.account_id || item?.account_id || '').trim().toLowerCase();
+      return itemEmail === email.toLowerCase() && itemAccountId === accountId.toLowerCase();
+    };
+    const items = lookupItems(lookup.data);
+    let existing = items.find(matchesIdentity);
+    // Sub2API's `search` filter currently matches account.name only. If an
+    // existing OAuth account uses a different display name, walk the OpenAI
+    // account pages and perform the required email + workspace identity match.
+    if (!existing) {
+      for (let page = 1; page <= 20 && !existing; page += 1) {
+        const pageResult = await sub2ApiRequest(config, `/admin/accounts?page=${page}&page_size=100&platform=openai&type=oauth`);
+        if (!pageResult.ok) break;
+        const pageItems = lookupItems(pageResult.data);
+        if (!pageItems.length) break;
+        existing = pageItems.find(matchesIdentity);
+        if (pageItems.length < 100) break;
+      }
+    }
+    const synced = existing?.id
+      ? await sub2ApiRequest(config, `/admin/accounts/${encodeURIComponent(existing.id)}`, { method: 'PUT', body: payload })
+      : await sub2ApiRequest(config, '/admin/accounts', { method: 'POST', body: payload });
+    if (!synced.ok) return { ...metadata, accountId: existing?.id || null, action: existing?.id ? 'update_failed' : 'create_failed', message: sub2ApiOAuthMessage(synced, 'sub2api_sync_failed') };
+    const saved = synced.data && typeof synced.data === 'object' ? synced.data : {};
+    return { ...metadata, accountId: saved.id || existing?.id || null, action: existing?.id ? 'updated' : 'created', synced: true, message: 'ok' };
+  } catch (error) {
+    return { ...metadata, message: error?.name === 'TimeoutError' ? 'timeout' : error?.message || 'network_error' };
+  }
+}
+
+async function querySub2ApiGroups(config = sub2ApiConfigs()[0] || {}) {
   const root = sub2ApiRoot(config.baseUrl);
   if (!root || !config.apiKey) return { ok: false, status: 400, message: 'sub2api_connection_required', groups: [] };
   try {
@@ -2663,7 +3301,7 @@ async function resolveSub2ApiGroup(config) {
   const groupName = String(config?.groupName || '').trim();
   if (Number.isFinite(groupId) && groupId > 0) return { ok: true, id: groupId, name: groupName };
   if (!groupName) return { ok: false, status: 400, message: 'sub2api_group_required' };
-  const result = await querySub2ApiGroups();
+  const result = await querySub2ApiGroups(config);
   if (!result.ok) return { ok: false, status: result.status || 502, message: 'sub2api_group_lookup_failed' };
   const target = groupName.toLocaleLowerCase();
   const matches = result.groups.filter((group) => group.name.toLocaleLowerCase() === target);
@@ -2728,8 +3366,8 @@ function sub2ApiAccountFromChild(child) {
     credentials: sub2ApiCredentials(child),
     extra: sub2ApiExtra(child),
     team: child.team || undefined,
-    concurrency: child.concurrency,
-    priority: child.priority,
+    concurrency: 10,
+    priority: 1,
     rate_multiplier: child.rateMultiplier,
     auto_pause_on_expired: child.autoPauseOnExpired,
   };
@@ -2747,6 +3385,9 @@ function teamOwnerRecords(mother) {
     return [{
       ...child,
       accessToken: workspaceToken.accessToken,
+      refreshToken: workspaceToken.refreshToken || '',
+      idToken: workspaceToken.idToken || '',
+      clientId: workspaceToken.clientId || child.clientId || '',
       accountId: workspaceId,
       team: mother.team || workspaceId,
       plan: 'team',
@@ -2791,6 +3432,9 @@ function teamJsonRecords(mother) {
     const record = {
       ...child,
       accessToken: workspaceToken.accessToken,
+      refreshToken: workspaceToken.refreshToken || '',
+      idToken: workspaceToken.idToken || '',
+      clientId: workspaceToken.clientId || child.clientId || '',
       accountId: workspaceId,
       team: mother.team || workspaceId,
       plan: 'team',
@@ -2821,8 +3465,7 @@ function sub2ApiAccountFromMotherOwner(mother, owner) {
   return sub2ApiAccountFromChild(record);
 }
 
-async function pushSub2ApiEntries(entries = [], historyLabel = '推送 Sub2API') {
-  const config = state.settings?.integrations?.sub2api || {};
+async function pushSub2ApiEntries(entries = [], historyLabel = '推送 Sub2API', { config = sub2ApiConfigs()[0] || {}, mode = 'create_only' } = {}) {
   const root = sub2ApiRoot(config.baseUrl);
   if (!root || !config.apiKey) return { ok: false, status: 400, message: 'sub2api_connection_required', pushed: [], failed: [] };
   const group = await resolveSub2ApiGroup(config);
@@ -2830,37 +3473,43 @@ async function pushSub2ApiEntries(entries = [], historyLabel = '推送 Sub2API')
   const groupId = group.id;
   const outcomes = await mapWithConcurrency(entries, async (entry) => {
     const payload = { ...entry.payload, group_ids: [groupId] };
-    const email = entry.email || payload.email || payload.credentials?.email || '';
+    const email = String(entry.email || payload.email || payload.credentials?.email || '').trim();
+    const targetAccountId = String(payload.credentials?.chatgpt_account_id || '').trim();
+    if (!email || !targetAccountId) {
+      return { ok: false, value: { id: entry.id, motherId: entry.motherId, email, status: 400, phase: 'identity', message: 'sub2api_identity_requires_email_and_chatgpt_account_id' } };
+    }
     try {
       const lookup = await sub2ApiRequest(config, `/admin/accounts?page=1&page_size=100&search=${encodeURIComponent(email)}`);
+      if (!lookup.ok) return { ok: false, value: { id: entry.id, motherId: entry.motherId, email, status: lookup.status, phase: 'lookup', message: lookup.message || 'sub2api_lookup_failed' } };
       const lookupData = lookup.data;
       const items = Array.isArray(lookupData) ? lookupData : Array.isArray(lookupData?.items) ? lookupData.items : [];
       const emailMatches = items.filter((item) => String(item?.email || item?.credentials?.email || '').toLowerCase() === String(email).toLowerCase());
-      const targetCredentials = payload.credentials || {};
-      const targetAccountId = String(targetCredentials.chatgpt_account_id || '').trim();
-      const targetPlan = String(targetCredentials.plan_type || '').trim().toLowerCase();
       const existing = emailMatches.find((item) => {
         const credentials = item?.credentials || {};
         const accountId = String(credentials.chatgpt_account_id || credentials.account_id || item?.account_id || '').trim();
-        const plan = String(credentials.plan_type || item?.plan_type || '').trim().toLowerCase();
-        if (targetAccountId) return Boolean(accountId) && targetAccountId === accountId;
-        if (targetPlan && plan) return targetPlan === plan;
-        return emailMatches.length === 1;
+        return Boolean(accountId) && targetAccountId.toLowerCase() === accountId.toLowerCase();
       });
-      const result = existing?.id
+      if (mode === 'create_only' && existing?.id) {
+        return { ok: true, skipped: true, value: { id: entry.id, motherId: entry.motherId, email, targetGroupId: groupId, targetGroupName: group.name || config.groupName || '', integrationId: config.id || null, integrationName: config.name || '', action: 'skipped_existing', sub2apiAccountId: existing.id } };
+      }
+      if (mode === 'repair_only' && !existing?.id) {
+        return { ok: false, value: { id: entry.id, motherId: entry.motherId, email, status: 404, phase: 'repair_lookup', message: 'sub2api_account_not_found_for_repair' } };
+      }
+      const result = mode === 'repair_only'
         ? await sub2ApiRequest(config, `/admin/accounts/${encodeURIComponent(existing.id)}`, { method: 'PUT', body: { ...payload, group_ids: [groupId] } })
         : await sub2ApiRequest(config, '/admin/accounts', { method: 'POST', body: payload });
       if (!result.ok) return { ok: false, value: { id: entry.id, motherId: entry.motherId, email, status: result.status, message: result.message } };
-      return { ok: true, value: { id: entry.id, motherId: entry.motherId, email, targetGroupId: groupId, targetGroupName: group.name || config.groupName || '', action: existing?.id ? 'updated' : 'created' } };
+      return { ok: true, skipped: false, value: { id: entry.id, motherId: entry.motherId, email, targetGroupId: groupId, targetGroupName: group.name || config.groupName || '', integrationId: config.id || null, integrationName: config.name || '', action: mode === 'repair_only' ? 'repaired' : 'created' } };
     } catch (error) {
       return { ok: false, value: { id: entry.id, motherId: entry.motherId, email, status: 0, message: error?.name === 'TimeoutError' ? 'timeout' : 'network_error' } };
     }
   });
-  const pushed = outcomes.filter((outcome) => outcome.ok).map((outcome) => outcome.value);
+  const pushed = outcomes.filter((outcome) => outcome.ok && !outcome.skipped).map((outcome) => outcome.value);
+  const skipped = outcomes.filter((outcome) => outcome.ok && outcome.skipped).map((outcome) => outcome.value);
   const failed = outcomes.filter((outcome) => !outcome.ok).map((outcome) => outcome.value);
-  addHistory(historyLabel, `${group.name || `分组 ${groupId}`} 推送 ${pushed.length} 个账号${failed.length ? `，失败 ${failed.length} 个` : ''}`, failed.length ? 'partial' : 'success');
+  addHistory(historyLabel, `${config.name || 'Sub2API'} / ${group.name || `分组 ${groupId}`} ${mode === 'repair_only' ? '修复' : '新增'} ${pushed.length} 个账号${skipped.length ? `，已存在跳过 ${skipped.length} 个` : ''}${failed.length ? `，失败 ${failed.length} 个` : ''}`, failed.length ? 'partial' : 'success');
   await persist();
-  return { ok: failed.length === 0, status: failed.length ? 207 : 200, targetGroupId: groupId, targetGroupName: group.name || config.groupName || '', pushed, failed };
+  return { ok: failed.length === 0, status: failed.length ? 207 : 200, mode, integrationId: config.id || null, integrationName: config.name || '', targetGroupId: groupId, targetGroupName: group.name || config.groupName || '', pushed, skipped, failed };
 }
 
 async function pushSub2ApiAccounts(ids = []) {
@@ -2868,14 +3517,15 @@ async function pushSub2ApiAccounts(ids = []) {
   const entries = state.children
     .filter((child) => child.accessToken && (!idSet.size || idSet.has(String(child.id))))
     .map((child) => ({ id: child.id, email: child.email, payload: sub2ApiAccountFromChild(child) }));
-  return pushSub2ApiEntries(entries, '推送 Free 到 Sub2API');
+  return pushSub2ApiEntries(entries, '推送 Free 到 Sub2API', { config: sub2ApiConfigs()[0] || {}, mode: 'create_only' });
 }
 
-function teamSub2ApiEntries(motherIds = []) {
+function teamSub2ApiEntries(motherIds = [], emails = []) {
   const idSet = new Set(Array.isArray(motherIds) ? motherIds.map(String) : []);
+  const emailSet = new Set(Array.isArray(emails) ? emails.map((email) => String(email || '').trim().toLowerCase()).filter(Boolean) : []);
   return state.mothers
     .filter((mother) => !idSet.size || idSet.has(String(mother.id)) || idSet.has(String(mother.accountId || mother.team)))
-    .flatMap((mother) => teamJsonRecords(mother).map((owner) => ({
+    .flatMap((mother) => teamJsonRecords(mother).filter((owner) => !emailSet.size || emailSet.has(String(owner.email || '').trim().toLowerCase())).map((owner) => ({
       id: `${mother.id}:${owner.email}`,
       motherId: mother.id,
       email: owner.email,
@@ -2884,7 +3534,27 @@ function teamSub2ApiEntries(motherIds = []) {
 }
 
 async function pushSub2ApiTeams(motherIds = []) {
-  return pushSub2ApiEntries(teamSub2ApiEntries(motherIds), '推送 Team 到 Sub2API');
+  const idSet = new Set(Array.isArray(motherIds) ? motherIds.map(String) : []);
+  const mothers = state.mothers.filter((mother) => !idSet.size || idSet.has(String(mother.id)) || idSet.has(String(mother.accountId || mother.team)));
+  const results = await mapWithConcurrency(mothers, (mother) => pushSub2ApiEntries(teamSub2ApiEntries([mother.id]), '推送 Team 到 Sub2API', {
+    config: sub2ApiConfigForMother(mother) || {},
+    mode: 'create_only',
+  }));
+  const pushed = results.flatMap((result) => result.pushed || []);
+  const skipped = results.flatMap((result) => result.skipped || []);
+  const failed = results.flatMap((result, index) => {
+    if (result.failed?.length) return result.failed;
+    if (result.ok === false) return [{ motherId: mothers[index]?.id || null, status: result.status || 400, message: result.message || 'sub2api_push_failed' }];
+    return [];
+  });
+  return {
+    ok: results.every((result) => result.ok === true),
+    status: failed.length ? 207 : 200,
+    pushed,
+    skipped,
+    failed,
+    targets: results.map((result) => ({ integrationId: result.integrationId || null, integrationName: result.integrationName || '', targetGroupId: result.targetGroupId || null, targetGroupName: result.targetGroupName || '', ok: result.ok })),
+  };
 }
 
 // Streamable HTTP MCP transport. The tools deliberately use the same public
@@ -3158,10 +3828,12 @@ async function handleApi(req, res, url) {
   }
   if (method === 'PATCH' && url.pathname === '/api/integrations') {
     const current = state.settings.integrations || (state.settings.integrations = structuredClone(emptyState.settings.integrations));
-    if (body.sub2api && typeof body.sub2api === 'object') {
+    if (Array.isArray(body.sub2apis)) {
+      replaceSub2ApiConfigs(body.sub2apis);
+    } else if (body.sub2api && typeof body.sub2api === 'object') {
       const input = body.sub2api;
-      current.sub2api = { ...current.sub2api, ...(input.baseUrl !== undefined ? { baseUrl: String(input.baseUrl || '').trim() } : {}), ...(input.groupId !== undefined ? { groupId: input.groupId == null || input.groupId === '' ? null : Number(input.groupId) } : {}), ...(input.groupName !== undefined ? { groupName: String(input.groupName || '').trim() } : {}), ...(input.enabled !== undefined ? { enabled: Boolean(input.enabled) } : {}) };
-      if (input.apiKey !== undefined) current.sub2api.apiKey = String(input.apiKey || '').trim();
+      const first = sub2ApiConfigs()[0] || normalizeSub2ApiConfig({}, 0);
+      replaceSub2ApiConfigs([{ ...first, ...input, apiKey: input.apiKey === undefined ? first.apiKey : String(input.apiKey || '').trim() }, ...sub2ApiConfigs().slice(1)]);
     }
     if (body.mailbox && typeof body.mailbox === 'object') {
       const input = body.mailbox;
@@ -3173,18 +3845,20 @@ async function handleApi(req, res, url) {
     return sendJson(res, 200, { settings: publicState({ includeHistory: false }).settings, state: publicState({ includeHistory: false }) });
   }
   if (method === 'GET' && url.pathname === '/api/integrations/sub2api/groups') {
-    return sendJson(res, 200, await querySub2ApiGroups());
+    const config = sub2ApiConfigById(url.searchParams.get('integrationId')) || sub2ApiConfigs()[0] || {};
+    return sendJson(res, 200, await querySub2ApiGroups(config));
   }
   if (method === 'POST' && url.pathname === '/api/mothers') {
+    if (body.sub2apiIntegrationId !== undefined && !sub2ApiConfigById(body.sub2apiIntegrationId)) return sendJson(res, 400, { message: 'sub2api_integration_not_found' });
     const imported = motherFromImportedAccount(body);
     const importedTeam = body.team !== undefined ? String(body.team || '').trim() : (body.accountId ? String(body.accountId).trim() : imported.team);
-    const mother = { ...imported, id: body.id || imported.id, email: String(body.email || imported.email), name: String(body.name || imported.name), team: importedTeam, teamName: String(body.teamName || body.displayName || imported.teamName || ''), rotationMode: body.rotationMode === 'rotating' ? 'rotating' : 'fixed', primaryOwnerEmail: String(body.primaryOwnerEmail || imported.primaryOwnerEmail || body.email || imported.email || ''), seats: body.seats == null ? imported.seats : Number(body.seats), used: body.used == null ? imported.used : Number(body.used), status: 'unconfigured', lastCheck: null };
+    const mother = { ...imported, id: body.id || imported.id, email: String(body.email || imported.email), name: String(body.name || imported.name), team: importedTeam, teamName: String(body.teamName || body.displayName || imported.teamName || ''), rotationMode: body.rotationMode === 'rotating' ? 'rotating' : 'fixed', dailyRotationLimit: normalizeDailyRotationLimit(body.dailyRotationLimit ?? imported.dailyRotationLimit), primaryOwnerEmail: String(body.primaryOwnerEmail || imported.primaryOwnerEmail || body.email || imported.email || ''), sub2apiIntegrationId: sub2ApiConfigById(body.sub2apiIntegrationId)?.id || sub2ApiConfigs()[0]?.id || DEFAULT_SUB2API_ID, seats: body.seats == null ? imported.seats : Number(body.seats), used: body.used == null ? imported.used : Number(body.used), status: 'unconfigured', lastCheck: null };
     if (body.accountId !== undefined) mother.accountId = String(body.accountId || '').trim();
     if (mother.accountId) mother.team = mother.accountId;
-    const duplicate = state.mothers.find((item) => (
-      (mother.accountId && item.accountId === mother.accountId)
-      || (mother.email && item.email && item.email.toLowerCase() === mother.email.toLowerCase())
-    ));
+    const incomingTeamId = configuredTeamId(mother);
+    const duplicate = state.mothers.find((item) => incomingTeamId
+      ? configuredTeamId(item) === incomingTeamId
+      : !configuredTeamId(item) && mother.email && item.email && item.email.toLowerCase() === mother.email.toLowerCase());
     if (duplicate) {
       const existingId = duplicate.id;
       Object.assign(duplicate, Object.fromEntries(Object.entries(mother).filter(([, value]) => value !== '' && value !== null && value !== undefined)));
@@ -3197,6 +3871,7 @@ async function handleApi(req, res, url) {
   }
   if (method === 'PATCH' && segments[1] === 'mothers' && segments[2]) {
     const mother = findMother(segments[2]); if (!mother) return sendJson(res, 404, { message: 'mother_not_found' });
+    if (body.sub2apiIntegrationId !== undefined && !sub2ApiConfigById(body.sub2apiIntegrationId)) return sendJson(res, 400, { message: 'sub2api_integration_not_found' });
     const fields = credentialFields(body);
     const previousTeam = canonicalTeamId(mother);
     const nextAccountId = fields.accountId
@@ -3210,6 +3885,8 @@ async function handleApi(req, res, url) {
     if (nextAccountId !== undefined) mother.accountId = nextAccountId;
     if (nextTeam !== undefined) mother.team = nextTeam || mother.accountId || mother.id;
     if (body.rotationMode !== undefined) mother.rotationMode = body.rotationMode === 'rotating' ? 'rotating' : 'fixed';
+    if (body.dailyRotationLimit !== undefined) mother.dailyRotationLimit = normalizeDailyRotationLimit(body.dailyRotationLimit, mother.dailyRotationLimit);
+    if (body.sub2apiIntegrationId !== undefined) mother.sub2apiIntegrationId = String(body.sub2apiIntegrationId);
     if (fields.accessToken) mother.accessToken = fields.accessToken;
     if (fields.refreshToken) mother.refreshToken = fields.refreshToken;
     if (fields.accountId) mother.accountId = fields.accountId;
@@ -3273,11 +3950,26 @@ async function handleApi(req, res, url) {
     const motherTarget = body.target === 'mothers' || body.kind === 'mother';
     const incoming = rawItems.map(asObject).filter((item) => credentialFields(item).email || credentialFields(item).accessToken);
     if (motherTarget) {
-      const added = incoming.map(motherFromImportedAccount);
+      const added = [];
+      const updated = [];
+      for (const item of incoming) {
+        const next = motherFromImportedAccount({ ...item, ...(body.sub2apiIntegrationId ? { sub2apiIntegrationId: body.sub2apiIntegrationId } : {}) });
+        const teamId = configuredTeamId(next);
+        const existing = [...added, ...state.mothers].find((mother) => teamId
+          ? configuredTeamId(mother) === teamId
+          : !configuredTeamId(mother) && next.email && mother.email && next.email.toLowerCase() === mother.email.toLowerCase());
+        if (existing) {
+          mergeImportedMother(existing, item);
+          if (!added.includes(existing) && !updated.includes(existing)) updated.push(existing);
+        } else {
+          added.push(next);
+        }
+      }
       state.mothers = [...added, ...state.mothers];
-      addHistory('导入母号', `新增 ${added.length} 个母号`);
+      linkFreeAccountsToImportedTeams();
+      addHistory('导入 Team', `新增 ${added.length} 个 Team${updated.length ? `，合并 ${updated.length} 个已有 Team` : ''}`);
       await persist();
-      return sendJson(res, 201, { added: added.map(publicMother), state: publicState({ includeHistory: false }) });
+      return sendJson(res, 201, { added: added.map(publicMother), updated: updated.map(publicMother), state: publicState({ includeHistory: false }) });
     }
     const added = [];
     const updated = [];
@@ -3315,6 +4007,7 @@ async function handleApi(req, res, url) {
         const merged = Object.fromEntries(Object.entries(next).filter(([key, value]) => {
           if (key === 'id' || key === 'workspaceHistory' || value === '' || value === null || value === undefined) return false;
           // Re-importing credentials must not erase a live membership snapshot.
+          if (key === 'status' && childIsBanned(existing)) return false;
           if (key === 'status' && value === 'ready' && existing.status && existing.status !== 'ready' && !item.status) return false;
           if (key === 'plan' && value === '待检测' && existing.plan && existing.plan !== '待检测' && !item.plan && !item.planType) return false;
           if (key === 'token' && value === '待登录获取 AT' && existing.accessToken) return false;
@@ -3361,7 +4054,7 @@ async function handleApi(req, res, url) {
     child.authAt = now();
     child.sub2apiImported = true;
     setChildLoginState(child, 'ready', 'AT 已保存，可导出 Free JSON');
-    child.status = child.team ? 'active' : 'ready';
+    if (!childIsBanned(child)) child.status = child.team ? 'active' : 'ready';
     if (fields.quota5h != null) child.quota5h = fields.quota5h;
     if (fields.quota7d != null) child.quota7d = fields.quota7d;
     child.quota5hResetAfterSeconds = fields.quota5hResetAfterSeconds ?? child.quota5hResetAfterSeconds ?? null;
@@ -3489,7 +4182,8 @@ async function handleApi(req, res, url) {
     if (workspaceMemberCount(mother, 2) <= 1) return sendJson(res, 409, { message: 'minimum_workspace_member_required' });
     const remote = await removeWorkspaceMember(mother, member);
     if (!remote.ok) return sendJson(res, remote.status || 502, { message: remote.message || 'workspace_member_remove_failed', remote });
-    child.status = 'kicked';
+    const banned = childIsBanned(child);
+    child.status = banned ? 'banned' : 'kicked';
     child.retryReason = body.reason || 'manual';
     const removedAt = now();
     const membership = membershipFor(child, oldTeam, true);
@@ -3498,13 +4192,13 @@ async function handleApi(req, res, url) {
       removedAt,
       reason: child.retryReason,
       retryAfter: body.retryAfter || null,
-      rejoinEligible: true,
+      rejoinEligible: banned ? false : true,
     });
     child.team = null;
     const replacement = (child.workspaceHistory || []).find((entry) => entry.status === 'active' && entry.team);
     child.team = replacement?.team || null;
     removeTeamOwnerForChild(mother, child);
-    if (child.team) child.status = 'active';
+    if (child.team && !banned) child.status = 'active';
     mother.members = (mother.members || []).filter((item) => item.id !== member.id);
     if (Number.isFinite(Number(mother.used))) mother.used = Math.max(0, Number(mother.used) - 1);
     addHistory('移出 Team', `${child.email} 已从 ${oldTeam} 移除`);
@@ -3553,6 +4247,16 @@ async function handleApi(req, res, url) {
 }
 
 let requestQueue = Promise.resolve();
+function canHandleReadConcurrently(req) {
+  if (!['GET', 'HEAD'].includes(req.method || 'GET')) return false;
+  try {
+    const pathname = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`).pathname;
+    return pathname === '/api/state' || pathname === '/api/history' || pathname === '/api/health' || !pathname.startsWith('/api/');
+  } catch {
+    return false;
+  }
+}
+
 async function handleRequest(req, res) {
   try {
     const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
@@ -3580,6 +4284,12 @@ async function handleRequest(req, res) {
   } catch (error) { sendJson(res, 400, { message: error?.message || 'request_failed' }); }
 }
 const server = createServer((req, res) => {
+  if (canHandleReadConcurrently(req)) {
+    void handleRequest(req, res).catch((error) => {
+      if (!res.headersSent) sendJson(res, 500, { message: error?.message || 'request_failed' });
+    });
+    return;
+  }
   requestQueue = requestQueue.then(() => handleRequest(req, res)).catch((error) => {
     if (!res.headersSent) sendJson(res, 500, { message: error?.message || 'request_failed' });
   });

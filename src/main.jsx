@@ -4,7 +4,7 @@ import {
   Activity, AlertTriangle, ArrowDownToLine, ArrowUpRight, Bot, Check, CheckCircle2,
   ChevronLeft, ChevronRight, CircleHelp, Clock3, CloudDownload, Copy, Download, ExternalLink,
   FileText, Gauge, KeyRound, LayoutDashboard, ListFilter, Mail, Moon, MoreHorizontal,
-  Pause, Play, Plus, RefreshCw, Settings2, ShieldCheck, SlidersHorizontal,
+  Pause, Play, Plus, RefreshCw, Settings2, ShieldAlert, ShieldCheck, SlidersHorizontal,
   Sparkles, Sun, Trash2, UserMinus, UserRound, Users, X, Zap
 } from 'lucide-react';
 import './styles.css';
@@ -14,6 +14,7 @@ const initialMothers = [];
 const initialHistory = [];
 const historyPageSizeOptions = [20, 50, 100];
 const defaultProxySettings = { enabled: false, strategy: 'failover', timeoutMs: 15000, maxRetries: 2, entries: [] };
+const defaultSub2Api = { id: 'sub2api_default', name: '默认 Sub2API', baseUrl: '', apiKey: '', groupId: null, groupName: '', enabled: false, apiKeySet: false };
 // The production server serves the API from the same origin; Vite dev runs it
 // separately on 8786, so point browser requests at the live local API there.
 const API_BASE = import.meta.env.VITE_API_BASE || (import.meta.env.DEV ? 'http://127.0.0.1:8786' : '');
@@ -86,6 +87,19 @@ function applyStatePayload(payload, setChildren, setMothers) {
   if (!payload || typeof payload !== 'object') return;
   if (Array.isArray(payload.children)) setChildren(hydrateChildren(payload.children));
   if (Array.isArray(payload.mothers)) setMothers(payload.mothers);
+}
+
+function mergedIntegrations(current, source = {}) {
+  const legacy = { ...defaultSub2Api, ...(source.sub2api || {}) };
+  const sub2apis = Array.isArray(source.sub2apis) && source.sub2apis.length
+    ? source.sub2apis.map((item, index) => ({ ...defaultSub2Api, id: index === 0 ? 'sub2api_default' : `sub2api_${index + 1}`, name: `Sub2API ${index + 1}`, ...item }))
+    : [legacy];
+  return {
+    ...current,
+    sub2api: sub2apis[0],
+    sub2apis,
+    mailbox: { ...(current.mailbox || {}), ...(source.mailbox || {}) },
+  };
 }
 
 function numericOrNull(value) {
@@ -321,7 +335,7 @@ function normalizeAcquireStatus(payload = {}) {
 function AcquireStatus({ state }) {
   if (!state?.status) return null;
   const labels = { queued: '等待处理', waiting_code: '等待验证码', phone_required: '需要手机号接码', browser_required: '需要浏览器验证', authenticating: '登录验证中', ready: '已更新', failed: '获取失败' };
-  return <span className={`acquire-status ${state.status} ${state.loading ? 'loading' : ''}`} title={state.message || ''}><i />{labels[state.status] || '处理中'}</span>;
+  return <span className={`acquire-status ${state.status} ${state.loading ? 'loading' : ''}`} title={state.message || ''}><i />{labels[state.status] || '处理中'}{state.authUrl && <a className="auth-link" href={state.authUrl} target="_blank" rel="noreferrer">打开授权链接</a>}</span>;
 }
 
 function App() {
@@ -368,7 +382,8 @@ function App() {
   const [kickWindow, setKickWindow] = useState('5h');
   const [promoteJoinedAccounts, setPromoteJoinedAccounts] = useState(true);
   const [integrations, setIntegrations] = useState({
-    sub2api: { baseUrl: '', apiKey: '', groupId: null, groupName: '', enabled: false },
+    sub2api: defaultSub2Api,
+    sub2apis: [defaultSub2Api],
     mailbox: { serviceType: 'manual', endpoint: '', apiKey: '', enabled: false },
   });
   const [showIntegration, setShowIntegration] = useState(null);
@@ -396,10 +411,7 @@ function App() {
           setConcurrency(Math.min(10, Math.max(1, Number(payload.settings.concurrency) || 3)));
           setKickWindow(payload.settings.kickWindow === '7d' ? '7d' : '5h');
           setPromoteJoinedAccounts(payload.settings.promoteJoinedAccounts !== false);
-          setIntegrations((current) => ({
-            sub2api: { ...current.sub2api, ...(payload.settings.integrations?.sub2api || {}) },
-            mailbox: { ...current.mailbox, ...(payload.settings.integrations?.mailbox || {}) },
-          }));
+          setIntegrations((current) => mergedIntegrations(current, payload.settings.integrations));
           setProxySettings((current) => ({ ...current, ...(payload.settings.proxy || {}), entries: Array.isArray(payload.settings.proxy?.entries) ? payload.settings.proxy.entries : current.entries }));
           setIsRunning(Boolean(payload.mothers?.length) && payload.settings.autoRefill !== false);
         }
@@ -443,8 +455,8 @@ function App() {
   const activeChildren = children.filter((c) => activeMother && isMemberOfTeam(c, activeMother.accountId || activeMother.team) && c.status !== 'kicked');
   const trackedChildren = children.filter((c) => joinedTeamsFor(c).some((entry) => entry.status === 'active'));
   const readyChildren = children.filter((c) => c.status === 'ready');
-  const exhausted = activeChildren.filter((c) => c.status === 'exhausted' && c.lastProbe?.ok === true);
-  const anyExhausted = children.some((c) => c.status === 'exhausted' && c.lastProbe?.ok === true);
+  const exhausted = activeChildren.filter((c) => c.status === 'banned' || (c.status === 'exhausted' && c.lastProbe?.ok === true));
+  const anyExhausted = children.some((c) => c.status === 'banned' || (c.status === 'exhausted' && c.lastProbe?.ok === true));
   const anyOpenSeat = mothers.some((mother) => Number.isFinite(Number(mother.seats)) && Number.isFinite(Number(mother.used)) && Number(mother.seats) > Number(mother.used));
   const lowQuota = activeChildren.filter((c) => [c.quota5h, c.quota7d].some((value) => Number.isFinite(Number(value)) && Number(value) <= Number(threshold)));
   const seatsOpen = activeMother && Number.isFinite(Number(activeMother.seats)) && Number.isFinite(Number(activeMother.used))
@@ -506,6 +518,28 @@ function App() {
     return () => clearInterval(timer);
   }, [isRunning]);
 
+  const hasActiveRotation = mothers.some((mother) => mother.rotationProgress?.status === 'running');
+  useEffect(() => {
+    if (!isProcessing && !isRunning) return undefined;
+    let cancelled = false;
+    let loading = false;
+    const refreshProgress = async () => {
+      if (loading) return;
+      loading = true;
+      try {
+        const payload = await apiRequest('/api/state?includeHistory=false');
+        if (!cancelled) applyStatePayload(payload, setChildren, setMothers);
+      } catch {
+        // The foreground operation reports the actionable error.
+      } finally {
+        loading = false;
+      }
+    };
+    void refreshProgress();
+    const timer = window.setInterval(refreshProgress, isProcessing || hasActiveRotation ? 700 : 3000);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, [isProcessing, isRunning, hasActiveRotation]);
+
   useEffect(() => {
     const rotationTeams = mothers.filter((mother) => mother.hasAccessToken && (mother.accountId || mother.team));
     if (!isRunning || rotationTeams.length < 2) return undefined;
@@ -535,10 +569,7 @@ function App() {
         setConcurrency(Math.min(10, Math.max(1, Number(payload.settings.concurrency) || 3)));
         setKickWindow(payload.settings.kickWindow === '7d' ? '7d' : '5h');
         setPromoteJoinedAccounts(payload.settings.promoteJoinedAccounts !== false);
-        setIntegrations((current) => ({
-          sub2api: { ...current.sub2api, ...(payload.settings.integrations?.sub2api || {}) },
-          mailbox: { ...current.mailbox, ...(payload.settings.integrations?.mailbox || {}) },
-        }));
+        setIntegrations((current) => mergedIntegrations(current, payload.settings.integrations));
         setProxySettings((current) => ({ ...current, ...(payload.settings.proxy || {}), entries: Array.isArray(payload.settings.proxy?.entries) ? payload.settings.proxy.entries : current.entries }));
         setIsRunning(Boolean(payload.mothers?.length) && payload.settings.autoRefill !== false);
       }
@@ -578,7 +609,7 @@ function App() {
         ? (result.teams || []).flatMap((team) => team.results || [])
         : (result.results || []);
       const recoveries = quotaResults.map((item) => item.tokenRecovery).filter(Boolean);
-      const recovered = recoveries.filter((item) => item.ok).length;
+      const recovered = quotaResults.filter((item) => item.tokenRecovery?.ok && item.ok === true).length;
       const waitingForLogin = recoveries.filter((item) => !item.ok && (item.needsInput || item.browserRequired)).length;
       const recoveryDetail = recovered
         ? `；已自动更新 ${recovered} 个 Team JSON`
@@ -639,8 +670,7 @@ function App() {
 
   async function saveIntegration(type, next) {
     try {
-      await apiRequest('/api/integrations', { method: 'PATCH', body: JSON.stringify(type === 'sub2api' ? { sub2api: next } : { mailbox: next }) });
-      setIntegrations((current) => ({ ...current, [type]: { ...current[type], ...next } }));
+      await apiRequest('/api/integrations', { method: 'PATCH', body: JSON.stringify(type === 'sub2api' ? { sub2apis: next } : { mailbox: next }) });
       setShowIntegration(null);
       await refreshState(false);
       notify(`${type === 'sub2api' ? 'Sub2API' : '邮箱 / 接码'}配置已保存`);
@@ -769,15 +799,33 @@ function App() {
     setShowTeamDetail(true);
   }
 
-  async function saveAccount(next) {
+  async function saveAccount(next, sub2apiJson = '') {
+    let recordSaved = false;
+    let savedChildId = editingAccountId;
     try {
       const path = editingAccountId ? `/api/children/${encodeURIComponent(editingAccountId)}` : '/api/children';
       const method = editingAccountId ? 'PATCH' : 'POST';
-      await apiRequest(path, { method, body: JSON.stringify(next) });
+      const saved = await apiRequest(path, { method, body: JSON.stringify(next) });
+      recordSaved = true;
+      const childId = editingAccountId || saved.child?.id || saved.id;
+      savedChildId = childId;
+      const json = String(sub2apiJson || '').trim();
+      if (json) {
+        if (!childId) throw new Error('账号已保存，但无法定位记录以导入 JSON');
+        await apiRequest(`/api/children/${encodeURIComponent(childId)}/sub2api`, { method: 'PUT', body: JSON.stringify({ json }) });
+      }
       await refreshState(false);
       setShowAccount(false);
-      notify(editingAccountId ? '账号记录已保存' : 'Free 账号已添加');
-    } catch (error) { notify(`账号保存失败：${error.message}`, 'error'); }
+      notify(json ? '账号和完整 Free Sub2API JSON 已保存' : editingAccountId ? '账号记录已保存' : 'Free 账号已添加');
+      return true;
+    } catch (error) {
+      if (recordSaved) {
+        await refreshState(false).catch(() => {});
+        if (!editingAccountId && savedChildId) setShowAccount(false);
+      }
+      notify(recordSaved ? `账号凭据已保存，但 JSON 录入失败：${error.message}。可在该账号的编辑面板中重试。` : `账号保存失败：${error.message}`, 'error');
+      return false;
+    }
   }
 
   async function saveAccountAndAcquire(next) {
@@ -867,7 +915,7 @@ function App() {
   }
 
   async function pushSub2Api() {
-    const target = integrations.sub2api || {};
+    const target = integrations.sub2apis?.[0] || integrations.sub2api || {};
     const hasGroupId = Number.isFinite(Number(target.groupId)) && Number(target.groupId) > 0;
     if (!target.enabled || !target.baseUrl || !target.apiKeySet || (!hasGroupId && !String(target.groupName || '').trim())) {
       notify('请先在设置中配置 Sub2API 服务、密钥和同步分组名称或 ID', 'error');
@@ -876,22 +924,30 @@ function App() {
     }
     try {
       const result = await apiRequest('/api/sub2api/push', { method: 'POST', body: JSON.stringify({}) });
-      notify(result.ok === false ? `Sub2API 部分推送失败：成功 ${result.pushed?.length || 0} 个，失败 ${result.failed?.length || 0} 个` : `已推送 ${result.pushed?.length || 0} 个账号到 ${result.targetGroupName || `分组 ${result.targetGroupId}`}`, result.ok === false ? 'error' : 'success');
+      notify(result.ok === false ? `Sub2API 部分推送失败：新增 ${result.pushed?.length || 0} 个，失败 ${result.failed?.length || 0} 个` : `新增 ${result.pushed?.length || 0} 个账号，已存在跳过 ${result.skipped?.length || 0} 个`, result.ok === false ? 'error' : 'success');
       await refreshState(false);
     } catch (error) { notify(`Sub2API 推送失败：${error.message}`, 'error'); }
   }
 
   async function pushTeamSub2Api(motherId = null) {
-    const target = integrations.sub2api || {};
-    const hasGroupId = Number.isFinite(Number(target.groupId)) && Number(target.groupId) > 0;
-    if (!target.enabled || !target.baseUrl || !target.apiKeySet || (!hasGroupId && !String(target.groupName || '').trim())) {
-      notify('请先在设置中配置 Sub2API 服务、密钥和同步分组名称或 ID', 'error');
-      setView('settings'); setShowIntegration('sub2api');
+    const configs = integrations.sub2apis?.length ? integrations.sub2apis : [integrations.sub2api || {}];
+    const mother = motherId ? mothers.find((item) => item.id === motherId) : null;
+    const targetMothers = mother ? [mother] : mothers;
+    const invalidTargets = targetMothers.filter((item) => {
+      const target = configs.find((config) => config.id === item.sub2apiIntegrationId) || (!item.sub2apiIntegrationId ? configs[0] : null);
+      const hasGroupId = Number.isFinite(Number(target?.groupId)) && Number(target.groupId) > 0;
+      return !target?.enabled || !target?.baseUrl || !target?.apiKeySet || (!hasGroupId && !String(target?.groupName || '').trim());
+    });
+    if (invalidTargets.length) {
+      notify(`${invalidTargets.length} 个 Team 的目标 Sub2API 未配置完整，请先处理`, 'error');
+      setShowTeamDetail(false);
+      setView('settings');
+      setShowIntegration('sub2api');
       return;
     }
     try {
       const result = await apiRequest('/api/sub2api/team-push', { method: 'POST', body: JSON.stringify(motherId ? { motherId } : {}) });
-      notify(result.ok === false ? `Team Sub2API 部分推送失败：成功 ${result.pushed?.length || 0} 个，失败 ${result.failed?.length || 0} 个` : `已推送 ${result.pushed?.length || 0} 个 Team 账号到 ${result.targetGroupName || `分组 ${result.targetGroupId}`}`, result.ok === false ? 'error' : 'success');
+      notify(result.ok === false ? `Team 推送部分失败：新增 ${result.pushed?.length || 0} 个，跳过 ${result.skipped?.length || 0} 个，失败 ${result.failed?.length || 0} 个` : `新增 ${result.pushed?.length || 0} 个 Team 账号，已存在跳过 ${result.skipped?.length || 0} 个`, result.ok === false ? 'error' : 'success');
       await refreshState(false);
     } catch (error) { notify(`Team Sub2API 推送失败：${error.message}`, 'error'); }
   }
@@ -916,7 +972,13 @@ function App() {
       applyStatePayload(payload, setChildren, setMothers);
       await refreshState(false);
       notify('Free 账号已删除');
-    } catch (error) { notify(`删除 Free 账号失败：${error.message}`, 'error'); }
+    } catch (error) {
+      if (error.payload?.message === 'child_has_active_team_memberships') {
+        notify('该 Free 账号仍在 Team 中，请先移出所有当前 Team 后再删除本地记录', 'error');
+        return;
+      }
+      notify(`删除 Free 账号失败：${error.message}`, 'error');
+    }
   }
 
   async function saveMother(next) {
@@ -962,9 +1024,10 @@ function App() {
 
     {showImport && <Modal title="导入账号" onClose={closeImport}><div className="modal-intro">Sub2API 混合文件会按 `plan_type` 自动分流：Team 记录合并到对应空间并保留多个所有者，Free 记录进入普通账号池。完整凭据只提交服务端，不写入浏览器存储。</div><label className="file-picker"><span>选择 Sub2API JSON</span><input type="file" accept="application/json,.json" onChange={importSub2ApiFile} /><small>{importFileName || '未选择文件'}</small></label><div className="segmented">{[['email-code', '邮箱 / 接码地址'], ['password-2fa', '邮箱 / 密码 / 2FA']].map(([id, label]) => <button key={id} className={importMode === id ? 'selected' : ''} onClick={() => setImportMode(id)}>{label}</button>)}</div><textarea className="import-area" value={importText} onChange={(event) => { setImportAccounts(null); setImportFileName(''); setImportText(event.target.value); }} placeholder={importMode === 'email-code' ? 'name@example.com | sms-provider://address\nname2@example.com | https://mailbox.example/...' : 'name@example.com----password----2fa-secret'} /><div className="modal-foot"><span className="muted">{importAccounts?.length ? `${importAccounts.length} 个 JSON 账号待导入` : '支持粘贴账号信息；不会生成演示账号。'}</span><button className="button primary" onClick={importChildren}><ArrowDownToLine size={15} />开始导入</button></div></Modal>}
     {showJsonImport && <Modal title="导入 Free Sub2API JSON" onClose={() => setShowJsonImport(false)}><div className="modal-intro">账号：<strong>{jsonImportChild?.email}</strong><br />粘贴该 Free 账号完整的 Sub2API JSON，系统会保存 AT、RT 和关联字段。Team JSON 不能录入到 Free 账号。</div><textarea className="import-area" aria-label="Free Sub2API JSON" value={jsonImportText} onChange={(event) => setJsonImportText(event.target.value)} placeholder={'粘贴完整 Sub2API JSON，例如：\n{\n  "credentials": { ... }\n}'} /><div className="modal-foot"><span className="muted">完整凭据仅提交服务端保存，不会在列表中显示。</span><button className="button primary" disabled={!jsonImportText.trim() || jsonImporting} onClick={async () => { if (!jsonImportChild) return; setJsonImporting(true); try { if (await importAccountSub2Api(jsonImportChild.id, jsonImportText)) setShowJsonImport(false); } finally { setJsonImporting(false); } }}><FileText size={15} />{jsonImporting ? '导入中' : '导入 JSON'}</button></div></Modal>}
-    {showMother && <MotherModal key={editingMotherId || 'new'} mother={editingMotherId ? mothers.find((item) => item.id === editingMotherId) : null} onClose={() => setShowMother(false)} onSave={saveMother} />}
-    {showAccount && <AccountModal account={editingAccountId ? children.find((item) => item.id === editingAccountId) : null} onClose={() => setShowAccount(false)} onSave={saveAccount} onSaveAndAcquire={saveAccountAndAcquire} onAcquire={acquireAccount} onImportSub2Api={importAccountSub2Api} acquireState={editingAccountId ? acquireStates[editingAccountId] : null} />}
-    {showIntegration && <IntegrationModal type={showIntegration} config={integrations[showIntegration]} onClose={() => setShowIntegration(null)} onSave={(next) => saveIntegration(showIntegration, next)} />}
+    {showMother && <MotherModal key={editingMotherId || 'new'} mother={editingMotherId ? mothers.find((item) => item.id === editingMotherId) : null} sub2apis={integrations.sub2apis || []} onClose={() => setShowMother(false)} onSave={saveMother} />}
+    {showAccount && <AccountModal account={editingAccountId ? children.find((item) => item.id === editingAccountId) : null} onClose={() => setShowAccount(false)} onSave={saveAccount} onSaveAndAcquire={saveAccountAndAcquire} onAcquire={acquireAccount} acquireState={editingAccountId ? acquireStates[editingAccountId] : null} />}
+    {showIntegration === 'sub2api' && <Sub2ApiModal configs={integrations.sub2apis || []} mothers={mothers} onClose={() => setShowIntegration(null)} onSave={(next) => saveIntegration('sub2api', next)} />}
+    {showIntegration === 'mailbox' && <IntegrationModal type="mailbox" config={integrations.mailbox} onClose={() => setShowIntegration(null)} onSave={(next) => saveIntegration('mailbox', next)} />}
     {showProxy && <ProxyModal proxy={proxySettings} onClose={() => setShowProxy(false)} onSave={saveProxySettings} onAdd={addProxyEntries} onRemove={removeProxyEntry} notify={notify} />}
     {showTeamDetail && <TeamDetailModal team={teamRecords.find((item) => item.id === detailTeamId) || null} onClose={() => setShowTeamDetail(false)} runCheck={runCheck} refillSeats={refillSeats} setSelectedTeam={setSelectedTeam} openTeam={openMother} exportTeamSub2Api={exportTeamSub2Api} pushTeamSub2Api={pushTeamSub2Api} />}
     {showSettings && <SettingsModal onClose={() => setShowSettings(false)} />}
@@ -984,6 +1047,13 @@ function teamRetryLabel(entry) {
   return Number.isFinite(retryAt) && retryAt <= Date.now() ? '现在可重试' : `${displayTime(entry.retryAfter)} 后可重试`;
 }
 
+function dailyRotationValues(mother = {}) {
+  const usage = mother.dailyRotationUsage || {};
+  const limit = Math.max(1, Number(usage.limit ?? mother.dailyRotationLimit) || 3);
+  const count = Math.max(0, Number(usage.count) || 0);
+  return { count, limit, remaining: Math.max(0, Number(usage.remaining ?? limit - count) || 0) };
+}
+
 function TeamManagementView({ teams, openTeam, openDetail, setShowImport, exportTeamSub2Api, pushTeamSub2Api }) {
   const totalSeats = teams.reduce((sum, team) => sum + (Number(team.seats.total) || 0), 0);
   const usedSeats = teams.reduce((sum, team) => sum + (Number(team.seats.used) || 0), 0);
@@ -997,14 +1067,16 @@ function TeamManagementView({ teams, openTeam, openDetail, setShowImport, export
     </section>
     <section className="content-panel team-list-panel">
       <div className="content-toolbar"><div><h2>Team 管理</h2><p>按空间查看所有者、席位和当前成员；账号详情在管理弹窗中展示。</p></div><div className="toolbar-actions"><button className="button ghost" onClick={() => exportTeamSub2Api()}><Download size={15} />导出 Team JSON</button><button className="button secondary" onClick={() => pushTeamSub2Api()}><ExternalLink size={15} />推送 Team</button><button className="button ghost" onClick={setShowImport}><ArrowDownToLine size={15} />导入账号</button><button className="button primary" onClick={() => openTeam()}><Plus size={15} />添加 Team</button></div></div>
-      {!teams.length ? <div className="empty-state"><Users size={28} /><strong>还没有 Team 空间</strong><span>添加 Team 后会显示空间、所有者和席位。</span></div> : <div className="table-wrap team-list-wrap"><table className="data-table team-list-table"><thead><tr><th>Team 空间</th><th>所有者</th><th>席位</th><th>当前账号</th><th>状态</th><th>最后同步</th><th /></tr></thead><tbody>{teams.map((team) => {
+      {!teams.length ? <div className="empty-state"><Users size={28} /><strong>还没有 Team 空间</strong><span>添加 Team 后会显示空间、所有者和席位。</span></div> : <div className="table-wrap team-list-wrap"><table className="data-table team-list-table"><thead><tr><th>Team 空间</th><th>所有者</th><th>席位</th><th>当前账号</th><th>今日轮转</th><th>状态</th><th>最后同步</th><th /></tr></thead><tbody>{teams.map((team) => {
         const status = team.mother.status || 'unconfigured';
         const statusLabel = status === 'online' ? '在线' : status === 'offline' ? '离线' : '未检测';
+        const daily = dailyRotationValues(team.mother);
         return <tr key={team.id}>
-          <td><div className="team-list-title"><div className="team-avatar"><Users size={17} /></div><div><strong>{team.displayName}</strong></div></div></td>
+          <td><div className="team-list-title"><div className="team-avatar"><Users size={17} /></div><div><strong>{team.displayName}</strong><small className="team-sub2api-target">{team.mother.sub2apiIntegrationName || '未配置 Sub2API'}</small></div></div></td>
           <td><OwnerEmails owners={team.owners} /></td>
           <td><div className="table-seats"><span>{team.seats.used == null || team.seats.total == null ? '--' : `${team.seats.used}/${team.seats.total}`}</span><i><b style={{ width: `${team.seats.total ? Math.min(100, (team.seats.used || 0) / team.seats.total * 100) : 0}%` }} /></i></div></td>
           <td>{team.rows.length} 个</td>
+          <td><span className={`rotation-limit ${daily.remaining === 0 ? 'reached' : ''}`}>{daily.count} / {daily.limit}</span></td>
           <td><span className={`status-chip ${status}`}><i />{statusLabel}</span></td>
           <td>{displayTime(team.lastSync)}</td>
           <td><button className="button ghost compact-button" onClick={() => openDetail(team.id)}><Settings2 size={14} />管理</button></td>
@@ -1014,20 +1086,39 @@ function TeamManagementView({ teams, openTeam, openDetail, setShowImport, export
   </section>;
 }
 
+function durationLabel(value) {
+  const milliseconds = Number(value);
+  if (!Number.isFinite(milliseconds)) return '';
+  if (milliseconds < 1000) return `${milliseconds}ms`;
+  return `${(milliseconds / 1000).toFixed(milliseconds >= 10000 ? 0 : 1)}s`;
+}
+
+function RotationProgress({ progress }) {
+  if (!progress?.steps?.length) return null;
+  const running = progress.status === 'running';
+  const stateLabel = running ? progress.message || '轮换处理中' : progress.status === 'completed' ? '最近一次轮换已完成' : progress.status === 'failed' ? '最近一次轮换失败' : '最近一次轮换部分完成';
+  return <section className={`rotation-progress ${progress.status || ''}`}>
+    <div className="rotation-progress-head"><div><span>ROTATION PIPELINE</span><strong>{stateLabel}</strong>{progress.account && <small>{progress.account}</small>}</div><b>{running ? '运行中' : durationLabel(progress.durationMs)}</b></div>
+    <div className="rotation-progress-steps">{progress.steps.map((step) => <div className={`rotation-progress-step ${step.status}`} key={step.id}>{step.status === 'running' ? <RefreshCw size={13} /> : step.status === 'completed' ? <Check size={13} /> : step.status === 'failed' ? <AlertTriangle size={13} /> : <Clock3 size={13} />}<span>{step.label}</span>{step.durationMs != null && <small>{durationLabel(step.durationMs)}</small>}</div>)}</div>
+  </section>;
+}
+
 function TeamDetailModal({ team, onClose, runCheck, refillSeats, setSelectedTeam, openTeam, exportTeamSub2Api, pushTeamSub2Api }) {
   if (!team) return null;
   const status = team.mother.status || 'unconfigured';
-  const hasExhausted = team.rows.some((row) => row.child?.status === 'exhausted');
+  const hasExhausted = team.rows.some((row) => row.child?.status === 'exhausted' || row.child?.status === 'banned');
+  const daily = dailyRotationValues(team.mother);
   const statusLabel = status === 'online' ? '在线' : status === 'offline' ? '离线' : '未检测';
   return <Modal title={`Team 账号详情 · ${team.displayName}`} onClose={onClose} className="team-detail-modal">
-    <div className="team-detail-top"><div><span className="kicker">TEAM SPACE</span><strong className="team-detail-name">{team.displayName}</strong></div><div className="team-detail-actions"><span className={`status-chip ${status}`}><i />{statusLabel}</span><button className="button ghost compact-button" onClick={() => { onClose(); openTeam(team.mother); }}><Settings2 size={14} />编辑 Team</button></div></div>
-    <div className="team-detail-summary"><div><span>所有者</span><OwnerEmails owners={team.owners} /><small>{team.owners?.length ? `${team.owners.length} 个所有者` : '未同步所有者'}</small></div><div><span>席位</span><strong>{team.seats.used == null || team.seats.total == null ? '--' : `${team.seats.used} / ${team.seats.total}`}</strong><small>{team.seats.open == null ? '尚未检测' : team.seats.open ? `剩余 ${team.seats.open} 个` : '已满'}</small></div><div><span>最后同步</span><strong>{displayTime(team.lastSync)}</strong><small>{team.rows.length} 个当前账号</small></div></div>
+    <div className="team-detail-top"><div><span className="kicker">TEAM SPACE</span><strong className="team-detail-name">{team.displayName}</strong><small className="team-sub2api-target">同步到 {team.mother.sub2apiIntegrationName || '未配置 Sub2API'}</small></div><div className="team-detail-actions"><span className={`status-chip ${status}`}><i />{statusLabel}</span><button className="button ghost compact-button" onClick={() => { onClose(); openTeam(team.mother); }}><Settings2 size={14} />编辑 Team</button></div></div>
+    <div className="team-detail-summary"><div><span>所有者</span><OwnerEmails owners={team.owners} /><small>{team.owners?.length ? `${team.owners.length} 个所有者` : '未同步所有者'}</small></div><div><span>席位</span><strong>{team.seats.used == null || team.seats.total == null ? '--' : `${team.seats.used} / ${team.seats.total}`}</strong><small>{team.seats.open == null ? '尚未检测' : team.seats.open ? `剩余 ${team.seats.open} 个` : '已满'}</small></div><div><span>今日轮转</span><strong>{daily.count} / {daily.limit}</strong><small>{daily.remaining ? `还可轮转 ${daily.remaining} 个账号` : '今日已达上限'}</small></div><div><span>最后同步</span><strong>{displayTime(team.lastSync)}</strong><small>{team.rows.length} 个当前账号</small></div></div>
+    <RotationProgress progress={team.mother.rotationProgress} />
     <div className="team-detail-toolbar"><div><h3>当前账号</h3><span>额度、身份和凭据状态</span></div><div className="toolbar-actions"><button className="button ghost compact-button" onClick={() => exportTeamSub2Api(team.mother.id)}><Download size={14} />导出 JSON</button><button className="button secondary compact-button" onClick={() => pushTeamSub2Api(team.mother.id)}><ExternalLink size={14} />推送 Sub2API</button><button className="button ghost compact-button" onClick={() => { setSelectedTeam(team.id); runCheck(team.mother.id); }}><RefreshCw size={14} />检测额度</button><button className="button secondary compact-button" disabled={!team.seats.open && !hasExhausted} onClick={() => { setSelectedTeam(team.id); refillSeats(team.mother.id); }}><Sparkles size={14} />移除并补位</button></div></div>
     <div className="table-wrap team-detail-table-wrap"><table className="data-table team-detail-table"><thead><tr><th>账号</th><th>身份</th><th>5h 剩余</th><th>7d 剩余</th><th>登录凭据</th><th>Sub2API</th><th>加入时间</th></tr></thead><tbody>{team.rows.map((row, index) => {
       const account = row.child;
       const email = account?.email || row.member?.email || '未识别邮箱';
       const joinedAt = account?.joinedAt || row.member?.createdTime;
-      return <tr key={`${email}-${row.member?.id || index}`}><td><div className="account-cell"><div className="queue-avatar">{email[0]?.toUpperCase() || '?'}</div><div><strong>{email}</strong><small className="mono">{account?.id || row.member?.id || '成员快照'}</small></div></div></td><td>{row.isOwner ? <span className="role-label owner">所有者</span> : <span className="role-label">成员</span>}</td><td><QuotaBar value={account?.quota5h} /></td><td><QuotaBar value={account?.quota7d} /></td><td><CredentialState account={account} /></td><td><span className={`sub2api-state ${account?.sub2apiStatus?.imported ? 'ready' : ''}`}>{account?.sub2apiStatus?.imported ? '已记录' : '未记录'}</span></td><td>{joinedAt ? displayTime(joinedAt) : <span className="muted">成员同步</span>}</td></tr>;
+      return <tr key={`${email}-${row.member?.id || index}`}><td><div className="account-cell"><div className="queue-avatar">{email[0]?.toUpperCase() || '?'}</div><div><strong>{email}</strong><small className="mono">{account?.id || row.member?.id || '成员快照'}</small></div></div></td><td><div className="role-stack">{row.isOwner ? <span className="role-label owner">所有者</span> : <span className="role-label">成员</span>}{account?.status === 'banned' && <StatusBadge status="banned" />}</div></td><td><QuotaBar value={account?.quota5h} /></td><td><QuotaBar value={account?.quota7d} /></td><td><CredentialState account={account} /></td><td><span className={`sub2api-state ${account?.sub2apiStatus?.imported ? 'ready' : ''}`}>{account?.sub2apiStatus?.imported ? '已记录' : '未记录'}</span></td><td>{joinedAt ? displayTime(joinedAt) : <span className="muted">成员同步</span>}</td></tr>;
     })}</tbody></table></div>
   </Modal>;
 }
@@ -1049,10 +1140,10 @@ function TeamMaintenanceView({ teams, runCheck, refillSeats, setSelectedTeam, op
       {!teams.length && <div className="empty-state"><Users size={28} /><strong>还没有 Team 空间</strong><span>添加 Team 后，这里会显示所有者、席位和账号额度。</span></div>}
       <div className="team-record-list">{teams.map((team) => <article className="team-record" key={team.id}>
         <div className="team-record-head"><div className="team-title"><div className="team-avatar"><Users size={18} /></div><div><h3>{team.displayName}</h3></div></div><span className={`status-chip ${team.mother.status || 'unconfigured'}`}><i />{team.mother.status === 'online' ? '在线' : team.mother.status === 'offline' ? '离线' : '未检测'}</span></div>
-        <div className="team-meta-grid"><div><span>所有者</span><OwnerEmails owners={team.owners} /><small>{team.owners?.length ? `${team.owners.length} 个所有者` : '未同步所有者'}</small></div><div><span>席位</span><strong>{team.seats.used == null || team.seats.total == null ? '--' : `${team.seats.used} / ${team.seats.total}`}</strong><small>{team.seats.open ? `剩余 ${team.seats.open} 个` : '已满'}</small></div><div><span>最后同步</span><strong>{displayTime(team.lastSync)}</strong><small>{team.rows.length} 个当前成员</small></div></div>
-        <div className="team-record-actions"><button className="button ghost" onClick={() => { setSelectedTeam(team.id); runCheck(team.id); }}><RefreshCw size={14} />检测额度</button><button className="button secondary" disabled={!team.seats.open && !team.rows.some((row) => row.child?.status === 'exhausted')} onClick={() => { setSelectedTeam(team.id); refillSeats(team.id); }}><Sparkles size={14} />移除并补位</button></div>
+        <div className="team-meta-grid"><div><span>所有者</span><OwnerEmails owners={team.owners} /><small>{team.owners?.length ? `${team.owners.length} 个所有者` : '未同步所有者'}</small></div><div><span>席位</span><strong>{team.seats.used == null || team.seats.total == null ? '--' : `${team.seats.used} / ${team.seats.total}`}</strong><small>{team.seats.open ? `剩余 ${team.seats.open} 个` : '已满'}</small></div><div><span>今日轮转</span><strong>{dailyRotationValues(team.mother).count} / {dailyRotationValues(team.mother).limit}</strong><small>{dailyRotationValues(team.mother).remaining ? `剩余 ${dailyRotationValues(team.mother).remaining} 次` : '已达上限'}</small></div><div><span>最后同步</span><strong>{displayTime(team.lastSync)}</strong><small>{team.rows.length} 个当前成员</small></div></div>
+        <div className="team-record-actions"><button className="button ghost" onClick={() => { setSelectedTeam(team.id); runCheck(team.id); }}><RefreshCw size={14} />检测额度</button><button className="button secondary" disabled={!team.seats.open && !team.rows.some((row) => row.child?.status === 'exhausted' || row.child?.status === 'banned')} onClick={() => { setSelectedTeam(team.id); refillSeats(team.id); }}><Sparkles size={14} />移除并补位</button></div>
         <div className="team-member-heading"><div><h4>当前账号</h4><span>成员额度和凭据状态</span></div><b>{team.rows.length}</b></div>
-        <div className="table-wrap team-member-wrap"><table className="data-table team-member-table"><thead><tr><th>账号</th><th>身份</th><th>5h 剩余</th><th>7d 剩余</th><th>凭据</th><th>加入记录</th></tr></thead><tbody>{team.rows.map((row, index) => { const account = row.child; const email = account?.email || row.member?.email || '未识别邮箱'; return <tr key={`${email}-${row.member?.id || index}`}><td><div className="account-cell"><div className="queue-avatar">{email[0]?.toUpperCase() || '?'}</div><div><strong>{email}</strong><small className="mono">{account?.id || row.member?.id || '成员快照'}</small></div></div></td><td>{row.isOwner ? <span className="role-label owner">所有者</span> : <span className="role-label">成员</span>}</td><td><QuotaBar value={account?.quota5h} /></td><td><QuotaBar value={account?.quota7d} /></td><td><CredentialState account={account} /></td><td>{account?.joinedAt ? <span>{displayTime(account.joinedAt)}<small>{account.joinedTeams?.length || account.workspaceHistory?.length || 1} 个 Team</small></span> : <span className="muted">成员同步</span>}</td></tr>; })}</tbody></table></div>
+        <div className="table-wrap team-member-wrap"><table className="data-table team-member-table"><thead><tr><th>账号</th><th>身份</th><th>5h 剩余</th><th>7d 剩余</th><th>凭据</th><th>加入记录</th></tr></thead><tbody>{team.rows.map((row, index) => { const account = row.child; const email = account?.email || row.member?.email || '未识别邮箱'; return <tr key={`${email}-${row.member?.id || index}`}><td><div className="account-cell"><div className="queue-avatar">{email[0]?.toUpperCase() || '?'}</div><div><strong>{email}</strong><small className="mono">{account?.id || row.member?.id || '成员快照'}</small></div></div></td><td><div className="role-stack">{row.isOwner ? <span className="role-label owner">所有者</span> : <span className="role-label">成员</span>}{account?.status === 'banned' && <StatusBadge status="banned" />}</div></td><td><QuotaBar value={account?.quota5h} /></td><td><QuotaBar value={account?.quota7d} /></td><td><CredentialState account={account} /></td><td>{account?.joinedAt ? <span>{displayTime(account.joinedAt)}<small>{account.joinedTeams?.length || account.workspaceHistory?.length || 1} 个 Team</small></span> : <span className="muted">成员同步</span>}</td></tr>; })}</tbody></table></div>
       </article>)}</div>
     </section>
   </section>;
@@ -1066,18 +1157,19 @@ function CredentialState({ account }) {
 
 function FreeAccountsView({ children, allChildren, mothers, search, setSearch, setShowImport, addAccount, exportSub2Api, pushSub2Api, removeChild, deleteFreeAccount, openJsonImport, editAccount, acquireAccount, acquireMissingFreeJson, acquireStates, batchAcquire, concurrency }) {
   const [filter, setFilter] = useState('all');
-  const visible = children.filter((account) => filter === 'all' || (filter === 'free' && !joinedTeamsFor(account).some((entry) => entry.status === 'active')) || (filter === 'team' && joinedTeamsFor(account).some((entry) => entry.status === 'active')) || (filter === 'cooldown' && (['kicked', 'cooldown'].includes(account.status) || joinedTeamsFor(account).some((entry) => ['kicked', 'cooldown'].includes(entry.status)))));
-  const freeCount = allChildren.filter((account) => !joinedTeamsFor(account).some((entry) => entry.status === 'active')).length;
+  const isBanned = (account) => account.banStatus === 'banned' || account.status === 'banned';
+  const visible = children.filter((account) => filter === 'all' || (filter === 'free' && !isBanned(account) && !joinedTeamsFor(account).some((entry) => entry.status === 'active')) || (filter === 'team' && joinedTeamsFor(account).some((entry) => entry.status === 'active')) || (filter === 'cooldown' && (['kicked', 'cooldown'].includes(account.status) || joinedTeamsFor(account).some((entry) => ['kicked', 'cooldown'].includes(entry.status)))) || (filter === 'banned' && isBanned(account)));
+  const freeCount = allChildren.filter((account) => !isBanned(account) && !joinedTeamsFor(account).some((entry) => entry.status === 'active')).length;
   const teamCount = allChildren.filter((account) => joinedTeamsFor(account).some((entry) => entry.status === 'active')).length;
-  const readyCount = allChildren.filter((account) => account.status === 'ready').length;
-  const missingJsonCount = allChildren.filter((account) => !account.sub2apiStatus?.exportable).length;
+  const bannedCount = allChildren.filter(isBanned).length;
+  const missingJsonCount = allChildren.filter((account) => !isBanned(account) && !account.sub2apiStatus?.exportable).length;
   const batchResult = batchAcquire?.result;
   return <section className="free-maintenance">
-    <section className="metrics"><Metric label="普通账号" value={allChildren.length} detail="不含 Team 所有者" icon={Users} tone="blue" /><Metric label="未加入 Team" value={freeCount} detail="可进入补位队列" icon={UserRound} tone="green" /><Metric label="已加入 Team" value={teamCount} detail="可同时保留多个空间" icon={LayoutDashboard} tone="amber" /><Metric label="待处理" value={readyCount} detail="等待加入或配置" icon={Clock3} tone="slate" /></section>
+    <section className="metrics"><Metric label="普通账号" value={allChildren.length} detail="不含 Team 所有者" icon={Users} tone="blue" /><Metric label="未加入 Team" value={freeCount} detail="可进入补位队列" icon={UserRound} tone="green" /><Metric label="已加入 Team" value={teamCount} detail="可同时保留多个空间" icon={LayoutDashboard} tone="amber" /><Metric label="已封禁" value={bannedCount} detail="永久排除自动补位" icon={ShieldAlert} tone="slate" /></section>
     <section className="content-panel account-panel"><div className="content-toolbar"><div><h2>Free 账号维护</h2><p>只记录普通账号；这里维护邮箱、凭据、加入过的 Team 和 Sub2API，不展示额度。</p></div><div className="toolbar-actions"><button className="button ghost" onClick={exportSub2Api}><Download size={15} />导出 Sub2API</button><button className="button secondary" onClick={pushSub2Api}><ExternalLink size={15} />推送到 Sub2API</button><button className="button secondary" onClick={acquireMissingFreeJson} disabled={batchAcquire?.loading || !missingJsonCount}><CloudDownload size={15} />{batchAcquire?.loading ? '批量获取中' : `批量获取 JSON${missingJsonCount ? ` (${missingJsonCount})` : ''}`}</button><button className="button ghost" onClick={setShowImport}><ArrowDownToLine size={15} />导入账号</button><button className="button primary" onClick={addAccount}><Plus size={15} />新增账号</button></div></div>
       {(batchAcquire?.loading || batchResult) && <div className={`batch-operation ${batchResult?.error ? 'failed' : batchAcquire?.loading ? 'running' : 'complete'}`}><div className="batch-operation-icon">{batchAcquire?.loading ? <RefreshCw size={16} /> : batchResult?.error ? <AlertTriangle size={16} /> : <CheckCircle2 size={16} />}</div><div><strong>{batchAcquire?.loading ? `正在按 ${concurrency} 并发获取 Free JSON` : batchResult?.error ? '批量获取失败' : '批量获取已完成'}</strong><span>{batchAcquire?.loading ? `待处理 ${batchResult?.totalMissing || missingJsonCount} 个缺少 JSON 的账号` : batchResult?.error || `成功 ${batchResult?.acquired || 0} 个 · 失败 ${batchResult?.failed || 0} 个 · 跳过 ${batchResult?.skipped || 0} 个 · 并发 ${batchResult?.concurrency || concurrency}`}</span></div></div>}
-      <div className="filter-row"><div className="search-box"><ListFilter size={16} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索邮箱、账号或 Team" /></div><div className="segmented compact-segmented">{[['all', '全部'], ['free', '未加入'], ['team', '已加入'], ['cooldown', '冷却']].map(([id, label]) => <button key={id} className={filter === id ? 'selected' : ''} onClick={() => setFilter(id)}>{label}</button>)}</div><span className="result-count">显示 {visible.length} / {allChildren.length}</span></div>
-      <div className="table-wrap"><table className="data-table account-table"><thead><tr><th>账号</th><th>状态</th><th>登录凭据</th><th>当前 Team</th><th>加入过的 Team</th><th>Sub2API</th><th /></tr></thead><tbody>{visible.map((account) => { const joinedTeams = joinedTeamsFor(account); const activeTeams = joinedTeams.filter((entry) => entry.status === 'active'); const historyTeams = joinedTeams.filter((entry) => entry.status !== 'active'); const acquireState = acquireStates?.[account.id]; return <tr key={account.id}><td><div className="account-cell"><div className="queue-avatar">{(account.email || '?')[0].toUpperCase()}</div><div><strong>{account.email || '未设置邮箱'}</strong><small className="mono">{account.id} · {account.plan || '未检测'}</small></div></div></td><td><StatusBadge status={account.status} /></td><td><div className="account-credential-cell"><CredentialState account={account} /><AcquireStatus state={acquireState} /></div></td><td>{activeTeams.length ? <div className="team-tags">{activeTeams.map((entry) => <span key={entry.team}>{teamNameForId(mothers, entry.team)}</span>)}</div> : <span className="muted">Free 池</span>}</td><td><div className="team-history-cell"><strong>{joinedTeams.length} 个空间</strong>{historyTeams.slice(-3).map((entry) => <small key={`${entry.team}-${entry.removedAt || entry.cooldownAt || entry.joinedAt}`}>{teamNameForId(mothers, entry.team)} · {entry.status === 'kicked' ? '已移出' : entry.status === 'cooldown' ? '冷却中' : '历史'}{entry.retryAfter ? ` · ${teamRetryLabel(entry)}` : entry.status === 'cooldown' ? ' · 等待额度刷新' : ''}</small>)}</div></td><td><span className={`sub2api-state ${account.sub2apiStatus?.imported ? 'ready' : ''}`}>{account.sub2apiStatus?.imported ? '已记录' : '未记录'}</span>{account.sub2apiStatus?.exportable && <small>可导出</small>}</td><td><div className="row-actions"><button className="icon-button small" title="获取 Free JSON" onClick={() => acquireAccount(account.id, 'free-json')} disabled={Boolean(acquireState?.loading)}><CloudDownload size={15} /></button><button className="icon-button small" title="刷新 AT" onClick={() => acquireAccount(account.id, 'refresh-at')} disabled={Boolean(acquireState?.loading)}><RefreshCw size={15} /></button><button className="icon-button small" title="编辑账号" onClick={() => editAccount(account)}><Settings2 size={15} /></button><button className="icon-button small" title="导入 Free Sub2API JSON" aria-label="导入 Free Sub2API JSON" onClick={() => openJsonImport(account.id)}><FileText size={15} /></button><button className="icon-button small" title="移出当前 Team" aria-label="移出当前 Team" onClick={() => removeChild(account.id)} disabled={!account.team}><UserMinus size={15} /></button><button className="icon-button small danger-hover" title="删除 Free 账号" aria-label="删除 Free 账号" onClick={() => deleteFreeAccount(account.id)}><Trash2 size={15} /></button></div></td></tr>; })}</tbody></table></div>{!visible.length && <div className="empty-state compact-empty"><UserRound size={26} /><strong>没有匹配的账号</strong><span>导入账号后会显示在这里。</span></div>}</section>
+      <div className="filter-row"><div className="search-box"><ListFilter size={16} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索邮箱、账号或 Team" /></div><div className="segmented compact-segmented">{[['all', '全部'], ['free', '未加入'], ['team', '已加入'], ['cooldown', '冷却'], ['banned', '封禁']].map(([id, label]) => <button key={id} className={filter === id ? 'selected' : ''} onClick={() => setFilter(id)}>{label}</button>)}</div><span className="result-count">显示 {visible.length} / {allChildren.length}</span></div>
+      <div className="table-wrap"><table className="data-table account-table"><thead><tr><th>账号</th><th>状态</th><th>登录凭据</th><th>当前 Team</th><th>加入过的 Team</th><th>Sub2API</th><th /></tr></thead><tbody>{visible.map((account) => { const joinedTeams = joinedTeamsFor(account); const activeTeams = joinedTeams.filter((entry) => entry.status === 'active'); const historyTeams = joinedTeams.filter((entry) => entry.status !== 'active'); const acquireState = acquireStates?.[account.id]; const banned = isBanned(account); return <tr className={banned ? 'banned-account-row' : ''} key={account.id}><td><div className="account-cell"><div className="queue-avatar">{(account.email || '?')[0].toUpperCase()}</div><div><strong>{account.email || '未设置邮箱'}</strong><small className="mono">{account.id} · {account.plan || '未检测'}</small>{banned && <small className="ban-reason" title={account.banReason || ''}>{account.banReason || 'OpenAI 账号已停用'}{account.bannedAt ? ` · ${displayTime(account.bannedAt)}` : ''}</small>}</div></div></td><td><StatusBadge status={banned ? 'banned' : account.status} /></td><td><div className="account-credential-cell"><CredentialState account={account} /><AcquireStatus state={acquireState} /></div></td><td>{activeTeams.length ? <div className="team-tags">{activeTeams.map((entry) => <span key={entry.team}>{teamNameForId(mothers, entry.team)}</span>)}</div> : <span className="muted">Free 池</span>}</td><td><div className="team-history-cell"><strong>{joinedTeams.length} 个空间</strong>{historyTeams.slice(-3).map((entry) => <small key={`${entry.team}-${entry.removedAt || entry.cooldownAt || entry.joinedAt}`}>{teamNameForId(mothers, entry.team)} · {entry.status === 'kicked' ? '已移出' : entry.status === 'cooldown' ? '冷却中' : '历史'}{entry.reason === 'account_banned' ? ' · 封禁' : entry.retryAfter ? ` · ${teamRetryLabel(entry)}` : entry.status === 'cooldown' ? ' · 等待额度刷新' : ''}</small>)}</div></td><td><span className={`sub2api-state ${account.sub2apiStatus?.imported ? 'ready' : ''}`}>{account.sub2apiStatus?.imported ? '已记录' : '未记录'}</span>{account.sub2apiStatus?.exportable && <small>可导出</small>}</td><td><div className="row-actions"><button className="icon-button small" title={banned ? '封禁账号不能再获取 Free JSON' : '获取 Free JSON'} onClick={() => acquireAccount(account.id, 'free-json')} disabled={banned || Boolean(acquireState?.loading)}><CloudDownload size={15} /></button><button className="icon-button small" title={banned ? '封禁账号不能再刷新 AT' : '刷新 AT'} onClick={() => acquireAccount(account.id, 'refresh-at')} disabled={banned || Boolean(acquireState?.loading)}><RefreshCw size={15} /></button><button className="icon-button small" title="编辑账号" onClick={() => editAccount(account)}><Settings2 size={15} /></button><button className="icon-button small" title={banned ? '封禁账号不能再导入凭据' : '导入 Free Sub2API JSON'} aria-label="导入 Free Sub2API JSON" onClick={() => openJsonImport(account.id)} disabled={banned}><FileText size={15} /></button><button className="icon-button small" title="移出当前 Team" aria-label="移出当前 Team" onClick={() => removeChild(account.id)} disabled={!account.team}><UserMinus size={15} /></button><button className="icon-button small danger-hover" title="删除 Free 账号" aria-label="删除 Free 账号" onClick={() => deleteFreeAccount(account.id)}><Trash2 size={15} /></button></div></td></tr>; })}</tbody></table></div>{!visible.length && <div className="empty-state compact-empty"><UserRound size={26} /><strong>没有匹配的账号</strong><span>导入账号后会显示在这里。</span></div>}</section>
   </section>;
 }
 
@@ -1104,7 +1196,7 @@ function Metric({ label, value, detail, icon: Icon, tone }) { return <div classN
 
 function MothersView({ mothers, setShowMother, setShowImport }) { return <section className="content-panel"><div className="content-toolbar"><div><h2>母号与空间</h2><p>管理用于检测额度、发送邀请和补位的 Team 母号。</p></div><div className="toolbar-actions"><button className="button ghost" onClick={setShowImport}><ArrowDownToLine size={15} />导入 JSON</button><button className="button primary" onClick={() => setShowMother()}><Plus size={15} />添加母号</button></div></div><div className="mother-grid">{mothers.map((mother) => <article className="mother-card" key={mother.id}><div className="card-top"><div className="mother-avatar"><KeyRound size={18} /></div><span className={`status-chip ${mother.status || 'unconfigured'}`}><i />{mother.status === 'online' ? '在线' : mother.status === 'offline' ? '离线' : '未检测'}</span></div><h3>{mother.name || '未命名母号'}</h3><p className="mono">{mother.email || '未设置邮箱'}</p><div className="space-line"><span>{teamDisplayName(mother)}</span><strong>{Number.isFinite(Number(mother.used)) && Number.isFinite(Number(mother.seats)) ? `${mother.used} / ${mother.seats} 席位` : '席位未检测'}</strong></div><div className="seat-bar"><i style={{ width: `${mother.seats ? Math.min(100, Number(mother.used || 0) / Number(mother.seats) * 100) : 0}%` }} /></div><div className="card-meta"><span>上次检测 {mother.lastCheck || '未检测'}</span><button className="text-button" onClick={() => setShowMother(mother)}>编辑 <ArrowUpRight size={14} /></button></div></article>)}<button className="add-card" onClick={() => setShowMother()}><Plus size={20} /><strong>添加母号</strong><span>连接新的 Team 空间</span></button></div><div className="subsection"><div className="subsection-title"><div><h3>空间状态</h3><p>每个空间的席位和加入记录</p></div><button className="button ghost"><ListFilter size={15} />筛选</button></div><table className="data-table"><thead><tr><th>空间</th><th>母号</th><th>席位</th><th>最后同步</th><th>状态</th><th /></tr></thead><tbody>{mothers.map((mother) => <tr key={mother.id}><td><strong>{teamDisplayName(mother)}</strong></td><td className="mono">{mother.email || '未设置'}</td><td><div className="table-seats"><span>{Number.isFinite(Number(mother.used)) && Number.isFinite(Number(mother.seats)) ? `${mother.used}/${mother.seats}` : '--'}</span><i><b style={{ width: `${mother.seats ? Math.min(100, Number(mother.used || 0) / Number(mother.seats) * 100) : 0}%` }} /></i></div></td><td>{mother.lastCheck || '未检测'}</td><td><span className={`status-chip ${mother.status || 'unconfigured'}`}><i />{mother.status === 'online' ? '正常' : '未检测'}</span></td><td><button className="icon-button small" title="更多"><MoreHorizontal size={16} /></button></td></tr>)}</tbody></table></div></section>; }
 
-function StatusBadge({ status }) { const labels = { active: '使用中', warning: '额度偏低', exhausted: '已耗尽', cooldown: '冷却中', ready: '待加入', kicked: '已移出', unconfigured: '待配置', offline: '离线', login_pending: '等待验证', login_required: '需要重新登录', phone_verification_required: '需要手机号接码' }; return <span className={`status-chip ${status || 'unconfigured'}`}><i />{labels[status] || '未检测'}</span>; }
+function StatusBadge({ status }) { const labels = { active: '使用中', warning: '额度偏低', exhausted: '已耗尽', cooldown: '冷却中', ready: '待加入', kicked: '已移出', banned: '已封禁', unconfigured: '待配置', offline: '离线', login_pending: '等待验证', login_required: '需要重新登录', phone_verification_required: '需要手机号接码' }; return <span className={`status-chip ${status || 'unconfigured'}`}><i />{labels[status] || '未检测'}</span>; }
 function QuotaBar({ value }) { const numeric = Number(value); const known = Number.isFinite(numeric); const tone = numeric === 0 ? 'red' : numeric <= 10 ? 'amber' : 'green'; return <div className="quota-cell"><span>{known ? `${numeric}%` : '--'}</span><i className={known ? tone : 'muted'}><b style={{ width: `${known ? Math.max(0, Math.min(100, numeric)) : 0}%` }} /></i></div>; }
 function HistoryView({ history, page, pageSize, meta, loading, error, onPageChange, onPageSizeChange, onRetry }) {
   const total = Math.max(0, Number(meta?.total) || 0);
@@ -1132,9 +1224,10 @@ function HistoryView({ history, page, pageSize, meta, loading, error, onPageChan
   </section>;
 }
 function SettingsView({ autoRefill, setAutoRefill, promoteJoinedAccounts, setPromoteJoinedAccounts, threshold, setThreshold, checkInterval, setCheckInterval, concurrency, setConcurrency, kickWindow, setKickWindow, integrations, openIntegration, proxy, openProxy, saveSettings }) {
-  const sub2apiGroupIdSet = Number.isFinite(Number(integrations.sub2api.groupId)) && Number(integrations.sub2api.groupId) > 0;
-  const sub2apiReady = integrations.sub2api.enabled && integrations.sub2api.baseUrl && integrations.sub2api.apiKeySet && (sub2apiGroupIdSet || String(integrations.sub2api.groupName || '').trim());
-  const sub2apiTarget = integrations.sub2api.groupName || (integrations.sub2api.groupId ? `分组 ${integrations.sub2api.groupId}` : '未指定同步分组');
+  const sub2apis = integrations.sub2apis?.length ? integrations.sub2apis : [integrations.sub2api || defaultSub2Api];
+  const readySub2Apis = sub2apis.filter((item) => item.enabled && item.baseUrl && item.apiKeySet && ((Number.isFinite(Number(item.groupId)) && Number(item.groupId) > 0) || String(item.groupName || '').trim()));
+  const sub2apiReady = readySub2Apis.length > 0;
+  const sub2apiTarget = `${readySub2Apis.length} / ${sub2apis.length} 个连接可用`;
   const mailboxReady = integrations.mailbox.enabled && (integrations.mailbox.endpoint || integrations.mailbox.apiKeySet || integrations.mailbox.apiKey);
   const proxyReady = proxy?.enabled && proxy?.entries?.length;
   return <section className="settings-layout">
@@ -1150,11 +1243,11 @@ function SettingsView({ autoRefill, setAutoRefill, promoteJoinedAccounts, setPro
     </section>
     <section className="content-panel integration-panel">
       <div className="content-toolbar"><div><h2>集成与导出</h2><p>连接后可将已获取 AT 的账号推送到指定 Sub2API 分组。</p></div></div>
-      <div className="integration-item"><div className="integration-logo sub2api">S2</div><div><strong>Sub2API</strong><span>{sub2apiTarget}</span></div><span className="connected">{sub2apiReady ? '已配置' : '未配置'}</span><button className="button ghost" onClick={() => openIntegration('sub2api')}>配置</button></div>
+      <div className="integration-item"><div className="integration-logo sub2api">S2</div><div><strong>Sub2API</strong><span>{sub2apiTarget}</span></div><span className="connected">{sub2apiReady ? '已配置' : '未配置'}</span><button className="button ghost" onClick={() => openIntegration('sub2api')}>管理</button></div>
       <div className="integration-item"><div className="integration-logo mail"><Mail size={16} /></div><div><strong>邮箱 / 接码</strong><span>登录时获取邮箱或短信验证码</span></div><span className="connected">{mailboxReady ? '已配置' : '未配置'}</span><button className="button ghost" onClick={() => openIntegration('mailbox')}>配置</button></div>
       <div className="integration-item proxy-integration-item"><div className="integration-logo proxy"><SlidersHorizontal size={16} /></div><div><strong>代理池</strong><span>{proxy?.entries?.length ? `${proxy.entries.length} 条代理 · ${proxy.strategy === 'round_robin' ? '轮询' : '故障切换'}` : 'Team、账号和 Sub2API 请求统一经过代理'}</span></div><span className="connected">{proxyReady ? '已启用' : proxy?.entries?.length ? '未启用' : '未配置'}</span><button className="button ghost" onClick={openProxy}>配置</button></div>
       <div className="integration-note"><CircleHelp size={15} /><span>代理超时或网络错误会自动切换池中下一条代理；关闭代理池时才会直连。</span></div>
-      <div className="integration-note"><CircleHelp size={15} /><span>Sub2API 必须指定目标分组才允许推送；邮箱 / 接码只负责取登录验证码，不参与额度查询。</span></div>
+      <div className="integration-note"><CircleHelp size={15} /><span>每个 Team 可选择一个 Sub2API 连接；未选择时使用列表中的第一个。</span></div>
     </section>
   </section>;
 }
@@ -1219,23 +1312,93 @@ function AgentAccessModal({ onClose, notify }) {
   </Modal>;
 }
 
-function AccountModal({ account, onClose, onSave, onSaveAndAcquire, onAcquire, onImportSub2Api, acquireState }) {
+function AccountModal({ account, onClose, onSave, onSaveAndAcquire, onAcquire, acquireState }) {
   const [form, setForm] = useState(() => ({ email: account?.email || '', password: '', totp: '', mailboxUrl: account?.mailboxUrl || '' }));
   const [sub2apiJson, setSub2apiJson] = useState('');
-  const [importingSub2apiJson, setImportingSub2apiJson] = useState(false);
+  const [saving, setSaving] = useState(false);
   const update = (key, value) => setForm((current) => ({ ...current, [key]: value }));
   const busy = Boolean(acquireState?.loading);
-  async function submitSub2ApiJson() {
-    if (!account?.id || !sub2apiJson.trim() || importingSub2apiJson) return;
-    setImportingSub2apiJson(true);
-    try { if (await onImportSub2Api(account.id, sub2apiJson)) onClose(); } finally { setImportingSub2apiJson(false); }
+  async function submit() {
+    if (saving) return;
+    setSaving(true);
+    try { await onSave(form, sub2apiJson); } finally { setSaving(false); }
   }
   return <Modal title={account ? '编辑账号记录' : '新增 Free 账号'} onClose={onClose}>
-    <div className="modal-intro">填写邮箱、密码和 2FA Secret 后保存账号，再点击“获取 Free JSON”。系统会自动登录并保存 AT、RT。</div>
-    <div className="form-grid"><label className="wide"><span>登录邮箱</span><input value={form.email} onChange={(event) => update('email', event.target.value)} placeholder="name@example.com" /></label><label><span>密码</span><input type="password" value={form.password} onChange={(event) => update('password', event.target.value)} placeholder="账号密码" /></label><label><span>2FA Secret</span><input type="password" value={form.totp} onChange={(event) => update('totp', event.target.value)} placeholder="可选，Base32 Secret" /></label><label className="wide"><span>邮箱 / 接码地址</span><input value={form.mailboxUrl} onChange={(event) => update('mailboxUrl', event.target.value)} placeholder="可选；支持 {email} 占位符" /></label></div>
-    <div className="account-acquire-panel"><div className="account-acquire-copy"><strong>Free JSON 获取</strong><span>已有 Sub2API refresh token 时直接刷新 AT；RT 失效时使用邮箱、密码和 2FA 完成无头 OAuth 登录。</span><AcquireStatus state={acquireState} /></div><div className="account-acquire-actions"><button className="button ghost compact-button" disabled={!account?.id || busy} onClick={() => onAcquire(account.id, 'free-json', form)}><CloudDownload size={14} />获取 Free JSON</button><button className="button secondary compact-button" disabled={!account?.id || busy} onClick={() => onAcquire(account.id, 'refresh-at', form)}><RefreshCw size={14} />刷新 AT</button></div></div>
-    {account && <><div className="modal-intro">可直接粘贴该 Free 账号完整的 Sub2API JSON。提交后会保存 AT、RT 及相关凭据，不能录入 Team JSON。</div><textarea className="import-area" aria-label="Sub2API JSON" value={sub2apiJson} onChange={(event) => setSub2apiJson(event.target.value)} placeholder={'粘贴完整 Sub2API JSON，例如：\n{\n  "credentials": { ... }\n}'} /></>}
-    <div className="modal-foot"><span className="muted">当前账号：{account?.email || '未设置'}</span><div className="modal-foot-actions">{account && <button className="button secondary" disabled={!sub2apiJson.trim() || importingSub2apiJson} onClick={submitSub2ApiJson}><FileText size={15} />{importingSub2apiJson ? '录入中' : '录入 Sub2API JSON'}</button>}{!account && <button className="button ghost" onClick={() => onSaveAndAcquire(form)}><CloudDownload size={14} />保存并获取 JSON</button>}<button className="button primary" onClick={() => onSave(form)}><Check size={15} />保存账号</button></div></div>
+    <div className="modal-intro">填写已完成手机号验证的 Free 账号邮箱、密码和 2FA Secret。获取 JSON 时会完成 Codex OAuth，并选择 Free 或目标 Team 空间。</div>
+    <div className="form-grid"><label className="wide"><span>登录邮箱</span><input value={form.email} onChange={(event) => update('email', event.target.value)} placeholder="name@example.com" /></label><label><span>密码</span><input type="password" value={form.password} onChange={(event) => update('password', event.target.value)} placeholder="账号密码" /></label><label><span>2FA Secret</span><input type="password" value={form.totp} onChange={(event) => update('totp', event.target.value)} placeholder="Base32 Secret" /></label><label className="wide"><span>邮箱验证码地址</span><input value={form.mailboxUrl} onChange={(event) => update('mailboxUrl', event.target.value)} placeholder="仅异常触发邮箱验证时使用；支持 {email} 占位符" /></label></div>
+    <div className="account-acquire-panel"><div className="account-acquire-copy"><strong>Free JSON 获取</strong><span>优先刷新已有 RT；重新登录时从默认 Sub2API 获取 OAuth 链接，选择 personal 空间并生成完整 JSON。</span><AcquireStatus state={acquireState} /></div><div className="account-acquire-actions"><button className="button ghost compact-button" disabled={!account?.id || busy} onClick={() => onAcquire(account.id, 'free-json', form)}><CloudDownload size={14} />获取 Free JSON</button><button className="button secondary compact-button" disabled={!account?.id || busy} onClick={() => onAcquire(account.id, 'refresh-at', form)}><RefreshCw size={14} />刷新 AT</button></div></div>
+    <div className="modal-intro">可直接粘贴该 Free 账号完整的 Sub2API JSON。提交后会保存 AT、RT 及相关凭据，不能录入 Team JSON。</div><textarea className="import-area" aria-label="Sub2API JSON" value={sub2apiJson} onChange={(event) => setSub2apiJson(event.target.value)} placeholder={'粘贴完整 Sub2API JSON，例如：\n{\n  "credentials": { ... }\n}'} />
+    <div className="modal-foot"><span className="muted">当前账号：{account?.email || form.email || '未设置'}</span><div className="modal-foot-actions">{!account && !sub2apiJson.trim() && <button className="button ghost" disabled={saving} onClick={() => onSaveAndAcquire(form)}><CloudDownload size={14} />保存并获取 JSON</button>}<button className="button primary" disabled={saving} onClick={submit}><Check size={15} />{saving ? '保存中' : sub2apiJson.trim() ? '保存账号和 JSON' : '保存账号'}</button></div></div>
+  </Modal>;
+}
+
+function Sub2ApiModal({ configs = [], mothers = [], onClose, onSave }) {
+  const initial = (configs.length ? configs : [defaultSub2Api]).map((item, index) => ({ ...defaultSub2Api, id: item.id || `sub2api_${Date.now()}_${index}`, name: item.name || `Sub2API ${index + 1}`, ...item, apiKey: '' }));
+  const [forms, setForms] = useState(initial);
+  const [selectedId, setSelectedId] = useState(initial[0].id);
+  const [groupOptions, setGroupOptions] = useState([]);
+  const [groupLoading, setGroupLoading] = useState(false);
+  const [groupError, setGroupError] = useState('');
+  const selected = forms.find((item) => item.id === selectedId) || forms[0];
+  const update = (key, value) => setForms((current) => current.map((item) => item.id === selected.id ? { ...item, [key]: value } : item));
+
+  useEffect(() => {
+    setGroupOptions([]);
+    setGroupError('');
+    if (!selected?.baseUrl || !selected?.apiKeySet) return undefined;
+    let cancelled = false;
+    setGroupLoading(true);
+    apiRequest(`/api/integrations/sub2api/groups?integrationId=${encodeURIComponent(selected.id)}`).then((payload) => {
+      if (!cancelled) {
+        if (payload.ok) setGroupOptions(Array.isArray(payload.groups) ? payload.groups : []);
+        else setGroupError('无法读取分组，请手动填写名称或 ID');
+      }
+    }).catch(() => { if (!cancelled) setGroupError('无法读取分组，请手动填写名称或 ID'); }).finally(() => { if (!cancelled) setGroupLoading(false); });
+    return () => { cancelled = true; };
+  }, [selected?.id, selected?.baseUrl, selected?.apiKeySet]);
+
+  function addConfig() {
+    const id = `sub2api_${Date.now()}`;
+    setForms((current) => [...current, { ...defaultSub2Api, id, name: `Sub2API ${current.length + 1}` }]);
+    setSelectedId(id);
+  }
+
+  function removeConfig(id) {
+    if (forms.length <= 1 || mothers.some((mother) => mother.sub2apiIntegrationId === id)) return;
+    const next = forms.filter((item) => item.id !== id);
+    setForms(next);
+    if (selectedId === id) setSelectedId(next[0].id);
+  }
+
+  function submit() {
+    const next = forms.map((item, index) => {
+      const config = {
+        ...item,
+        name: String(item.name || `Sub2API ${index + 1}`).trim(),
+        baseUrl: String(item.baseUrl || '').trim(),
+        groupId: item.groupId === '' || item.groupId == null ? null : Number(item.groupId),
+        groupName: String(item.groupName || '').trim(),
+      };
+      if (!config.apiKey) delete config.apiKey;
+      return config;
+    });
+    onSave(next);
+  }
+
+  return <Modal title="管理 Sub2API 连接" onClose={onClose} className="sub2api-config-modal">
+    <div className="modal-intro">正常推送按“邮箱 + Team 空间 ID”查重，已存在即跳过；额度检测遇到 401 时，只更新远端已有的同账号 Team JSON，找不到时不会新增。</div>
+    <div className="sub2api-config-layout">
+      <aside className="sub2api-config-list"><div className="sub2api-config-list-head"><strong>连接</strong><button className="icon-button small" title="新增 Sub2API" onClick={addConfig}><Plus size={15} /></button></div>{forms.map((item, index) => { const referencedCount = mothers.filter((mother) => mother.sub2apiIntegrationId === item.id).length; return <div className={`sub2api-config-item ${item.id === selected?.id ? 'selected' : ''}`} key={item.id}><button onClick={() => setSelectedId(item.id)}><strong>{item.name || `Sub2API ${index + 1}`}</strong><span>{referencedCount ? `${referencedCount} 个 Team 正在使用` : item.baseUrl || '未配置地址'}</span></button><button className="icon-button small danger-hover" title={referencedCount ? '请先将关联 Team 切换到其他连接' : '删除连接'} disabled={forms.length <= 1 || referencedCount > 0} onClick={() => removeConfig(item.id)}><Trash2 size={14} /></button></div>; })}</aside>
+      {selected && <div className="form-grid integration-form sub2api-config-form">
+        <label className="wide"><span>连接名称</span><input value={selected.name || ''} onChange={(event) => update('name', event.target.value)} placeholder="例如：主 Sub2API" /></label>
+        <label className="wide"><span>服务地址</span><input value={selected.baseUrl || ''} onChange={(event) => update('baseUrl', event.target.value)} placeholder="https://sub2api.example.com" /></label>
+        <label><span>同步分组名称</span><input value={selected.groupName || ''} onChange={(event) => { const value = event.target.value; const option = groupOptions.find((item) => item.name.toLocaleLowerCase() === value.trim().toLocaleLowerCase()); update('groupName', value); update('groupId', option ? option.id : ''); }} placeholder="例如：团队账号" /><small className="field-hint integration-group-hint">{groupLoading ? '正在读取分组...' : groupError || '可填写名称，推送时精确匹配'}</small></label>
+        <label><span>分组 ID（可选）</span>{groupOptions.length ? <select className="select-control integration-group-select" value={selected.groupId ?? ''} onChange={(event) => { const option = groupOptions.find((item) => String(item.id) === event.target.value); update('groupId', event.target.value); update('groupName', option?.name || ''); }}><option value="">按名称匹配</option>{groupOptions.map((group) => <option value={group.id} key={group.id}>{group.name}（#{group.id}）</option>)}</select> : <input type="number" min="1" value={selected.groupId ?? ''} onChange={(event) => update('groupId', event.target.value)} placeholder="留空则按名称匹配" />}</label>
+        <label className="wide"><span>API Key / Token{selected.apiKeySet && <small className="field-hint">已保存，留空保持不变</small>}</span><input type="password" value={selected.apiKey || ''} onChange={(event) => update('apiKey', event.target.value)} placeholder={selected.apiKeySet ? '留空保持现有密钥' : '输入 API Key'} /></label>
+        <label className="integration-enabled"><span>启用此连接</span><Toggle checked={selected.enabled === true} onChange={(value) => update('enabled', value)} /></label>
+      </div>}
+    </div>
+    <div className="modal-foot"><span className="muted">列表第一项是未指定 Team 的默认连接。</span><button className="button primary" onClick={submit}><Check size={15} />保存连接</button></div>
   </Modal>;
 }
 
@@ -1279,23 +1442,27 @@ function IntegrationModal({ type, config = {}, onClose, onSave }) {
   </Modal>;
 }
 
-function MotherModal({ mother, onClose, onSave }) {
+function MotherModal({ mother, sub2apis = [], onClose, onSave }) {
+  const defaultSub2apiId = sub2apis[0]?.id || 'sub2api_default';
   const [form, setForm] = useState(() => mother
-    ? { ...mother, token: '', teamName: mother.teamName || mother.displayName || '', primaryOwnerEmail: mother.primaryOwnerEmail || mother.email || '' }
-    : { id: `mother_${Date.now()}`, email: '', name: '', team: '', teamName: '', accountId: '', rotationMode: 'fixed', primaryOwnerEmail: '', seats: 0, used: 0, status: 'unconfigured', lastCheck: null, token: '' });
+    ? { ...mother, token: '', teamName: mother.teamName || mother.displayName || '', primaryOwnerEmail: mother.primaryOwnerEmail || mother.email || '', sub2apiIntegrationId: mother.sub2apiIntegrationId || defaultSub2apiId }
+    : { id: `mother_${Date.now()}`, email: '', name: '', team: '', teamName: '', accountId: '', rotationMode: 'fixed', dailyRotationLimit: 3, primaryOwnerEmail: '', sub2apiIntegrationId: defaultSub2apiId, seats: 0, used: 0, status: 'unconfigured', lastCheck: null, token: '' });
   const update = (key, value) => setForm((current) => ({ ...current, [key]: value }));
   const ownerOptions = [...[{ email: form.email, name: form.name, userId: form.chatgptUserId }], ...(mother?.ownerAccounts || [])]
     .filter((owner) => owner?.email)
     .filter((owner, index, list) => list.findIndex((item) => item.email.toLowerCase() === owner.email.toLowerCase()) === index);
+  const selectedSub2ApiMissing = Boolean(form.sub2apiIntegrationId && !sub2apis.some((item) => item.id === form.sub2apiIntegrationId));
   return <Modal title={mother ? '编辑 Team' : '添加 Team'} onClose={onClose}><div className="form-grid">
     <label><span>所有者名称</span><input value={form.name || ''} onChange={(event) => update('name', event.target.value)} placeholder="Team 所有者" /></label>
     <label><span>所有者邮箱</span><input value={form.email || ''} onChange={(event) => update('email', event.target.value)} placeholder="owner@example.com" /></label>
     <label className="wide"><span>Team 显示名称</span><input value={form.teamName || ''} onChange={(event) => update('teamName', event.target.value)} placeholder="例如：研发 Team" /></label>
     <label className="wide"><span>Team ID（accountId / team）</span><input value={form.accountId || form.team || ''} onChange={(event) => { update('accountId', event.target.value); update('team', event.target.value); }} placeholder="chatgpt_account_id" /></label>
+    <label className="wide"><span>目标 Sub2API</span><select className="select-control" value={form.sub2apiIntegrationId || defaultSub2apiId} onChange={(event) => update('sub2apiIntegrationId', event.target.value)}>{selectedSub2ApiMissing && <option value={form.sub2apiIntegrationId}>原连接已删除，请重新选择</option>}{sub2apis.length ? sub2apis.map((item, index) => <option value={item.id} key={item.id}>{item.name || `Sub2API ${index + 1}`}{item.enabled ? '' : '（未启用）'}</option>) : <option value={defaultSub2apiId}>默认 Sub2API（未配置）</option>}</select><small className="field-hint">首次加入和 401 修复都会同步到此连接；未选择时使用第一项。</small></label>
     <label><span>轮转方式</span><div className="segmented modal-segmented">{[['fixed', '固定主号'], ['rotating', '不固定主号']].map(([id, label]) => <button type="button" key={id} className={(form.rotationMode || 'fixed') === id ? 'selected' : ''} onClick={() => { update('rotationMode', id); if (id === 'fixed' && !form.primaryOwnerEmail) update('primaryOwnerEmail', form.email || ''); }}>{label}</button>)}</div></label>
     <label className="wide"><span>固定主号（不会被踢）</span><select className="select-control" disabled={(form.rotationMode || 'fixed') === 'rotating' || !ownerOptions.length} value={form.primaryOwnerEmail || form.email || ''} onChange={(event) => update('primaryOwnerEmail', event.target.value)}>{ownerOptions.length ? ownerOptions.map((owner) => <option value={owner.email} key={owner.email}>{owner.name ? `${owner.name} · ${owner.email}` : owner.email}</option>) : <option value="">先填写所有者邮箱</option>}</select><small className="field-hint">{form.rotationMode === 'rotating' ? '不固定主号模式下，所有者都可以轮转' : '固定模式下仅此账号不会被自动移出'}</small></label>
     <label><span>所有者 Access Token</span><input type="password" value={form.token || ''} onChange={(event) => update('token', event.target.value)} placeholder={mother ? '留空保持现有 AT' : '粘贴所有者 AT'} /></label>
     <label><span>席位上限</span><input type="number" min="0" max="100" value={form.seats ?? 0} onChange={(event) => update('seats', Number(event.target.value))} /></label>
+    <label><span>每日轮转账号上限</span><input type="number" min="1" max="100" value={form.dailyRotationLimit ?? 3} onChange={(event) => update('dailyRotationLimit', Math.min(100, Math.max(1, Number(event.target.value) || 3)))} /><small className="field-hint">按 Team 独立统计，次日自动归零</small></label>
   </div><div className="modal-foot"><span className="muted">所有者凭据用于检测 Team、发送邀请和补位。</span><button className="button primary" onClick={() => onSave(form)}><Check size={15} />保存 Team</button></div></Modal>;
 }
 function SettingsModal({ onClose }) { return <Modal title="快速设置" onClose={onClose}><div className="quick-setting"><Activity size={18} /><div><strong>实时监控</strong><span>每 60 秒检测一次子号额度</span></div><Toggle checked onChange={() => {}} /></div><div className="quick-setting"><ShieldCheck size={18} /><div><strong>加入前验证</strong><span>获取 AT 后先检测可用性再进入 Team</span></div><Toggle checked onChange={() => {}} /></div></Modal>; }

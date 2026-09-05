@@ -186,6 +186,21 @@ function responseErrorCode(payload, body = '') {
   return '';
 }
 
+function responseErrorMessage(payload, body = '', fallback = '') {
+  const candidates = [
+    payload?.error?.message,
+    payload?.error_description,
+    payload?.detail,
+    payload?.message,
+    typeof payload?.error === 'string' ? payload.error : '',
+    payload?.error?.code,
+  ];
+  const direct = candidates.map(string).find(Boolean);
+  if (direct) return direct;
+  const raw = string(body).trim();
+  return raw && raw.length <= 500 ? raw : fallback;
+}
+
 function classifyChallenge(url, body = '', status = 0) {
   let path = '';
   try { path = new URL(url, AUTH_BASE_URL).pathname.toLowerCase(); } catch { path = string(url).toLowerCase(); }
@@ -265,6 +280,22 @@ function workspaceIdFromCookie(value, preferredId = '', mode = 'free') {
   return string(workspaces.find((item) => item?.kind === 'personal')?.id || workspaces[0]?.id);
 }
 
+function authorizationFromInput(input = {}) {
+  if (!input || typeof input !== 'object') return null;
+  const authUrl = string(input.authUrl || input.auth_url || input.url);
+  if (!authUrl) return null;
+  let parsed = null;
+  try { parsed = new URL(authUrl); } catch { parsed = null; }
+  return {
+    source: string(input.source) || 'external',
+    providerId: string(input.providerId || input.provider_id),
+    authUrl,
+    sessionId: string(input.sessionId || input.session_id),
+    state: string(input.state) || string(parsed?.searchParams.get('state')),
+    redirectUri: string(input.redirectUri || input.redirect_uri) || string(parsed?.searchParams.get('redirect_uri')) || DEFAULT_REDIRECT_URI,
+  };
+}
+
 function sessionFromInput(input = {}) {
   const session = input && typeof input === 'object' ? input : {};
   return {
@@ -275,6 +306,7 @@ function sessionFromInput(input = {}) {
     deviceId: string(session.deviceId) || randomUUID(),
     cookies: session.cookies && typeof session.cookies === 'object' ? session.cookies : {},
     baselineMailbox: session.baselineMailbox && typeof session.baselineMailbox === 'object' ? session.baselineMailbox : null,
+    authorization: authorizationFromInput(session.authorization),
     attempts: Number(session.attempts) || 0,
   };
 }
@@ -288,6 +320,7 @@ function publicSession(session) {
     deviceId: session.deviceId,
     cookies: session.cookies,
     baselineMailbox: session.baselineMailbox,
+    authorization: session.authorization,
     attempts: session.attempts,
   };
 }
@@ -330,6 +363,8 @@ class LoginRunner {
     this.mailboxHeaders = options.mailboxHeaders && typeof options.mailboxHeaders === 'object' ? options.mailboxHeaders : {};
     this.timeoutMs = Number(options.timeoutMs) || 15000;
     this.onProgress = typeof options.onProgress === 'function' ? options.onProgress : () => {};
+    this.authorizationProvider = typeof options.authorizationProvider === 'function' ? options.authorizationProvider : null;
+    this.callbackHandler = typeof options.callbackHandler === 'function' ? options.callbackHandler : null;
     this.session = sessionFromInput(options.session);
     this.jar = createCookieJar(this.session.cookies);
     this.phase = this.session.phase || 'initializing';
@@ -383,6 +418,30 @@ class LoginRunner {
     return `${AUTH_BASE_URL}/oauth/authorize?${query.toString()}`;
   }
 
+  currentAuthorizationUrl() {
+    if (this.session.authorization?.authUrl) return this.session.authorization.authUrl;
+    return this.authorizationProvider ? '' : this.authorizeUrl();
+  }
+
+  async prepareAuthorization() {
+    if (this.session.authorization?.authUrl) return this.session.authorization.authUrl;
+    if (!this.authorizationProvider) return this.authorizeUrl();
+    this.progress('oauth_link', '正在从 Sub2API 获取 OAuth 授权链接');
+    let provided;
+    try {
+      provided = authorizationFromInput(await this.authorizationProvider());
+    } catch (error) {
+      throw new OpenAiLoginError(error?.code || 'oauth_provider_failed', error?.message || 'Sub2API OAuth 授权链接获取失败', error?.status || 502);
+    }
+    if (!provided?.authUrl || !provided.state || !provided.sessionId) {
+      throw new OpenAiLoginError('oauth_provider_response_invalid', 'Sub2API OAuth 授权响应缺少 auth_url、state 或 session_id', 502);
+    }
+    this.session.authorization = provided;
+    this.session.state = provided.state;
+    this.session.codeVerifier = '';
+    return provided.authUrl;
+  }
+
   async startAuthorization({ fresh = false } = {}) {
     if (fresh) {
       this.session.state = '';
@@ -390,10 +449,11 @@ class LoginRunner {
       this.session.currentUrl = '';
       this.session.cookies = {};
       this.session.baselineMailbox = null;
+      this.session.authorization = null;
       this.callbackUrl = '';
       this.jar = createCookieJar();
     }
-    let current = this.authorizeUrl();
+    let current = await this.prepareAuthorization();
     for (let hop = 0; hop < 8; hop += 1) {
       if (isCallback(current)) return current;
       const result = await this.request(current, {
@@ -406,7 +466,7 @@ class LoginRunner {
         },
       });
       this.session.deviceId = this.jar.get('oai-did') || this.session.deviceId;
-      if (result.status >= 400) throw new OpenAiLoginError('oauth_start_failed', `OAuth 会话创建失败（HTTP ${result.status}）`, result.status);
+      if (result.status >= 400) throw new OpenAiLoginError('oauth_start_failed', responseErrorMessage(result.payload, result.text, `OAuth 会话创建失败（HTTP ${result.status}）`), result.status);
       if (!result.location) return current;
       current = result.location;
     }
@@ -446,7 +506,7 @@ class LoginRunner {
         throw new OpenAiLoginError('authorize_state_invalid', 'OAuth 登录会话已失效', 409);
       }
       const challenge = classifyChallenge(result.location || '', result.text, result.status);
-      throw new OpenAiLoginError(challenge || 'authorize_failed', challenge ? '登录需要浏览器验证' : '登录邮箱提交失败', result.status || 502, { browserRequired: Boolean(challenge) });
+      throw new OpenAiLoginError(challenge || 'authorize_failed', challenge ? '登录需要浏览器验证' : responseErrorMessage(result.payload, result.text, '登录邮箱提交失败'), result.status || 502, { browserRequired: Boolean(challenge) });
     }
     return pageUrl(result.payload, result.location || `${AUTH_BASE_URL}/email-verification`);
   }
@@ -500,7 +560,7 @@ class LoginRunner {
     });
     if (!result.ok) {
       const challenge = classifyChallenge(result.location || '', result.text, result.status);
-      throw new OpenAiLoginError(challenge || 'password_invalid', challenge ? '密码登录触发协议验证' : '账号密码校验失败', result.status || 400, { needsInput: Boolean(challenge) });
+      throw new OpenAiLoginError(challenge || 'password_invalid', challenge ? '密码登录触发协议验证' : responseErrorMessage(result.payload, result.text, '账号密码校验失败'), result.status || 400, { needsInput: Boolean(challenge) });
     }
     return pageUrl(result.payload, result.location);
   }
@@ -513,7 +573,7 @@ class LoginRunner {
     });
     if (!result.ok) {
       const challenge = classifyChallenge(result.location || '', result.text, result.status);
-      throw new OpenAiLoginError(challenge || 'otp_send_failed', challenge ? '登录需要浏览器验证' : '无法发送邮箱验证码', result.status || 502, { browserRequired: Boolean(challenge) });
+      throw new OpenAiLoginError(challenge || 'otp_send_failed', challenge ? '登录需要浏览器验证' : responseErrorMessage(result.payload, result.text, '无法发送邮箱验证码'), result.status || 502, { browserRequired: Boolean(challenge) });
     }
     return pageUrl(result.payload, result.location || `${AUTH_BASE_URL}/email-verification`);
   }
@@ -524,7 +584,7 @@ class LoginRunner {
       headers: { 'content-type': 'application/json', origin: AUTH_BASE_URL, referer: `${AUTH_BASE_URL}/email-verification` },
       body: { code },
     });
-    if (!result.ok) throw new OpenAiLoginError('email_otp_invalid', '邮箱验证码无效或已过期', result.status || 400);
+    if (!result.ok) throw new OpenAiLoginError('email_otp_invalid', responseErrorMessage(result.payload, result.text, '邮箱验证码无效或已过期'), result.status || 400);
     return pageUrl(result.payload, result.location);
   }
 
@@ -545,7 +605,7 @@ class LoginRunner {
       body: { id: challengeId, type: 'totp', code },
     });
     if (result.ok) return pageUrl(result.payload, result.location || url);
-    throw new OpenAiLoginError('totp_invalid', '2FA 验证失败', result.status || 400);
+    throw new OpenAiLoginError('totp_invalid', responseErrorMessage(result.payload, result.text, '2FA 验证失败'), result.status || 400);
   }
 
   async selectWorkspace(url) {
@@ -584,7 +644,7 @@ class LoginRunner {
       this.progress('workspace', `空间选择暂时失败，正在重试（${attempt + 2}/3）`);
       await new Promise((resolve) => setTimeout(resolve, 400 * (attempt + 1)));
     }
-    throw new OpenAiLoginError('workspace_select_failed', '空间选择失败', last?.status || 502);
+    throw new OpenAiLoginError('workspace_select_failed', responseErrorMessage(last?.payload, last?.text, '空间选择失败'), last?.status || 502);
   }
 
   async followToCallback(url) {
@@ -636,6 +696,32 @@ class LoginRunner {
     throw new OpenAiLoginError('token_exchange_failed', '授权码交换 Token 失败', last?.status || 502);
   }
 
+  async completeCallback(callbackUrl) {
+    let parsed;
+    try { parsed = new URL(callbackUrl); } catch { throw new OpenAiLoginError('callback_invalid', 'OAuth 回调地址无效', 400); }
+    const code = string(parsed.searchParams.get('code'));
+    const callbackState = string(parsed.searchParams.get('state'));
+    if (!code) throw new OpenAiLoginError('callback_code_missing', 'OAuth 回调缺少授权码', 400);
+    if (this.session.state && callbackState && callbackState !== this.session.state) throw new OpenAiLoginError('callback_state_mismatch', 'OAuth 回调状态不匹配', 400);
+    if (!this.callbackHandler) return this.exchangeCode(callbackUrl);
+    this.progress('oauth_exchange', '正在由 Sub2API 完成 OAuth 并生成 JSON');
+    try {
+      const completed = await this.callbackHandler({
+        callbackUrl,
+        code,
+        state: callbackState || this.session.state,
+        authorization: this.session.authorization,
+      });
+      if (!completed?.accessToken || !completed?.refreshToken) {
+        throw new OpenAiLoginError('oauth_provider_token_incomplete', 'Sub2API OAuth 返回缺少 AT 或 RT', 502);
+      }
+      return completed;
+    } catch (error) {
+      if (error instanceof OpenAiLoginError) throw error;
+      throw new OpenAiLoginError(error?.code || 'oauth_provider_callback_failed', error?.message || 'Sub2API OAuth 回调处理失败', error?.status || 502);
+    }
+  }
+
   async run() {
     if (!this.email || !this.password) throw new OpenAiLoginError('credentials_required', '请先填写邮箱和密码', 400);
     this.session.attempts += 1;
@@ -646,11 +732,11 @@ class LoginRunner {
         current = await this.startAuthorization();
         this.session.currentUrl = current;
       }
-      if (this.callbackUrl) return await this.exchangeCode(current);
+      if (this.callbackUrl) return await this.completeCallback(current);
       let authRecoveryCount = 0;
       for (let step = 0; step < 10; step += 1) {
         this.session.currentUrl = current;
-        if (isCallback(current)) return await this.exchangeCode(current);
+        if (isCallback(current)) return await this.completeCallback(current);
         if (authStep(current, '/log-in') && !authStep(current, '/log-in/password')) {
           try {
             current = await this.sendAuthorizeContinue();
@@ -719,7 +805,7 @@ export async function loginFreeAccount(options = {}) {
       stage: runner.phase,
       browserRequired,
       needsInput: Boolean(error.needsInput),
-      authUrl: runner.authorizeUrl(),
+      authUrl: runner.currentAuthorizationUrl(),
       session: publicSession(runner.session),
     };
   }

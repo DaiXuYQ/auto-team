@@ -63,7 +63,8 @@ export async function refreshOpenAiAccessToken(refreshToken, clientId = DEFAULT_
           claims: accessTokenClaims(accessToken),
         };
       }
-      last = { ok: false, status: response.status, message: String(payload.error_description || payload.error || payload.message || `http_${response.status}`) };
+      const errorValue = payload.error_description || payload.error?.message || payload.error?.code || payload.error || payload.message;
+      last = { ok: false, status: response.status, code: String(payload.error?.code || payload.code || ''), message: typeof errorValue === 'string' ? errorValue : errorValue ? JSON.stringify(errorValue) : `http_${response.status}` };
       if (response.status !== 404 && response.status !== 405) break;
     } catch (error) {
       last = { ok: false, status: 0, message: error?.name === 'TimeoutError' ? 'timeout' : 'network_error' };

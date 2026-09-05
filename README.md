@@ -6,8 +6,10 @@
 2. 在 Team 成员列表中查看每个账号的 5h / 7d 额度。
 3. 只对 5h 或 7d 已用完的账号执行移出，并记录移出原因、加入空间和下次可重试时间。
 4. 从待加入池补满空席位。
-5. 在 Free 账号维护中记录邮箱、密码/2FA 是否已录入、加入过的 Team 和 Sub2API 状态。
-6. 下载 Sub2API JSON，后续可替换为真实推送适配器。
+5. 封号检测只接受明确的 OpenAI 停用/封禁错误信号；确认后从 Team 移出、在 Free 记录中永久标记，并排除后续补位。
+6. 每个 Team 默认每天最多轮转 3 个账号，可在 Team 编辑中单独调整；跨日自动重置。
+7. 在 Free 账号维护中记录邮箱、密码/2FA 是否已录入、加入过的 Team 和 Sub2API 状态。
+8. 下载 Sub2API JSON，后续可替换为真实推送适配器。
 
 ## 启动
 
@@ -18,7 +20,9 @@ npm run dev
 
 然后打开 <http://localhost:5173>。前端和服务端默认从空状态启动，不包含预置母号、子号或历史记录。数据以服务端 `data/state.json` 为准；该文件使用 AES-256-GCM 加密，可以在“设置”中调整预警阈值和轮询周期。
 
-前端不会生成演示账号。Free 账号可以通过“导入 Sub2API JSON”导入真实 `accounts[].credentials` 和 `accounts[].extra`，也可以粘贴 `邮箱----密码----2FA`（或使用 `|`、逗号）保存登录凭据。开启自动补位后，没有 Free JSON 的账号会先通过 RT 或邮箱、密码、2FA 自动取得 AT/RT；已有 AT 过期时优先用 RT 刷新。遇到邮箱验证码、Turnstile 或浏览器设备校验时不会伪造成功，界面会保留验证状态。JSON 的完整凭据只提交并加密保存在服务端，界面和 API 响应只返回脱敏 token。
+前端不会生成演示账号。Free 账号可以通过“导入 Sub2API JSON”导入真实 `accounts[].credentials` 和 `accounts[].extra`，也可以粘贴 `邮箱----密码----2FA`（或使用 `|`、逗号）保存已完成手机号验证的登录凭据。开启自动补位后，没有 Free JSON 的账号会先通过 RT 或邮箱、密码、2FA 完成 Codex OAuth；已有 AT 过期时优先用 RT 刷新。遇到额外邮箱验证码、Turnstile 或浏览器设备校验时不会伪造成功，界面会保留验证状态。JSON 的完整凭据只提交并加密保存在服务端，界面和 API 响应只返回脱敏 token。
+
+配置并启用 Sub2API 后，Codex OAuth 优先使用目标连接的 `/api/v1/admin/openai/generate-auth-url` 创建 PKCE 会话，登录完成后通过 `/api/v1/admin/openai/exchange-code` 换取完整凭据，再按“邮箱 + `chatgpt_account_id`”写入指定分组。Free JSON 使用列表中的默认连接并选择 personal 空间；Team JSON 使用该 Team 绑定的连接并选择其 `accountId` 空间。未配置可用连接时保留本地 PKCE 流程，生成的 JSON 仍可手动导出或推送。
 
 混合 Sub2API 文件会按 `credentials.plan_type` 分流：`team` 记录按 `chatgpt_account_id` 合并为空间，并保留该空间的多个所有者；`free` 记录进入 Free 账号池。同一邮箱同时存在 Free 和 Team 记录时不会互相覆盖。
 
@@ -71,11 +75,11 @@ MCP 工具包括 `get_state`、`list_teams`、`list_accounts`、`get_history`、
 
 ## 与真实服务对接
 
-当前实现把登录、Team invite、workspace/select、额度查询和 Sub2API 推送保留为可替换的适配边界。参考实现位于 `F:\ai-work\ai-gpt-k12`：
+当前实现把登录、Team invite、workspace/select、额度查询和 Sub2API 推送保留为可替换的适配边界。Team 管理参考实现位于 `F:\ai-work\ai-gpt-k12`，无头 Codex OAuth 登录流程参考 `F:\ai-work\pp-auto` 的实现：
 
 - 邀请申请/管理员同意：`server/k12-invite.ts` 与 `server/index.ts` 中的 `approveK12WorkspaceRequestByAdmin`。
 - 切换空间并取得 workspace AT：`selectAuthWorkspace` / `switchToK12WorkspaceAccessToken`。
 - 5h/7d 额度：`probeChatGptUsageQuota`，请求 `/backend-api/wham/usage`。
-- Sub2API OAuth：`codex_register/src/sub2api.ts`。
+- Sub2API OAuth：按上述无头登录流程生成授权链接、完成邮箱/密码/TOTP 登录、选择 Free 或 Team 空间、提交 callback 并取得 Sub2API credentials。
 
 接入真实服务时请将完整 AT、refresh token、密码和 2FA 仅保存在受控服务端，前端只展示脱敏值；不要把浏览器 localStorage 当作生产凭据保险库。
