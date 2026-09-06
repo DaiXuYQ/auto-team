@@ -315,8 +315,9 @@ function consumeDailyRotation(mother) {
   mother.dailyRotationUsage = usage;
   return dailyRotationBudget(mother);
 }
-function addHistory(action, detail, result = 'success') {
-  state.history = [{ id: randomUUID(), time: now(), action, detail, result }, ...state.history].slice(0, 200);
+function addHistory(action, detail, result = 'success', meta = {}) {
+  const safeMeta = meta && typeof meta === 'object' ? meta : {};
+  state.history = [{ id: randomUUID(), time: now(), action, detail, result, ...safeMeta }, ...state.history].slice(0, 200);
 }
 function preview(value) {
   if (!value || typeof value !== 'string') return '';
@@ -2729,7 +2730,18 @@ async function refillTeamInternal(motherId, mother) {
   mother.lastCheck = now();
   const pushDetail = joinedSub2apiPush.attempted ? `，Team JSON 推送 ${joinedSub2apiPush.pushed} 个` : '';
   const rotationBudgetAfter = dailyRotationBudget(mother);
-  addHistory('自动补位', `${mother.team} 移出 ${kicked.length} 个，加入 ${confirmedJoined.length}${rotationLimitSkipped.length ? `，${rotationLimitSkipped.length} 个受每日轮转上限限制` : ''}${pushDetail}${kickFailures.length || joinFailures.length ? `，失败 ${kickFailures.length + joinFailures.length} 个` : ''}`, kickFailures.length || joinFailures.length || joinedSub2apiPush.ok === false ? 'partial' : 'success');
+  addHistory('自动补位', `${mother.team} 移出 ${kicked.length} 个，加入 ${confirmedJoined.length}${rotationLimitSkipped.length ? `，${rotationLimitSkipped.length} 个受每日轮转上限限制` : ''}${pushDetail}${kickFailures.length || joinFailures.length ? `，失败 ${kickFailures.length + joinFailures.length} 个` : ''}`, kickFailures.length || joinFailures.length || joinedSub2apiPush.ok === false ? 'partial' : 'success', {
+    flow: mother.rotationProgress,
+    summary: {
+      team: mother.team,
+      kicked: kicked.map((child) => ({ id: child.id, email: child.email || '', reason: child.retryReason || null })),
+      joined: confirmedJoined.map((child) => ({ id: child.id, email: child.email || '' })),
+      kickFailures: kickFailures.map((item) => ({ id: item.id, email: item.email || '', phase: item.phase || 'kick', status: item.status || null, message: item.message || '' })),
+      joinFailures: joinFailures.map((item) => ({ id: item.id, email: item.email || '', phase: item.phase || 'join', status: item.status || null, message: item.message || '' })),
+      pushed: joinedSub2apiPush.pushed || 0,
+      pushFailed: joinedSub2apiPush.failed || 0,
+    },
+  });
   const pushFailed = joinedSub2apiPush.attempted && joinedSub2apiPush.ok === false;
   const ok = kickFailures.length === 0 && joinFailures.length === 0 && !pushFailed;
   finishRotationProgress(mother, ok ? 'completed' : 'partial', rotationLimitSkipped.length ? `已达到今日轮转上限 ${rotationBudgetAfter.count}/${rotationBudgetAfter.limit}` : ok ? '轮换链路执行完成' : '轮换完成，但存在未成功步骤', { kicked: kicked.length, joined: confirmedJoined.length, pushed: joinedSub2apiPush.pushed || 0, skipped: (joinedSub2apiPush.skipped || 0) + rotationLimitSkipped.length, failed: kickFailures.length + joinFailures.length + (joinedSub2apiPush.failed || 0) });

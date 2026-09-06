@@ -348,6 +348,7 @@ function App() {
   const [historyMeta, setHistoryMeta] = useState({ page: 1, pageSize: historyPageSizeOptions[0], total: 0, totalPages: 1 });
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyError, setHistoryError] = useState('');
+  const [selectedHistory, setSelectedHistory] = useState(null);
   const [historyReloadKey, setHistoryReloadKey] = useState(0);
   const [isRunning, setIsRunning] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
@@ -370,6 +371,8 @@ function App() {
   const [detailTeamId, setDetailTeamId] = useState(null);
   const [showSettings, setShowSettings] = useState(false);
   const [showAgentHelp, setShowAgentHelp] = useState(false);
+  const [tasks, setTasks] = useState([]);
+  const [showTaskCenter, setShowTaskCenter] = useState(false);
   const [selectedTeam, setSelectedTeam] = useState(null);
   const [importText, setImportText] = useState('');
   const [importMode, setImportMode] = useState('password-2fa');
@@ -394,6 +397,35 @@ function App() {
   const [theme, setTheme] = useState(() => {
     try { return window.localStorage.getItem('quota-hub-theme') === 'dark' ? 'dark' : 'light'; } catch { return 'light'; }
   });
+
+  function createTask(type, label, teamId = null, details = '') {
+    const createdAt = new Date().toISOString();
+    const task = { id: `task_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`, type, label, teamId, details, status: 'running', progress: 8, message: '正在启动', createdAt, startedAt: createdAt, completedAt: null };
+    setTasks((current) => [task, ...current].slice(0, 30));
+    return task.id;
+  }
+
+  function updateTask(id, patch) {
+    setTasks((current) => current.map((task) => task.id === id ? { ...task, ...patch } : task));
+  }
+
+  function finishTask(id, status, message, details = '') {
+    updateTask(id, { status, progress: status === 'completed' ? 100 : status === 'partial' ? 100 : 0, message, details, completedAt: new Date().toISOString() });
+  }
+
+  useEffect(() => {
+    const live = mothers.filter((mother) => mother.rotationProgress?.status === 'running');
+    if (!live.length) return;
+    setTasks((current) => current.map((task) => {
+      if (task.status !== 'running') return task;
+      const progress = live.find((mother) => !task.teamId || mother.id === task.teamId || mother.accountId === task.teamId || mother.team === task.teamId)?.rotationProgress;
+      if (!progress) return task;
+      const steps = progress.steps || [];
+      const complete = steps.filter((step) => step.status === 'completed').length;
+      const running = steps.find((step) => step.status === 'running');
+      return { ...task, progress: Math.max(8, Math.min(96, Math.round(((complete + (running ? 0.35 : 0)) / Math.max(1, steps.length)) * 100))), message: progress.message || task.message, account: progress.account || '' };
+    }));
+  }, [mothers]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -602,6 +634,7 @@ function App() {
   async function runCheck(motherId = null) {
     if (!motherId && !mothers.length) { notify('请先添加一个 Team', 'error'); return; }
     const allTeams = !motherId;
+    const taskId = createTask('check', allTeams ? `检测全部 ${mothers.length} 个 Team` : '检测 Team 额度', motherId, allTeams ? '同步所有 Team 的席位、成员和 5h / 7d 额度' : '同步席位、成员和 5h / 7d 额度');
     setStage('monitor'); setProgress(12); setIsProcessing(true); notify(allTeams ? `已启动全部 ${mothers.length} 个 Team 的额度检测` : '额度检测已启动', 'info');
     try {
       const result = await apiRequest(allTeams ? '/api/maintenance/check-all' : '/api/maintenance/check', { method: 'POST', body: JSON.stringify(allTeams ? {} : { motherId }) });
@@ -621,9 +654,10 @@ function App() {
           : recoveries.length
             ? '；OAuth 自动恢复未成功，请检查 Free 账号凭据'
             : '';
-      if (result.ok === false) notify(`${allTeams ? '多 Team 检测部分失败' : '检测部分失败'}，已检查 ${allTeams ? `${result.succeeded || 0}/${result.teamCount || mothers.length} 个 Team，` : ''}${checked} 个账号${recoveryDetail}`, 'error');
-      else notify(`${allTeams ? `全部 ${result.teamCount || mothers.length} 个 Team` : '检测'}完成，已检查 ${checked} 个账号`);
+      if (result.ok === false) { const message = `${allTeams ? '多 Team 检测部分失败' : '检测部分失败'}，已检查 ${allTeams ? `${result.succeeded || 0}/${result.teamCount || mothers.length} 个 Team，` : ''}${checked} 个账号${recoveryDetail}`; finishTask(taskId, 'partial', message, result); notify(message, 'error'); }
+      else { const message = `${allTeams ? `全部 ${result.teamCount || mothers.length} 个 Team` : '检测'}完成，已检查 ${checked} 个账号`; finishTask(taskId, 'completed', message, result); notify(message); }
     } catch (error) {
+      finishTask(taskId, 'failed', `检测失败：${error.message}`);
       setProgress(0); notify(`额度检测失败：${error.message}`, 'error');
     } finally { setIsProcessing(false); }
   }
@@ -631,13 +665,17 @@ function App() {
   async function refillSeats(motherId = null) {
     if (!motherId && !mothers.length) { notify('请先添加一个 Team', 'error'); return; }
     const allTeams = !motherId;
+    const taskId = createTask('refill', allTeams ? `补满全部 ${mothers.length} 个 Team` : '补满 Team 席位', motherId, allTeams ? '按空席位从 Free 池补位' : '先同步席位，再按空席位从 Free 池补位');
     setProgress(20); setIsProcessing(true); notify(allTeams ? `正在为全部 ${mothers.length} 个 Team 移除耗尽账号并补位` : '正在移除耗尽账号并补位', 'info');
     try {
       const result = await apiRequest(allTeams ? '/api/maintenance/refill-all' : '/api/maintenance/refill', { method: 'POST', body: JSON.stringify(allTeams ? {} : { motherId }) });
       await refreshState(false);
       setStage('join'); setProgress(100);
-      notify(result.ok === false ? `多 Team 补位未完全成功，已处理 ${result.teamCount || 0} 个 Team` : `${allTeams ? `全部 ${result.teamCount || mothers.length} 个 Team` : '补位'}完成：移除 ${result.kicked?.length || 0} 个，加入 ${result.joined?.length || 0} 个`, result.ok === false ? 'error' : 'success');
+      const message = result.ok === false ? `多 Team 补位未完全成功，已处理 ${result.teamCount || 0} 个 Team` : `${allTeams ? `全部 ${result.teamCount || mothers.length} 个 Team` : '补位'}完成：移除 ${result.kicked?.length || 0} 个，加入 ${result.joined?.length || 0} 个`;
+      finishTask(taskId, result.ok === false ? 'partial' : 'completed', message, result);
+      notify(message, result.ok === false ? 'error' : 'success');
     } catch (error) {
+      finishTask(taskId, 'failed', `补位失败：${error.message}`);
       setProgress(0); notify(`补位失败：${error.message}`, 'error');
     } finally { setIsProcessing(false); }
   }
@@ -749,6 +787,7 @@ function App() {
       return;
     }
     const missingIds = new Set(missing.map((account) => account.id));
+    const taskId = createTask('acquire', `批量获取 ${missing.length} 个 Free JSON`, null, `按 ${concurrency} 并发获取 AT / RT`);
     setAcquireStates((current) => {
       const next = { ...current };
       for (const account of missing) next[account.id] = { loading: true, status: 'queued', message: '等待批量获取' };
@@ -767,6 +806,7 @@ function App() {
       await refreshState(false);
       setBatchAcquire({ loading: false, result });
       const summary = `批量获取完成：成功 ${result.acquired || 0} 个，失败 ${result.failed || 0} 个，跳过 ${result.skipped || 0} 个`;
+      finishTask(taskId, result.failed || result.skipped ? 'partial' : 'completed', summary, result);
       notify(summary, result.failed || result.skipped ? 'info' : 'success');
     } catch (error) {
       setAcquireStates((current) => {
@@ -775,6 +815,7 @@ function App() {
         return next;
       });
       setBatchAcquire({ loading: false, result: { totalMissing: missing.length, concurrency, error: error.message || '批量获取失败' } });
+      finishTask(taskId, 'failed', `批量获取失败：${error.message}`);
       notify(`批量获取 Free JSON 失败：${error.message}`, 'error');
     }
   }
@@ -1039,7 +1080,7 @@ function App() {
       {view === 'run' && <RunView activeMother={activeMother} activeChildren={activeChildren} trackedChildren={trackedChildren} readyChildren={readyChildren} exhausted={exhausted} canRefillAll={anyExhausted || anyOpenSeat || kickWindow === 'time'} lowQuota={lowQuota} seatsOpen={seatsOpen} stage={stage} progress={progress} isRunning={isRunning} isProcessing={isProcessing} lastSync={lastSync} runCheck={runCheck} refillSeats={refillSeats} setShowMother={() => openMother(activeMother)} setSelectedTeam={setSelectedTeam} mothers={mothers} autoRefill={autoRefill} />}
       {view === 'teams' && <TeamManagementView teams={teamRecords} openTeam={openMother} openDetail={openTeamDetail} setShowImport={() => setShowImport(true)} exportTeamSub2Api={exportTeamSub2Api} pushTeamSub2Api={pushTeamSub2Api} />}
       {view === 'free' && <FreeAccountsView children={filteredAccounts} allChildren={accountRecords} mothers={mothers} search={search} setSearch={setSearch} setShowImport={() => setShowImport(true)} addAccount={() => openAccount()} exportSub2Api={exportSub2Api} pushSub2Api={pushSub2Api} removeChild={removeChild} deleteFreeAccount={deleteFreeAccount} batchDeleteBannedAccounts={batchDeleteBannedAccounts} openJsonImport={openJsonImport} editAccount={openAccount} acquireAccount={acquireAccount} acquireMissingFreeJson={acquireMissingFreeJson} acquireStates={acquireStates} batchAcquire={batchAcquire} concurrency={concurrency} />}
-      {view === 'history' && <HistoryView history={history} page={historyPage} pageSize={historyPageSize} meta={historyMeta} loading={historyLoading} error={historyError} onPageChange={changeHistoryPage} onPageSizeChange={changeHistoryPageSize} onRetry={reloadHistory} />}
+      {view === 'history' && <HistoryView history={history} page={historyPage} pageSize={historyPageSize} meta={historyMeta} loading={historyLoading} error={historyError} onPageChange={changeHistoryPage} onPageSizeChange={changeHistoryPageSize} onRetry={reloadHistory} onSelect={setSelectedHistory} />}
       {view === 'settings' && <SettingsView autoRefill={autoRefill} setAutoRefill={setAutoRefill} promoteJoinedAccounts={promoteJoinedAccounts} setPromoteJoinedAccounts={setPromoteJoinedAccounts} threshold={threshold} setThreshold={setThreshold} checkInterval={checkInterval} setCheckInterval={setCheckInterval} concurrency={concurrency} setConcurrency={setConcurrency} kickWindow={kickWindow} setKickWindow={setKickWindow} kickAfterHours={kickAfterHours} setKickAfterHours={setKickAfterHours} integrations={integrations} openIntegration={setShowIntegration} proxy={proxySettings} openProxy={() => setShowProxy(true)} saveSettings={saveSettings} />}
     </main>
 
@@ -1053,6 +1094,8 @@ function App() {
     {showTeamDetail && <TeamDetailModal team={teamRecords.find((item) => item.id === detailTeamId) || null} onClose={() => setShowTeamDetail(false)} runCheck={runCheck} refillSeats={refillSeats} setSelectedTeam={setSelectedTeam} openTeam={openMother} exportTeamSub2Api={exportTeamSub2Api} pushTeamSub2Api={pushTeamSub2Api} kickWindow={kickWindow} kickAfterHours={kickAfterHours} />}
     {showSettings && <SettingsModal onClose={() => setShowSettings(false)} />}
     {showAgentHelp && <AgentAccessModal onClose={() => setShowAgentHelp(false)} notify={notify} />}
+    <TaskCenter tasks={tasks} open={showTaskCenter} onOpen={() => setShowTaskCenter(true)} onClose={() => setShowTaskCenter(false)} />
+    {selectedHistory && <HistoryDetailModal item={selectedHistory} onClose={() => setSelectedHistory(null)} />}
     {toast && <div className={`toast ${toast.type}`}><CheckCircle2 size={18} /><span>{toast.message}</span><button onClick={() => setToast(null)}><X size={16} /></button></div>}
   </div>;
 }
@@ -1143,6 +1186,25 @@ function RotationProgress({ progress }) {
   </section>;
 }
 
+function taskStatusLabel(status) {
+  return { queued: '排队中', running: '运行中', completed: '已完成', partial: '部分完成', failed: '失败' }[status] || '未知';
+}
+
+function taskTime(value) {
+  if (!value) return '--';
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? '--' : date.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+
+function TaskCenter({ tasks, open, onOpen, onClose }) {
+  const active = tasks.find((task) => task.status === 'running' || task.status === 'queued');
+  const recent = tasks.slice(0, 5);
+  return <>
+    <button className={`task-dock ${active ? 'running' : ''}`} onClick={onOpen} title="打开任务中心"><span className="task-dock-icon">{active ? <RefreshCw size={16} /> : <Clock3 size={16} />}</span><span><strong>{active ? '任务执行中' : '任务中心'}</strong><small>{active ? `${active.progress || 0}% · ${active.message || active.label}` : `${tasks.length} 条记录`}</small></span><ChevronRight size={15} /></button>
+    {open && <Modal title="任务中心" onClose={onClose} className="task-center-modal"><div className="task-center-intro">查看检测、补位和账号处理任务的实时状态、进度与执行结果。</div><div className="task-list">{recent.length ? recent.map((task) => <article className={`task-item ${task.status}`} key={task.id}><div className="task-item-head"><div><strong>{task.label}</strong><span>{taskStatusLabel(task.status)} · 创建 {taskTime(task.createdAt)}</span></div><b>{task.progress ?? 0}%</b></div><div className="task-progress"><i style={{ width: `${Math.max(0, Math.min(100, task.progress || 0))}%` }} /></div><p>{task.message || task.details || '等待更新'}{task.account ? ` · 当前账号：${task.account}` : ''}</p><small>开始：{taskTime(task.startedAt)}　完成：{taskTime(task.completedAt)}</small></article>) : <div className="empty-state compact-empty"><Clock3 size={25} /><strong>暂无任务</strong><span>点击检测、补满席位或批量获取后会显示进度。</span></div>}</div><div className="modal-foot"><span className="muted">任务记录保留最近 30 条</span><button className="button ghost" onClick={onClose}>关闭</button></div></Modal>}
+  </>;
+}
+
 function TeamDetailModal({ team, onClose, runCheck, refillSeats, setSelectedTeam, openTeam, exportTeamSub2Api, pushTeamSub2Api, kickWindow, kickAfterHours }) {
   if (!team) return null;
   const status = team.mother.status || 'unconfigured';
@@ -1153,7 +1215,7 @@ function TeamDetailModal({ team, onClose, runCheck, refillSeats, setSelectedTeam
     <div className="team-detail-top"><div><span className="kicker">TEAM SPACE</span><strong className="team-detail-name">{team.displayName}</strong><small className="team-sub2api-target">同步到 {team.mother.sub2apiIntegrationName || '未配置 Sub2API'}</small></div><div className="team-detail-actions"><span className={`status-chip ${status}`}><i />{statusLabel}</span><button className="button ghost compact-button" onClick={() => { onClose(); openTeam(team.mother); }}><Settings2 size={14} />编辑 Team</button></div></div>
     <div className="team-detail-summary"><div><span>所有者</span><OwnerEmails owners={team.owners} /><small>{team.owners?.length ? `${team.owners.length} 个所有者` : '未同步所有者'}</small></div><div><span>席位</span><strong>{team.seats.used == null || team.seats.total == null ? '--' : `${team.seats.used} / ${team.seats.total}`}</strong><small>{team.seats.open == null ? '尚未检测' : team.seats.open ? `剩余 ${team.seats.open} 个` : '已满'}</small></div><div><span>今日轮转</span><strong>{daily.count} / {daily.limit}</strong><small>{daily.remaining ? `还可轮转 ${daily.remaining} 个账号` : '今日已达上限'}</small></div><div><span>最后同步</span><strong>{displayTime(team.lastSync)}</strong><small>{team.rows.length} 个当前账号</small></div></div>
     <RotationProgress progress={team.mother.rotationProgress} />
-    <div className="team-detail-toolbar"><div><h3>当前账号</h3><span>额度、身份和凭据状态</span></div><div className="toolbar-actions"><button className="button ghost compact-button" onClick={() => exportTeamSub2Api(team.mother.id)}><Download size={14} />导出 JSON</button><button className="button secondary compact-button" onClick={() => pushTeamSub2Api(team.mother.id)}><ExternalLink size={14} />推送 Sub2API</button><button className="button ghost compact-button" onClick={() => { setSelectedTeam(team.id); runCheck(team.mother.id); }}><RefreshCw size={14} />检测额度</button><button className="button secondary compact-button" disabled={!team.seats.open && !hasExhausted && kickWindow !== 'time'} onClick={() => { setSelectedTeam(team.id); refillSeats(team.mother.id); }}><Sparkles size={14} />移除并补位</button></div></div>
+    <div className="team-detail-toolbar"><div><h3>当前账号</h3><span>额度、身份和凭据状态</span></div><div className="toolbar-actions"><button className="button ghost compact-button" onClick={() => exportTeamSub2Api(team.mother.id)}><Download size={14} />导出 JSON</button><button className="button secondary compact-button" onClick={() => pushTeamSub2Api(team.mother.id)}><ExternalLink size={14} />推送 Sub2API</button><button className="button ghost compact-button" onClick={() => { setSelectedTeam(team.id); runCheck(team.mother.id); }}><RefreshCw size={14} />检测额度</button><button className="button secondary compact-button" disabled={!team.mother.accountId && !team.mother.team} title={!team.mother.accountId && !team.mother.team ? '请先配置 Team ID' : '先同步席位，再从 Free 账号池并发补满空席位'} onClick={() => { setSelectedTeam(team.id); refillSeats(team.mother.id); }}><Sparkles size={14} />补满席位</button></div></div>
     <div className="table-wrap team-detail-table-wrap"><table className="data-table team-detail-table"><thead><tr><th>账号</th><th>身份</th><th>5h 剩余</th><th>7d 剩余</th><th>登录凭据</th><th>Sub2API</th><th>{kickWindow === 'time' ? '加入时间 / 倒计时' : '加入时间'}</th></tr></thead><tbody>{team.rows.map((row, index) => {
       const account = row.child;
       const email = account?.email || row.member?.email || '未识别邮箱';
@@ -1182,7 +1244,7 @@ function TeamMaintenanceView({ teams, runCheck, refillSeats, setSelectedTeam, op
       <div className="team-record-list">{teams.map((team) => <article className="team-record" key={team.id}>
         <div className="team-record-head"><div className="team-title"><div className="team-avatar"><Users size={18} /></div><div><h3>{team.displayName}</h3></div></div><span className={`status-chip ${team.mother.status || 'unconfigured'}`}><i />{team.mother.status === 'online' ? '在线' : team.mother.status === 'offline' ? '离线' : '未检测'}</span></div>
         <div className="team-meta-grid"><div><span>所有者</span><OwnerEmails owners={team.owners} /><small>{team.owners?.length ? `${team.owners.length} 个所有者` : '未同步所有者'}</small></div><div><span>席位</span><strong>{team.seats.used == null || team.seats.total == null ? '--' : `${team.seats.used} / ${team.seats.total}`}</strong><small>{team.seats.open ? `剩余 ${team.seats.open} 个` : '已满'}</small></div><div><span>今日轮转</span><strong>{dailyRotationValues(team.mother).count} / {dailyRotationValues(team.mother).limit}</strong><small>{dailyRotationValues(team.mother).remaining ? `剩余 ${dailyRotationValues(team.mother).remaining} 次` : '已达上限'}</small></div><div><span>最后同步</span><strong>{displayTime(team.lastSync)}</strong><small>{team.rows.length} 个当前成员</small></div></div>
-        <div className="team-record-actions"><button className="button ghost" onClick={() => { setSelectedTeam(team.id); runCheck(team.id); }}><RefreshCw size={14} />检测额度</button><button className="button secondary" disabled={!team.seats.open && !team.rows.some((row) => row.child?.status === 'exhausted' || row.child?.status === 'banned')} onClick={() => { setSelectedTeam(team.id); refillSeats(team.id); }}><Sparkles size={14} />移除并补位</button></div>
+        <div className="team-record-actions"><button className="button ghost" onClick={() => { setSelectedTeam(team.id); runCheck(team.id); }}><RefreshCw size={14} />检测额度</button><button className="button secondary" disabled={!team.mother.accountId && !team.mother.team} title={!team.mother.accountId && !team.mother.team ? '请先配置 Team ID' : '先同步席位，再从 Free 账号池并发补满空席位'} onClick={() => { setSelectedTeam(team.id); refillSeats(team.id); }}><Sparkles size={14} />补满席位</button></div>
         <div className="team-member-heading"><div><h4>当前账号</h4><span>成员额度和凭据状态</span></div><b>{team.rows.length}</b></div>
         <div className="table-wrap team-member-wrap"><table className="data-table team-member-table"><thead><tr><th>账号</th><th>身份</th><th>5h 剩余</th><th>7d 剩余</th><th>凭据</th><th>加入记录</th></tr></thead><tbody>{team.rows.map((row, index) => { const account = row.child; const email = account?.email || row.member?.email || '未识别邮箱'; return <tr key={`${email}-${row.member?.id || index}`}><td><div className="account-cell"><div className="queue-avatar">{email[0]?.toUpperCase() || '?'}</div><div><strong>{email}</strong><small className="mono">{account?.id || row.member?.id || '成员快照'}</small></div></div></td><td><div className="role-stack">{row.isOwner ? <span className="role-label owner">所有者</span> : <span className="role-label">成员</span>}{account?.status === 'banned' && <StatusBadge status="banned" />}</div></td><td><QuotaBar value={account?.quota5h} /></td><td><QuotaBar value={account?.quota7d} /></td><td><CredentialState account={account} /></td><td>{account?.joinedAt ? <span>{displayTime(account.joinedAt)}<small>{account.joinedTeams?.length || account.workspaceHistory?.length || 1} 个 Team</small></span> : <span className="muted">成员同步</span>}</td></tr>; })}</tbody></table></div>
       </article>)}</div>
@@ -1294,7 +1356,7 @@ function MothersView({ mothers, setShowMother, setShowImport }) { return <sectio
 
 function StatusBadge({ status }) { const labels = { active: '使用中', warning: '额度偏低', exhausted: '已耗尽', cooldown: '冷却中', ready: '待加入', kicked: '已移出', banned: '已封禁', unconfigured: '待配置', offline: '离线', login_pending: '等待验证', login_required: '需要重新登录', phone_verification_required: '需要手机号接码' }; return <span className={`status-chip ${status || 'unconfigured'}`}><i />{labels[status] || '未检测'}</span>; }
 function QuotaBar({ value }) { const numeric = Number(value); const known = Number.isFinite(numeric); const tone = numeric === 0 ? 'red' : numeric <= 10 ? 'amber' : 'green'; return <div className="quota-cell"><span>{known ? `${numeric}%` : '--'}</span><i className={known ? tone : 'muted'}><b style={{ width: `${known ? Math.max(0, Math.min(100, numeric)) : 0}%` }} /></i></div>; }
-function HistoryView({ history, page, pageSize, meta, loading, error, onPageChange, onPageSizeChange, onRetry }) {
+function HistoryView({ history, page, pageSize, meta, loading, error, onPageChange, onPageSizeChange, onRetry, onSelect }) {
   const total = Math.max(0, Number(meta?.total) || 0);
   const totalPages = Math.max(1, Number(meta?.totalPages) || 1);
   const currentPage = Math.min(totalPages, Math.max(1, Number(page) || 1));
@@ -1304,7 +1366,7 @@ function HistoryView({ history, page, pageSize, meta, loading, error, onPageChan
     <div className="content-toolbar"><div><h2>操作历史</h2><p>记录额度检测、账号移除、Team 加入和导出操作。</p></div><button className="button ghost"><CloudDownload size={15} />导出日志</button></div>
     <div className={`history-list ${loading ? 'is-loading' : ''}`} aria-busy={loading}>
       {error ? <div className="history-state error-state"><AlertTriangle size={22} /><strong>历史记录加载失败</strong><span>{error}</span><button className="button ghost" onClick={onRetry}><RefreshCw size={14} />重试</button></div>
-        : history.length ? history.map((item) => <div className="history-item" key={item.id}><div className={`history-icon ${item.result}`}><Check size={16} /></div><div className="history-copy"><div><strong>{item.action}</strong><span>{item.time}</span></div><p>{item.detail}</p></div><ChevronRight size={16} className="history-arrow" /></div>)
+        : history.length ? history.map((item) => <button className="history-item" key={item.id} onClick={() => onSelect(item)}><span className={`history-icon ${item.result}`}><Check size={16} /></span><span className="history-copy"><span><strong>{item.action}</strong><span>{item.time}</span></span><span>{item.detail}</span></span><ChevronRight size={16} className="history-arrow" /></button>)
           : loading ? <div className="history-state"><RefreshCw size={21} className="history-spinner" /><span>正在加载历史记录...</span></div>
             : <div className="history-state"><Clock3 size={22} /><strong>暂无操作记录</strong><span>完成一次检测或配置操作后会显示在这里。</span></div>}
     </div>
@@ -1318,6 +1380,18 @@ function HistoryView({ history, page, pageSize, meta, loading, error, onPageChan
       </div>
     </div>
   </section>;
+}
+
+function HistoryDetailModal({ item, onClose }) {
+  const flow = item.flow;
+  const summary = item.summary || {};
+  const failures = [...(summary.kickFailures || []), ...(summary.joinFailures || [])];
+  return <Modal title={`流程日志 · ${item.action}`} onClose={onClose} className="history-detail-modal">
+    <div className="history-detail-head"><div><span className={`status-chip ${item.result || 'success'}`}><i />{item.result === 'partial' ? '部分完成' : item.result === 'error' ? '失败' : '完成'}</span><strong>{item.detail}</strong></div><small>{taskTime(item.time)}</small></div>
+    {flow?.steps?.length ? <><h3 className="history-detail-section-title">执行阶段</h3><div className="history-detail-steps">{flow.steps.map((step) => <div className={`history-detail-step ${step.status}`} key={step.id}><div><strong>{step.label}</strong><span>{step.status === 'completed' ? '已完成' : step.status === 'failed' ? '失败' : step.status === 'skipped' ? '已跳过' : step.status === 'running' ? '执行中' : '排队中'}</span></div><small>{step.durationMs != null ? durationLabel(step.durationMs) : '--'}</small></div>)}</div></> : <div className="history-detail-empty">该条记录没有阶段级日志，仅保留操作摘要。</div>}
+    {Object.keys(summary).length > 0 && <><h3 className="history-detail-section-title">执行结果</h3><div className="history-detail-stats"><div><span>移出账号</span><strong>{summary.kicked?.length || 0}</strong></div><div><span>加入账号</span><strong>{summary.joined?.length || 0}</strong></div><div><span>推送数量</span><strong>{summary.pushed || 0}</strong></div><div><span>失败步骤</span><strong>{failures.length + (summary.pushFailed || 0)}</strong></div></div>{failures.length > 0 && <div className="history-failure-list">{failures.map((failure, index) => <div key={`${failure.id || index}-${index}`}><strong>{failure.email || failure.id || '未知账号'}</strong><span>{failure.phase || '处理'} · {failure.message || `HTTP ${failure.status || '未知'}`}</span></div>)}</div>}</>}
+    <div className="modal-foot"><span className="muted">记录时间：{taskTime(item.time)}</span><button className="button ghost" onClick={onClose}>关闭</button></div>
+  </Modal>;
 }
 function SettingsView({ autoRefill, setAutoRefill, promoteJoinedAccounts, setPromoteJoinedAccounts, threshold, setThreshold, checkInterval, setCheckInterval, concurrency, setConcurrency, kickWindow, setKickWindow, kickAfterHours, setKickAfterHours, integrations, openIntegration, proxy, openProxy, saveSettings }) {
   const sub2apis = integrations.sub2apis?.length ? integrations.sub2apis : [integrations.sub2api || defaultSub2Api];
