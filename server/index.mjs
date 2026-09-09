@@ -430,11 +430,15 @@ function teamOwnerCandidateChildren(mother) {
   });
 }
 
-async function recoverTeamManagerToken(mother, { force = false } = {}) {
+async function recoverTeamManagerToken(mother, { force = false, allowCredentialLogin = true } = {}) {
   if (!mother?.accountId) return { ok: false, status: 400, message: 'workspace_id_required' };
   if (!force && teamManagerContext(mother)) return { ok: true, status: 200, source: 'stored_team_token' };
   const workspaceId = mother.accountId;
   const records = [mother, ...(Array.isArray(mother.ownerAccounts) ? mother.ownerAccounts : [])];
+  let lastFailure = null;
+  // Periodic quota checks must never start an interactive OAuth login. They can
+  // still use a stored refresh token; credential login is reserved for manual
+  // setup/refill actions.
   for (const record of records) {
     if (!record?.refreshToken) continue;
     const refreshed = await refreshOpenAiAccessToken(record.refreshToken, record.clientId, OPENAI_REQUEST_TIMEOUT_MS, proxyFetch);
@@ -449,7 +453,9 @@ async function recoverTeamManagerToken(mother, { force = false } = {}) {
     await persist();
     return { ok: true, status: 200, source: 'team_refresh_token' };
   }
-  let lastFailure = null;
+  if (!allowCredentialLogin) {
+    return { ok: false, status: 401, message: 'workspace_owner_token_required', code: 'stored_token_unavailable' };
+  }
   for (const child of teamOwnerCandidateChildren(mother)) {
     const exchanged = await switchWorkspaceWithFreeRecovery(child, mother.accountId);
     if (exchanged.ok) {
@@ -1494,15 +1500,15 @@ async function queryWorkspaceSubscription(mother) {
   return { ...result, accountId: mother.accountId, subscription: result.ok ? normalizeSubscription(result.payload, mother.accountId) : null };
 }
 
-async function syncMotherWorkspace(mother, { query = '', force = false } = {}) {
+async function syncMotherWorkspace(mother, { query = '', force = false, allowCredentialLogin = true } = {}) {
   if (!mother) return { ok: false, status: 404, message: 'mother_not_found' };
-  if (!teamManagerContext(mother)) await recoverTeamManagerToken(mother);
+  if (!teamManagerContext(mother)) await recoverTeamManagerToken(mother, { allowCredentialLogin });
   let [subscriptionResult, membersResult] = await Promise.all([
     queryWorkspaceSubscription(mother),
     queryAllWorkspaceMembers(mother, query),
   ]);
   if ([subscriptionResult.status, membersResult.status].some((status) => [401, 403].includes(Number(status)))) {
-    const recovered = await recoverTeamManagerToken(mother, { force: true });
+    const recovered = await recoverTeamManagerToken(mother, { force: true, allowCredentialLogin });
     if (recovered.ok) {
       [subscriptionResult, membersResult] = await Promise.all([
         queryWorkspaceSubscription(mother),
@@ -2193,7 +2199,7 @@ function canAutoPushRenewedTeamJson(mother) {
     && (Number.isFinite(groupId) && groupId > 0 || Boolean(String(config.groupName || '').trim()));
 }
 
-async function renewUnauthorizedTeamToken(mother, child) {
+async function renewUnauthorizedTeamToken(mother, child, { allowCredentialLogin = false } = {}) {
   if (!mother?.accountId || !child) return { ok: false, status: 400, message: 'workspace_id_or_child_missing', freeRefreshed: false };
   const workspaceId = String(mother.accountId).trim();
   const stored = workspaceTokenFor(child, workspaceId) || workspaceTokenFor(child, mother.team);
@@ -2219,6 +2225,9 @@ async function renewUnauthorizedTeamToken(mother, child) {
     }
   }
 
+  if (!allowCredentialLogin) {
+    return { ok: false, status: 401, code: 'team_token_refresh_failed', message: 'Team AT 已失效，未找到可用 RT；额度检测不会启动登录流程', freeRefreshed: false, credentialLogin: false, credentialLoginAttempted: false };
+  }
   const teamOAuth = await acquireTeamAuth(mother, child, { force: true });
   if (!teamOAuth.ok) {
     return {
@@ -2268,11 +2277,16 @@ async function pushRenewedTeamJson(mother, { emails = [], mode = 'create_only' }
 async function checkTeam(motherId) {
   const mother = findMother(motherId);
   if (!mother) return { ok: false, status: 404, message: 'mother_not_found' };
-  let managerRecovery = await recoverTeamManagerToken(mother);
-  let workspace = await syncMotherWorkspace(mother).catch((error) => ({ ok: false, message: error?.message || 'workspace_sync_failed', members: [] }));
+  let managerRecovery = await recoverTeamManagerToken(mother, { allowCredentialLogin: false });
+  let workspace = await syncMotherWorkspace(mother, { allowCredentialLogin: false }).catch((error) => ({ ok: false, message: error?.message || 'workspace_sync_failed', members: [] }));
   if (!workspace.ok && [401, 403].includes(Number(workspace.status))) {
-    managerRecovery = await recoverTeamManagerToken(mother, { force: true });
-    if (managerRecovery.ok) workspace = await syncMotherWorkspace(mother).catch((error) => ({ ok: false, message: error?.message || 'workspace_sync_failed', members: [] }));
+    managerRecovery = await recoverTeamManagerToken(mother, { force: true, allowCredentialLogin: false });
+    // A confirmed expired owner token may fall back to the full OAuth flow,
+    // but only after the non-interactive refresh path has failed.
+    if (!managerRecovery.ok && Number(workspace.status) === 401) {
+      managerRecovery = await recoverTeamManagerToken(mother, { force: true, allowCredentialLogin: true });
+    }
+    if (managerRecovery.ok) workspace = await syncMotherWorkspace(mother, { allowCredentialLogin: false }).catch((error) => ({ ok: false, message: error?.message || 'workspace_sync_failed', members: [] }));
   }
   const members = state.children.filter((child) => isChildMemberOfTeam(child, mother.team));
   const kickWindow = selectedKickWindow(mother);
@@ -2291,7 +2305,7 @@ async function checkTeam(motherId) {
       }
       const livenessBanMessage = liveness?.banned ? explicitAccountBanMessage(liveness) || 'OpenAI 账号已被停用或封禁' : '';
       if (!initialBanMessage && !livenessBanMessage && (result.status === 401 || result.message === 'missing_token')) {
-        tokenRecovery = await renewUnauthorizedTeamToken(mother, child);
+        tokenRecovery = await renewUnauthorizedTeamToken(mother, child, { allowCredentialLogin: true });
         if (tokenRecovery.ok) {
           const renewedToken = workspaceTokenFor(child, mother.accountId) || workspaceTokenFor(child, mother.team);
           result = await probeUsage(renewedToken?.accessToken || '', mother.accountId);
@@ -2322,7 +2336,7 @@ async function checkTeam(motherId) {
     ? await pushRenewedTeamJson(mother, { emails: renewedEmails, mode: 'repair_only' })
     : { attempted: false, ok: null, status: null, message: null, pushed: 0, failed: 0 };
   if (renewedTeamTokens > 0 && workspace.ok !== true) {
-    workspace = await syncMotherWorkspace(mother).catch((error) => ({ ok: false, message: error?.message || 'workspace_sync_failed', members: [] }));
+    workspace = await syncMotherWorkspace(mother, { allowCredentialLogin: false }).catch((error) => ({ ok: false, message: error?.message || 'workspace_sync_failed', members: [] }));
   }
   mother.lastCheck = now();
   const renewalDetail = !renewedTeamTokens
