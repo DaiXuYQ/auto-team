@@ -1489,14 +1489,17 @@ async function queryWorkspaceSubscription(mother) {
   if (!mother?.accountId) return { ok: false, status: 400, message: 'workspace_id_required', subscription: null };
   const accountId = encodeURIComponent(mother.accountId);
   const requestPath = `/backend-api/subscriptions?account_id=${accountId}`;
-  const attempted = await withTeamManager(mother, (manager) => fetchChatGptJson(manager.accessToken, requestPath, {
+  // Subscription/seat data is scoped to the primary Team account. Do not use
+  // a rotating member or secondary owner here: those tokens may authenticate
+  // successfully but are not guaranteed to have billing/seat permissions.
+  const attempted = await fetchChatGptJson(mother.accessToken, requestPath, {
     accountId: mother.accountId,
     targetPath: '/backend-api/subscriptions',
     targetRoute: '/backend-api/subscriptions',
-    headers: { ...(manager.deviceId ? { 'oai-device-id': manager.deviceId } : {}), ...(manager.cookie ? { cookie: manager.cookie } : {}) },
-  }));
-  if (!attempted?.result) return { ok: false, status: 401, message: 'workspace_owner_token_required', subscription: null };
-  const result = attempted.result;
+    headers: { ...(mother.deviceId ? { 'oai-device-id': mother.deviceId } : {}), ...(mother.cookie ? { cookie: mother.cookie } : {}) },
+  });
+  if (!attempted) return { ok: false, status: 401, message: 'workspace_owner_token_required', subscription: null };
+  const result = attempted;
   return { ...result, accountId: mother.accountId, subscription: result.ok ? normalizeSubscription(result.payload, mother.accountId) : null };
 }
 

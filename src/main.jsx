@@ -162,6 +162,23 @@ function teamDisplayName(mother) {
   return mother?.teamName || mother?.displayName || '未命名 Team';
 }
 
+function seatTypeLabel(type) {
+  const value = String(type || '').toLowerCase();
+  if (value === 'prolite' || value === 'pro' || value === 'premium') return '高级席位';
+  if (value === 'default' || value === 'standard') return '普通席位';
+  return type || '其他席位';
+}
+
+function seatBreakdown(snapshot = {}) {
+  const capacities = Array.isArray(snapshot.seatCapacity) ? snapshot.seatCapacity : [];
+  return capacities.map((entry) => {
+    const total = Number(entry?.paid ?? entry?.entitled ?? entry?.total);
+    const available = Number(entry?.available);
+    const used = Number.isFinite(total) && Number.isFinite(available) ? Math.max(0, total - available) : null;
+    return { type: entry?.type || '', label: seatTypeLabel(entry?.type), used, total: Number.isFinite(total) ? total : null, available: Number.isFinite(available) ? available : null };
+  }).filter((entry) => entry.total != null || entry.available != null);
+}
+
 function teamNameForId(mothers, teamId) {
   const mother = (mothers || []).find((item) => item.id === teamId || item.team === teamId || item.accountId === teamId);
   return mother ? teamDisplayName(mother) : '未命名 Team';
@@ -507,6 +524,7 @@ function App() {
     const ownerAccount = { ...primaryOwner, email: mother.email, id: primaryOwner?.id || mother.chatgptUserId, status: mother.status, credentialsStatus: primaryOwner?.credentialsStatus || mother.credentialsStatus, sub2apiStatus: primaryOwner?.sub2apiStatus || { imported: Boolean(mother.hasAccessToken), exportable: Boolean(mother.hasAccessToken) }, joinedAt: mother.createdAt, joinedTeams: [{ team: teamId, status: 'active', joinedAt: mother.createdAt }], ...ownerQuota };
     const seatTotal = Number.isFinite(Number(mother.seats)) ? Number(mother.seats) : numericOrNull(snapshot.seatsEntitled);
     const seatUsed = Number.isFinite(Number(mother.used)) ? Number(mother.used) : numericOrNull(snapshot.seatsInUse);
+    const seatTypes = seatBreakdown(snapshot);
     const teamChildren = children.filter((child) => isMemberOfTeam(child, teamId) && child.status !== 'kicked').map((child) => accountForTeam(child, teamId));
     const memberSnapshots = [...(mother.members || []), ...teamChildren.map((child) => child.memberSnapshot)].filter(Boolean);
     const owners = normalizedOwners(mother, memberSnapshots);
@@ -537,7 +555,7 @@ function App() {
       mother,
       owners,
       owner: owners[0] || { email: mother.email || '', name: mother.name || '', userId: mother.chatgptUserId || null },
-      seats: { used: seatUsed, total: seatTotal, open: seatUsed != null && seatTotal != null ? Math.max(0, seatTotal - seatUsed) : null },
+      seats: { used: seatUsed, total: seatTotal, open: seatUsed != null && seatTotal != null ? Math.max(0, seatTotal - seatUsed) : null, types: seatTypes },
       rows,
       lastSync: mother.lastWorkspaceSyncAt || mother.lastCheck || null,
     };
@@ -1157,7 +1175,7 @@ function TeamManagementView({ teams, openTeam, openDetail, setShowImport, export
         return <tr key={team.id}>
           <td><div className="team-list-title"><div className="team-avatar"><Users size={17} /></div><div><strong>{team.displayName}</strong><small className="team-sub2api-target">{team.mother.sub2apiIntegrationName || '未配置 Sub2API'}</small></div></div></td>
           <td><OwnerEmails owners={team.owners} /></td>
-          <td><div className="table-seats"><span>{team.seats.used == null || team.seats.total == null ? '--' : `${team.seats.used}/${team.seats.total}`}</span><i><b style={{ width: `${team.seats.total ? Math.min(100, (team.seats.used || 0) / team.seats.total * 100) : 0}%` }} /></i></div></td>
+          <td><div className="table-seats"><span>{team.seats.used == null || team.seats.total == null ? '--' : `${team.seats.used}/${team.seats.total}`}</span><i><b style={{ width: `${team.seats.total ? Math.min(100, (team.seats.used || 0) / team.seats.total * 100) : 0}%` }} /></i></div>{team.seats.types?.length ? <div className="seat-type-list">{team.seats.types.map((seat) => <small key={seat.type}>{seat.label} {seat.used == null ? '--' : `${seat.used}/${seat.total}`}</small>)}</div> : null}</td>
           <td>{team.rows.length} 个</td>
           <td><span className={`rotation-limit ${daily.remaining === 0 ? 'reached' : ''}`}>{daily.count} / {daily.limit}</span></td>
           <td><span className={`status-chip ${status}`}><i />{statusLabel}</span></td>
