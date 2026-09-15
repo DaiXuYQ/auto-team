@@ -33,6 +33,16 @@ export function accessTokenClaims(accessToken) {
   };
 }
 
+export function isOpenAiAuthFailure(result = {}) {
+  const status = Number(result?.status);
+  if (status === 401 || result?.message === 'missing_token') return true;
+  const value = [result?.code, result?.errorCode, result?.message]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase();
+  return status === 403 && /(?:token|oauth|authentication|authorization|sign-in session).*(?:expired|invalid|invalidated|revoked|required)|(?:expired|invalid|invalidated|revoked).*(?:token|oauth|authentication|authorization)/i.test(value);
+}
+
 export async function refreshOpenAiAccessToken(refreshToken, clientId = DEFAULT_CLIENT_ID, timeoutMs = 15000, requestFetch = fetch) {
   const token = String(refreshToken || '').trim();
   if (!token) return { ok: false, status: 400, message: 'refresh_token_required' };

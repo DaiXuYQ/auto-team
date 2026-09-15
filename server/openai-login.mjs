@@ -370,6 +370,7 @@ class LoginRunner {
     this.mailboxHeaders = options.mailboxHeaders && typeof options.mailboxHeaders === 'object' ? options.mailboxHeaders : {};
     this.timeoutMs = Number(options.timeoutMs) || 15000;
     this.onProgress = typeof options.onProgress === 'function' ? options.onProgress : () => {};
+    this.sentinelTokenProvider = typeof options.sentinelTokenProvider === 'function' ? options.sentinelTokenProvider : null;
     this.authorizationProvider = typeof options.authorizationProvider === 'function' ? options.authorizationProvider : null;
     this.callbackHandler = typeof options.callbackHandler === 'function' ? options.callbackHandler : null;
     this.session = sessionFromInput(options.session);
@@ -524,6 +525,9 @@ class LoginRunner {
 
   async sentinelToken(flow) {
     this.progress('authenticating', `正在后台完成 ${flow} 协议验证`);
+    if (this.sentinelTokenProvider) {
+      return this.sentinelTokenProvider({ flow, deviceId: this.session.deviceId, userAgent: browserHeaders['user-agent'], proxy: this.sentinelProxy });
+    }
     let browserError = null;
     try {
       return await fetchSentinelToken({
@@ -809,11 +813,58 @@ class LoginRunner {
 }
 
 export async function loginFreeAccount(options = {}) {
-  const runner = new LoginRunner(options);
+  let runner = new LoginRunner(options);
+  let oauthFallback = null;
   try {
     const token = await runner.run();
     return { ok: true, status: 200, code: 'ready', stage: 'ready', ...token, session: publicSession(runner.session) };
   } catch (error) {
+    const providerFailure = Boolean(options.authorizationProvider)
+      && (/^sub2api_oauth_/i.test(String(error?.code || ''))
+        || /^oauth_provider_/i.test(String(error?.code || '')));
+    if (providerFailure) {
+      oauthFallback = {
+        code: error?.code || 'oauth_provider_failed',
+        message: error?.message || '外部 OAuth 服务不可用',
+      };
+      runner = new LoginRunner({
+        ...options,
+        authorizationProvider: null,
+        callbackHandler: null,
+        session: null,
+        callbackUrl: '',
+      });
+      try {
+        const token = await runner.run();
+        return {
+          ok: true,
+          status: 200,
+          code: 'ready',
+          stage: 'ready',
+          ...token,
+          session: publicSession(runner.session),
+          oauthFallback,
+        };
+      } catch (retryError) {
+        error = retryError;
+      }
+    }
+    const staleSession = ['authorize_state_invalid', 'signin_session_invalid'].includes(error?.code)
+      || /sign-in session is no longer valid|oauth (?:login )?session (?:is )?(?:invalid|expired)/i.test(String(error?.message || ''));
+    if (staleSession && (!options.callbackUrl || oauthFallback)) {
+      runner = new LoginRunner({
+        ...options,
+        ...(oauthFallback ? { authorizationProvider: null, callbackHandler: null } : {}),
+        session: null,
+        callbackUrl: '',
+      });
+      try {
+        const token = await runner.run();
+        return { ok: true, status: 200, code: 'ready', stage: 'ready', ...token, session: publicSession(runner.session), sessionRecovered: true, ...(oauthFallback ? { oauthFallback } : {}) };
+      } catch (retryError) {
+        error = retryError;
+      }
+    }
     const browserRequired = Boolean(error.browserRequired)
       || ['protocol_verification_required', 'sentinel_verification_failed'].includes(error.code);
     return {
@@ -826,6 +877,7 @@ export async function loginFreeAccount(options = {}) {
       needsInput: Boolean(error.needsInput),
       authUrl: runner.currentAuthorizationUrl(),
       session: publicSession(runner.session),
+      ...(oauthFallback ? { oauthFallback } : {}),
     };
   }
 }

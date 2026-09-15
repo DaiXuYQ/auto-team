@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { createRoot } from 'react-dom/client';
+import { createPortal } from 'react-dom';
 import {
   Activity, AlertTriangle, ArrowDownToLine, ArrowUpRight, Bot, Check, CheckCircle2,
   ChevronLeft, ChevronRight, CircleHelp, Clock3, CloudDownload, Copy, Download, ExternalLink,
@@ -7,6 +8,7 @@ import {
   Pause, Play, Plus, RefreshCw, Settings2, ShieldAlert, ShieldCheck, SlidersHorizontal,
   Sparkles, Sun, Trash2, UserMinus, UserRound, Users, X, Zap
 } from 'lucide-react';
+import { groupTeamAccounts } from '../shared/team-members.mjs';
 import './styles.css';
 
 const initialChildren = [];
@@ -155,7 +157,7 @@ function isMemberOfTeam(account, teamId) {
 
 function accountForTeam(account, teamId) {
   const membership = teamMembershipFor(account, teamId);
-  return membership ? { ...account, quota5h: membership.quota5h ?? account.quota5h, quota7d: membership.quota7d ?? account.quota7d, quotaSnapshot: membership.quotaSnapshot || account.quotaSnapshot, joinedAt: membership.joinedAt || account.joinedAt } : account;
+  return membership ? { ...account, quota5h: membership.quota5h ?? account.quota5h, quota7d: membership.quota7d ?? account.quota7d, quotaSnapshot: membership.quotaSnapshot || account.quotaSnapshot, seatType: membership.seatType || account.seatType || account.memberSnapshot?.seatType || null, joinedAt: membership.joinedAt || account.joinedAt } : account;
 }
 
 function teamDisplayName(mother) {
@@ -169,12 +171,24 @@ function seatTypeLabel(type) {
   return type || '其他席位';
 }
 
+function inviteSeatTypeLabel(type) {
+  if (type === 'default') return '普通席位';
+  if (type === 'prolite') return '高级席位';
+  return '自动分配';
+}
+
 function seatBreakdown(snapshot = {}) {
   const capacities = Array.isArray(snapshot.seatCapacity) ? snapshot.seatCapacity : [];
+  const assigned = snapshot.assigned && typeof snapshot.assigned === 'object' ? snapshot.assigned : {};
   return capacities.map((entry) => {
     const total = Number(entry?.paid ?? entry?.entitled ?? entry?.total);
-    const available = Number(entry?.available);
-    const used = Number.isFinite(total) && Number.isFinite(available) ? Math.max(0, total - available) : null;
+    const availableValue = entry?.available;
+    const available = availableValue === null || availableValue === undefined || availableValue === '' ? null : Number(availableValue);
+    const assignedValue = assigned[String(entry?.type || '').toLowerCase()];
+    const assignedCount = assignedValue === null || assignedValue === undefined || assignedValue === '' ? null : Number(assignedValue);
+    const used = Number.isFinite(assignedCount)
+      ? Math.max(0, assignedCount)
+      : Number.isFinite(total) && Number.isFinite(available) ? Math.max(0, total - available) : null;
     return { type: entry?.type || '', label: seatTypeLabel(entry?.type), used, total: Number.isFinite(total) ? total : null, available: Number.isFinite(available) ? available : null };
   }).filter((entry) => entry.total != null || entry.available != null);
 }
@@ -382,6 +396,12 @@ function App() {
   const [batchAcquire, setBatchAcquire] = useState({ loading: false, result: null });
   const [showMother, setShowMother] = useState(false);
   const [editingMotherId, setEditingMotherId] = useState(null);
+  const [managedMotherId, setManagedMotherId] = useState(null);
+  const [managerAction, setManagerAction] = useState({ loading: false, message: '' });
+  const [showBillingPreview, setShowBillingPreview] = useState(false);
+  const [billingPreviewLoading, setBillingPreviewLoading] = useState(false);
+  const [billingPreviewError, setBillingPreviewError] = useState('');
+  const [billingPreviewData, setBillingPreviewData] = useState({ items: [], total: 0, succeeded: 0, failed: 0, expiring: 0, thresholdDays: 7, checkedAt: null });
   const [showAccount, setShowAccount] = useState(false);
   const [editingAccountId, setEditingAccountId] = useState(null);
   const [showTeamDetail, setShowTeamDetail] = useState(false);
@@ -503,6 +523,7 @@ function App() {
   }, [view, historyPage, historyPageSize, historyReloadKey]);
 
   const activeMother = mothers.find((m) => m.id === selectedTeam) || mothers[0];
+  const automaticMothers = useMemo(() => mothers.filter((mother) => mother.rotationEnabled !== false), [mothers]);
   const activeChildren = children.filter((c) => activeMother && isMemberOfTeam(c, activeMother.accountId || activeMother.team) && c.status !== 'kicked');
   const trackedChildren = children.filter((c) => joinedTeamsFor(c).some((entry) => entry.status === 'active'));
   const readyChildren = children.filter((c) => c.status === 'ready');
@@ -526,27 +547,51 @@ function App() {
     const seatUsed = Number.isFinite(Number(mother.used)) ? Number(mother.used) : numericOrNull(snapshot.seatsInUse);
     const seatTypes = seatBreakdown(snapshot);
     const teamChildren = children.filter((child) => isMemberOfTeam(child, teamId) && child.status !== 'kicked').map((child) => accountForTeam(child, teamId));
-    const memberSnapshots = [...(mother.members || []), ...teamChildren.map((child) => child.memberSnapshot)].filter(Boolean);
-    const owners = normalizedOwners(mother, memberSnapshots);
+    const remoteMembers = (mother.members || []).filter((item) => (item.email || item.id) && !item.deactivated_time && !item.deactivatedTime);
+    const authoritativeMembers = mother.lastMembersProbe?.ok === true;
+    const memberSnapshots = authoritativeMembers ? remoteMembers : [...remoteMembers, ...teamChildren.map((child) => child.memberSnapshot)].filter(Boolean);
+    const owners = normalizedOwners(authoritativeMembers ? { ...mother, email: '', ownerAccounts: [] } : mother, memberSnapshots);
     const ownerEmails = new Set(owners.map((owner) => String(owner.email || '').toLowerCase()).filter(Boolean));
     const rows = [];
-    const usedIds = new Set();
-    for (const member of (mother.members || []).filter((item) => (item.email || item.id) && !item.deactivated_time && !item.deactivatedTime)) {
-      const child = teamChildren.find((item) => (member.id && item.memberId === member.id) || (member.email && item.email?.toLowerCase() === member.email.toLowerCase()));
-      if (child) usedIds.add(child.id);
-      const isOwner = isOwnerMember(member) || member.email?.toLowerCase() === mother.email?.toLowerCase() || member.id === mother.chatgptUserId || ownerEmails.has(String(member.email || '').toLowerCase());
-      const ownerRecord = isOwner ? teamOwnerRecordFor(mother, member.email) : null;
-      rows.push({ member, child: child ? teamScopedAccount(child, teamId, ownerRecord) : (isOwner ? { ...ownerAccount, ...ownerRecord } : null), isOwner });
+    const groups = groupTeamAccounts(remoteMembers, teamChildren, { authoritativeMembers });
+    for (const group of groups) {
+      const { child } = group;
+      const member = group.member || child?.memberSnapshot || null;
+      const email = member?.email || child?.email || '';
+      const isOwner = isOwnerMember(member || {}) || email.toLowerCase() === mother.email?.toLowerCase() || member?.id === mother.chatgptUserId || ownerEmails.has(email.toLowerCase());
+      const ownerRecord = isOwner ? teamOwnerRecordFor(mother, email) : null;
+      let account = null;
+      if (child) {
+        const scoped = teamScopedAccount(child, teamId, ownerRecord);
+        account = {
+          ...scoped,
+          id: child.id,
+          email: child.email || member?.email || '',
+          memberId: child.memberId || member?.id || null,
+          accountUserId: child.accountUserId || member?.accountUserId || member?.account_user_id || null,
+          credentialsStatus: child.credentialsStatus || scoped.credentialsStatus || null,
+          seatType: member?.seatType || member?.seat_type || scoped.seatType || null,
+          joinedAt: scoped.joinedAt || member?.createdTime || member?.created_time || null,
+        };
+      } else if (ownerRecord) {
+        account = {
+          ...ownerRecord,
+          id: ownerRecord.id || member?.id || member?.accountUserId || null,
+          email: member?.email || ownerRecord.email || '',
+          name: member?.name || ownerRecord.name || '',
+          status: 'active',
+          seatType: member?.seatType || member?.seat_type || null,
+          joinedAt: member?.createdTime || member?.created_time || mother.createdAt || null,
+          joinedTeams: [{ team: teamId, status: 'active', joinedAt: member?.createdTime || member?.created_time || mother.createdAt || null }],
+        };
+      }
+      rows.push({ identityKey: group.identityKey, member, child: account, childId: child?.id || null, isOwner });
     }
-    for (const child of teamChildren) if (!usedIds.has(child.id)) {
-      const isOwner = isOwnerMember(child.memberSnapshot || {}) || ownerEmails.has(String(child.email || '').toLowerCase());
-      rows.push({ member: child.memberSnapshot || null, child: teamScopedAccount(child, teamId, isOwner ? teamOwnerRecordFor(mother, child.email) : null), isOwner });
-    }
-    for (const owner of mother.ownerAccounts || []) {
+    for (const owner of authoritativeMembers ? [] : (mother.ownerAccounts || [])) {
       if (!owner.email || rows.some((row) => row.child?.email?.toLowerCase() === owner.email.toLowerCase() || row.member?.email?.toLowerCase() === owner.email.toLowerCase())) continue;
-      rows.push({ member: { email: owner.email, id: owner.userId || null, role: 'account-owner' }, child: { ...ownerAccount, ...teamOwnerRecordFor(mother, owner.email), id: owner.userId || `owner_${rows.length}`, email: owner.email, name: owner.name || '', status: 'active', joinedAt: mother.createdAt, joinedTeams: [{ team: teamId, status: 'active', joinedAt: mother.createdAt }] }, isOwner: true });
+      rows.push({ identityKey: `email:${owner.email.toLowerCase()}`, member: { email: owner.email, id: owner.userId || null, role: 'account-owner' }, child: { ...ownerAccount, ...teamOwnerRecordFor(mother, owner.email), id: owner.userId || `owner_${rows.length}`, email: owner.email, name: owner.name || '', status: 'active', joinedAt: mother.createdAt, joinedTeams: [{ team: teamId, status: 'active', joinedAt: mother.createdAt }] }, childId: null, isOwner: true });
     }
-    if (!rows.some((row) => row.isOwner) && mother.email) rows.unshift({ member: { email: mother.email, id: mother.chatgptUserId || null }, child: ownerAccount, isOwner: true });
+    if (!authoritativeMembers && !rows.some((row) => row.isOwner) && mother.email) rows.unshift({ identityKey: `email:${mother.email.toLowerCase()}`, member: { email: mother.email, id: mother.chatgptUserId || null }, child: ownerAccount, childId: null, isOwner: true });
     return {
       id: mother.id,
       teamId,
@@ -555,7 +600,7 @@ function App() {
       mother,
       owners,
       owner: owners[0] || { email: mother.email || '', name: mother.name || '', userId: mother.chatgptUserId || null },
-      seats: { used: seatUsed, total: seatTotal, open: seatUsed != null && seatTotal != null ? Math.max(0, seatTotal - seatUsed) : null, types: seatTypes },
+      seats: { used: seatUsed, total: seatTotal, open: seatUsed != null && seatTotal != null ? Math.max(0, seatTotal - seatUsed) : null, reserved: Math.max(0, Number(mother.seatClaimsCount) || 0), types: seatTypes },
       rows,
       lastSync: mother.lastWorkspaceSyncAt || mother.lastCheck || null,
     };
@@ -571,8 +616,9 @@ function App() {
   }, [isRunning]);
 
   const hasActiveRotation = mothers.some((mother) => mother.rotationProgress?.status === 'running');
+  const hasActiveManualKickTimers = children.some((child) => joinedTeamsFor(child).some((membership) => membership.manualKickEnabled === true));
   useEffect(() => {
-    if (!isProcessing && !isRunning) return undefined;
+    if (!isProcessing && !isRunning && !hasActiveManualKickTimers) return undefined;
     let cancelled = false;
     let loading = false;
     const refreshProgress = async () => {
@@ -590,10 +636,10 @@ function App() {
     void refreshProgress();
     const timer = window.setInterval(refreshProgress, isProcessing || hasActiveRotation ? 700 : 3000);
     return () => { cancelled = true; window.clearInterval(timer); };
-  }, [isProcessing, isRunning, hasActiveRotation]);
+  }, [isProcessing, isRunning, hasActiveRotation, hasActiveManualKickTimers]);
 
   useEffect(() => {
-    const rotationTeams = mothers.filter((mother) => mother.hasAccessToken && (mother.accountId || mother.team));
+    const rotationTeams = automaticMothers.filter((mother) => mother.hasAccessToken && (mother.accountId || mother.team));
     if (!isRunning || rotationTeams.length < 2) return undefined;
     const timer = setInterval(() => {
       setSelectedTeam((current) => {
@@ -602,7 +648,7 @@ function App() {
       });
     }, 7000);
     return () => clearInterval(timer);
-  }, [isRunning, mothers]);
+  }, [isRunning, automaticMothers]);
 
   function notify(message, type = 'success') {
     setToast({ message, type });
@@ -649,6 +695,33 @@ function App() {
     setHistoryReloadKey((value) => value + 1);
   }
 
+  async function loadBillingPreviews() {
+    if (!mothers.length) {
+      setBillingPreviewError('请先添加一个 Team');
+      return;
+    }
+    setBillingPreviewLoading(true);
+    setBillingPreviewError('');
+    try {
+      const payload = await apiRequest('/api/teams/billing-preview', { method: 'POST', body: JSON.stringify({ thresholdDays: 7 }) });
+      setBillingPreviewData({
+        ...payload,
+        items: Array.isArray(payload.items) ? payload.items : [],
+      });
+      reloadHistory();
+      await refreshState(false).catch(() => {});
+    } catch (error) {
+      setBillingPreviewError(error.message || '临期 Team 查询失败');
+    } finally {
+      setBillingPreviewLoading(false);
+    }
+  }
+
+  function openBillingPreviews() {
+    setShowBillingPreview(true);
+    void loadBillingPreviews();
+  }
+
   async function runCheck(motherId = null) {
     if (!motherId && !mothers.length) { notify('请先添加一个 Team', 'error'); return; }
     const allTeams = !motherId;
@@ -665,12 +738,13 @@ function App() {
       const recoveries = quotaResults.map((item) => item.tokenRecovery).filter(Boolean);
       const recovered = quotaResults.filter((item) => item.tokenRecovery?.ok && item.ok === true).length;
       const waitingForLogin = recoveries.filter((item) => !item.ok && (item.needsInput || item.browserRequired)).length;
+      const failedRecovery = recoveries.find((item) => !item.ok);
       const recoveryDetail = recovered
         ? `；已自动更新 ${recovered} 个 Team JSON`
         : waitingForLogin
           ? `；${waitingForLogin} 个账号需要完成登录验证后重试`
           : recoveries.length
-            ? '；OAuth 自动恢复未成功，请检查 Free 账号凭据'
+            ? `；OAuth 已自动重登但未恢复${failedRecovery?.message ? `：${failedRecovery.message}` : '，请检查 Free 账号凭据'}`
             : '';
       if (result.ok === false) { const message = `${allTeams ? '多 Team 检测部分失败' : '检测部分失败'}，已检查 ${allTeams ? `${result.succeeded || 0}/${result.teamCount || mothers.length} 个 Team，` : ''}${checked} 个账号${recoveryDetail}`; finishTask(taskId, 'partial', message, result); notify(message, 'error'); }
       else { const message = `${allTeams ? `全部 ${result.teamCount || mothers.length} 个 Team` : '检测'}完成，已检查 ${checked} 个账号`; finishTask(taskId, 'completed', message, result); notify(message); }
@@ -921,6 +995,53 @@ function App() {
     setShowMother(true);
   }
 
+  function openMotherManager(mother) {
+    setManagedMotherId(mother.id);
+    setManagerAction({ loading: false, message: '' });
+  }
+
+  async function manageMother(id, operation, fields = {}) {
+    const labels = { save: '保存凭据', probe: '检测母号', recover: '恢复管理凭据' };
+    setManagerAction({ loading: true, message: `正在${labels[operation]}` });
+    try {
+      const result = await apiRequest(`/api/mothers/${encodeURIComponent(id)}${operation === 'save' ? '' : `/${operation}`}`, {
+        method: operation === 'save' ? 'PATCH' : 'POST', body: JSON.stringify(fields),
+      });
+      if (operation === 'save') applyStatePayload(result, setChildren, setMothers);
+      await syncNow(false);
+      const message = operation === 'probe'
+        ? result.accountStatus === 'banned' ? `母号已封禁：${result.banReason}` : result.ok ? '母号额度正常' : `母号额度检测受阻：${result.message || result.status || '未知错误'}`
+        : operation === 'recover' ? 'Team 管理凭据已恢复' : '母号凭据已保存';
+      setManagerAction({ loading: false, message });
+      notify(message, result.ok === false ? 'info' : 'success');
+      return true;
+    } catch (error) {
+      await syncNow(false).catch(() => {});
+      const message = `${labels[operation]}失败：${error.message}`;
+      setManagerAction({ loading: false, message, authUrl: error.payload?.authUrl || '' });
+      notify(message, 'error');
+      return false;
+    }
+  }
+
+  async function deleteMother(id) {
+    const mother = mothers.find((item) => item.id === id);
+    if (!mother || !window.confirm(`确认从本项目删除 ${teamDisplayName(mother)}？不会删除远端 Team、Free 账号或 Sub2API 数据。`)) return;
+    setManagerAction({ loading: true, message: '正在删除本地 Team 记录' });
+    try {
+      const result = await apiRequest(`/api/mothers/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      applyStatePayload(result.state, setChildren, setMothers);
+      await syncNow(false);
+      setManagedMotherId(null);
+      setShowTeamDetail(false);
+      if (selectedTeam === id) setSelectedTeam(null);
+      notify(`Team 已从项目删除，解除 ${result.deleted?.detached || 0} 个账号关联`);
+    } catch (error) {
+      setManagerAction({ loading: false, message: `删除失败：${error.message}` });
+      notify(`删除 Team 失败：${error.message}`, 'error');
+    }
+  }
+
   async function importChildren() {
     let items = Array.isArray(importAccounts) ? importAccounts : [];
     const source = Array.isArray(importAccounts) ? 'sub2api' : 'manual';
@@ -1014,6 +1135,32 @@ function App() {
     } catch (error) { notify(`Team Sub2API 推送失败：${error.message}`, 'error'); }
   }
 
+  async function updateMemberKickTimers(motherId, childIds, { enabled = true, durationHours = null } = {}) {
+    const ids = [...new Set((childIds || []).filter(Boolean))];
+    if (!motherId || !ids.length) return false;
+    const actionLabel = enabled ? '启动退出倒计时' : '取消退出倒计时';
+    const taskId = createTask('member-kick-timer', `${actionLabel} · ${ids.length} 个账号`, motherId, '更新 Team 成员的手动退出计划');
+    try {
+      updateTask(taskId, { progress: 45, message: '正在保存倒计时设置' });
+      const body = { childIds: ids, enabled };
+      if (enabled) body.durationHours = Number(durationHours);
+      const payload = await apiRequest(`/api/mothers/${encodeURIComponent(motherId)}/member-kick-timers`, { method: 'POST', body: JSON.stringify(body) });
+      applyStatePayload(payload.state || payload, setChildren, setMothers);
+      await refreshState(false);
+      const updatedCount = payload.updated?.length ?? ids.length;
+      const skippedCount = payload.skipped?.length || 0;
+      const message = `${updatedCount} 个账号已${enabled ? '开始倒计时' : '取消倒计时'}${skippedCount ? `，跳过 ${skippedCount} 个受保护或无效账号` : ''}`;
+      finishTask(taskId, skippedCount ? 'partial' : 'completed', message, payload);
+      notify(message, skippedCount ? 'info' : 'success');
+      return true;
+    } catch (error) {
+      const message = `${actionLabel}失败：${error.message}`;
+      finishTask(taskId, 'failed', message);
+      notify(message, 'error');
+      return false;
+    }
+  }
+
   async function removeChild(id) {
     const child = children.find((item) => item.id === id);
     if (!child || !child.team || child.status === 'kicked') return;
@@ -1070,7 +1217,8 @@ function App() {
       const path = editingMotherId ? `/api/mothers/${encodeURIComponent(editingMotherId)}` : '/api/mothers';
       const method = editingMotherId ? 'PATCH' : 'POST';
       const teamId = next.accountId || next.team || '';
-      const payload = await apiRequest(path, { method, body: JSON.stringify({ ...next, team: teamId, accountId: teamId, teamName: next.teamName || next.displayName || '', rotationMode: next.rotationMode === 'rotating' ? 'rotating' : 'fixed', primaryOwnerEmail: next.primaryOwnerEmail || next.email || '', accessToken: next.accessToken || next.token || '' }) });
+      const inviteSeatType = ['default', 'prolite'].includes(next.inviteSeatType) ? next.inviteSeatType : 'auto';
+      const payload = await apiRequest(path, { method, body: JSON.stringify({ ...next, team: teamId, accountId: teamId, teamName: next.teamName || next.displayName || '', rotationMode: next.rotationMode === 'rotating' ? 'rotating' : 'fixed', inviteSeatType, primaryOwnerEmail: next.primaryOwnerEmail || next.email || '', accessToken: next.accessToken || next.token || '' }) });
       applyStatePayload(payload, setChildren, setMothers);
       reloadHistory();
       setSelectedTeam(next.id); setShowMother(false);
@@ -1096,7 +1244,7 @@ function App() {
       <div className="page-heading"><div><div className="breadcrumb"><span>我的工作区</span><ChevronRight size={14} /><strong>{view === 'run' ? '首页' : navItems.find((item) => item.id === view)?.label}</strong></div><h1>{view === 'run' ? 'Team 配额自动化' : navItems.find((item) => item.id === view)?.label}</h1><p>{view === 'run' ? '持续监控 Team 席位与账号额度，自动完成移除和补位。' : view === 'teams' ? '管理 Team 所有者、席位和当前成员。' : view === 'free' ? '维护账号凭据、加入过的 Team 和 Sub2API 状态。' : '集中管理自动检测和操作记录。'}</p></div><div className="heading-actions"><span className={isRunning ? 'live-badge on' : 'live-badge'}><i />{isRunning ? 'Live' : 'Paused'}</span><button className="button ghost" onClick={toggleAutomation}>{isRunning ? <Pause size={15} /> : <Play size={15} />}{isRunning ? '暂停' : '恢复'}</button><button className="button primary" onClick={syncNow}><RefreshCw size={15} />同步进度</button></div></div>
 
       {view === 'run' && <RunView activeMother={activeMother} activeChildren={activeChildren} trackedChildren={trackedChildren} readyChildren={readyChildren} exhausted={exhausted} canRefillAll={anyExhausted || anyOpenSeat || kickWindow === 'time'} lowQuota={lowQuota} seatsOpen={seatsOpen} stage={stage} progress={progress} isRunning={isRunning} isProcessing={isProcessing} lastSync={lastSync} runCheck={runCheck} refillSeats={refillSeats} setShowMother={() => openMother(activeMother)} setSelectedTeam={setSelectedTeam} mothers={mothers} autoRefill={autoRefill} />}
-      {view === 'teams' && <TeamManagementView teams={teamRecords} openTeam={openMother} openDetail={openTeamDetail} setShowImport={() => setShowImport(true)} exportTeamSub2Api={exportTeamSub2Api} pushTeamSub2Api={pushTeamSub2Api} />}
+      {view === 'teams' && <TeamManagementView teams={teamRecords} openTeam={openMother} openDetail={openTeamDetail} setShowImport={() => setShowImport(true)} exportTeamSub2Api={exportTeamSub2Api} pushTeamSub2Api={pushTeamSub2Api} openBillingPreviews={openBillingPreviews} billingPreviewLoading={billingPreviewLoading} />}
       {view === 'free' && <FreeAccountsView children={filteredAccounts} allChildren={accountRecords} mothers={mothers} search={search} setSearch={setSearch} setShowImport={() => setShowImport(true)} addAccount={() => openAccount()} exportSub2Api={exportSub2Api} pushSub2Api={pushSub2Api} removeChild={removeChild} deleteFreeAccount={deleteFreeAccount} batchDeleteBannedAccounts={batchDeleteBannedAccounts} openJsonImport={openJsonImport} editAccount={openAccount} acquireAccount={acquireAccount} acquireMissingFreeJson={acquireMissingFreeJson} acquireStates={acquireStates} batchAcquire={batchAcquire} concurrency={concurrency} />}
       {view === 'history' && <HistoryView history={history} page={historyPage} pageSize={historyPageSize} meta={historyMeta} loading={historyLoading} error={historyError} onPageChange={changeHistoryPage} onPageSizeChange={changeHistoryPageSize} onRetry={reloadHistory} onSelect={setSelectedHistory} />}
       {view === 'settings' && <SettingsView autoRefill={autoRefill} setAutoRefill={setAutoRefill} promoteJoinedAccounts={promoteJoinedAccounts} setPromoteJoinedAccounts={setPromoteJoinedAccounts} threshold={threshold} setThreshold={setThreshold} checkInterval={checkInterval} setCheckInterval={setCheckInterval} concurrency={concurrency} setConcurrency={setConcurrency} kickWindow={kickWindow} setKickWindow={setKickWindow} kickAfterHours={kickAfterHours} setKickAfterHours={setKickAfterHours} integrations={integrations} openIntegration={setShowIntegration} proxy={proxySettings} openProxy={() => setShowProxy(true)} saveSettings={saveSettings} />}
@@ -1109,7 +1257,9 @@ function App() {
     {showIntegration === 'sub2api' && <Sub2ApiModal configs={integrations.sub2apis || []} mothers={mothers} onClose={() => setShowIntegration(null)} onSave={(next) => saveIntegration('sub2api', next)} />}
     {showIntegration === 'mailbox' && <IntegrationModal type="mailbox" config={integrations.mailbox} onClose={() => setShowIntegration(null)} onSave={(next) => saveIntegration('mailbox', next)} />}
     {showProxy && <ProxyModal proxy={proxySettings} onClose={() => setShowProxy(false)} onSave={saveProxySettings} onAdd={addProxyEntries} onRemove={removeProxyEntry} notify={notify} />}
-    {showTeamDetail && <TeamDetailModal team={teamRecords.find((item) => item.id === detailTeamId) || null} onClose={() => setShowTeamDetail(false)} runCheck={runCheck} refillSeats={refillSeats} setSelectedTeam={setSelectedTeam} openTeam={openMother} exportTeamSub2Api={exportTeamSub2Api} pushTeamSub2Api={pushTeamSub2Api} kickWindow={kickWindow} kickAfterHours={kickAfterHours} />}
+    {showTeamDetail && <TeamDetailModal team={teamRecords.find((item) => item.id === detailTeamId) || null} onClose={() => setShowTeamDetail(false)} runCheck={runCheck} refillSeats={refillSeats} setSelectedTeam={setSelectedTeam} openTeam={openMother} manageMother={openMotherManager} exportTeamSub2Api={exportTeamSub2Api} pushTeamSub2Api={pushTeamSub2Api} updateMemberKickTimers={updateMemberKickTimers} automationEnabled={autoRefill && (teamRecords.find((item) => item.id === detailTeamId)?.mother?.rotationEnabled !== false)} kickWindow={kickWindow} kickAfterHours={kickAfterHours} />}
+    {managedMotherId && <MotherManagerModal mother={mothers.find((item) => item.id === managedMotherId)} action={managerAction} onClose={() => setManagedMotherId(null)} onSave={(fields) => manageMother(managedMotherId, 'save', fields)} onProbe={() => manageMother(managedMotherId, 'probe')} onRecover={(fields) => manageMother(managedMotherId, 'recover', fields)} onDelete={() => deleteMother(managedMotherId)} />}
+    {showBillingPreview && <BillingPreviewModal data={billingPreviewData} loading={billingPreviewLoading} error={billingPreviewError} onRefresh={loadBillingPreviews} onClose={() => setShowBillingPreview(false)} />}
     {showSettings && <SettingsModal onClose={() => setShowSettings(false)} />}
     {showAgentHelp && <AgentAccessModal onClose={() => setShowAgentHelp(false)} notify={notify} />}
     <TaskCenter tasks={tasks} open={showTaskCenter} onOpen={() => setShowTaskCenter(true)} onClose={() => setShowTaskCenter(false)} />
@@ -1148,6 +1298,37 @@ function RotationCountdown({ joinedAt, hours }) {
   return <small className="rotation-countdown">剩余 {label}</small>;
 }
 
+function manualKickTimerFor(account, membership) {
+  const timer = membership?.kickTimer || account?.kickTimer || {};
+  const enabled = membership?.manualKickEnabled ?? account?.manualKickEnabled ?? timer.enabled ?? false;
+  const kickAt = membership?.manualKickAt || account?.manualKickAt || timer.kickAt || timer.expiresAt || null;
+  const startedAt = membership?.manualKickStartedAt || account?.manualKickStartedAt || timer.startedAt || null;
+  const durationMinutes = membership?.manualKickDurationMinutes ?? account?.manualKickDurationMinutes ?? timer.durationMinutes ?? null;
+  const parsedKickAt = Date.parse(kickAt || '');
+  const expired = membership?.manualKickExpired ?? account?.manualKickExpired ?? (Number.isFinite(parsedKickAt) && parsedKickAt <= Date.now());
+  return { enabled: enabled === true, kickAt, startedAt, durationMinutes, expired: Boolean(expired) };
+}
+
+function ManualKickCountdown({ timer }) {
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    if (!timer?.enabled || !timer?.kickAt) return undefined;
+    const interval = window.setInterval(() => setTick((value) => value + 1), 1000);
+    return () => window.clearInterval(interval);
+  }, [timer?.enabled, timer?.kickAt]);
+  if (!timer?.enabled) return <span className="manual-timer-empty">未设置</span>;
+  const kickAt = Date.parse(timer.kickAt || '');
+  if (!Number.isFinite(kickAt)) return <span className="manual-timer-state pending"><strong>已开启</strong><small>等待服务端确认时间</small></span>;
+  const remainingSeconds = Math.max(0, Math.ceil((kickAt - Date.now()) / 1000));
+  const days = Math.floor(remainingSeconds / 86400);
+  const hours = Math.floor((remainingSeconds % 86400) / 3600);
+  const minutes = Math.floor((remainingSeconds % 3600) / 60);
+  const seconds = remainingSeconds % 60;
+  const clock = `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+  const due = timer.expired || remainingSeconds <= 0;
+  return <span className={`manual-timer-state ${due ? 'due' : 'running'}`}><strong>{due ? '等待移出' : `${days ? `${days}天 ` : ''}${clock}`}</strong><small>{displayTime(timer.kickAt)} 到期</small></span>;
+}
+
 function dailyRotationValues(mother = {}) {
   const usage = mother.dailyRotationUsage || {};
   const limit = Math.max(1, Number(usage.limit ?? mother.dailyRotationLimit) || 3);
@@ -1155,7 +1336,20 @@ function dailyRotationValues(mother = {}) {
   return { count, limit, remaining: Math.max(0, Number(usage.remaining ?? limit - count) || 0) };
 }
 
-function TeamManagementView({ teams, openTeam, openDetail, setShowImport, exportTeamSub2Api, pushTeamSub2Api }) {
+function TeamRotationStatus({ mother }) {
+  const enabled = mother?.rotationEnabled !== false;
+  return <span className={`status-chip ${enabled ? 'active' : 'rotation-paused'}`}><i />{enabled ? '参与轮转' : '不参与轮转'}</span>;
+}
+
+function TeamHealthStatus({ mother }) {
+  const account = mother?.accountStatus || (mother?.status === 'online' ? 'healthy' : mother?.status === 'banned' ? 'banned' : mother?.status === 'offline' ? 'probe_blocked' : null);
+  const accountLabel = account === 'banned' ? '账号已封禁' : account === 'healthy' ? '母号额度正常' : account === 'probe_blocked' ? '额度检测受阻' : account === 'auth_required' ? '需要登录' : '未检测';
+  const management = mother?.managementStatus;
+  const managementLabel = management === 'ready' ? '可管理 Team' : management === 'forbidden' ? '管理权限不足' : management === 'auth_required' ? '管理凭据失效' : management === 'degraded' ? '订阅同步受阻' : management === 'blocked' ? '管理同步受阻' : '';
+  return <span className="team-health-status"><span className={`status-chip ${account === 'healthy' ? 'online' : account === 'banned' ? 'banned' : account === 'probe_blocked' ? 'warning' : ''}`} title={mother?.lastProbe?.message || '母号额度接口状态'}><i />{accountLabel}</span>{managementLabel && management !== 'ready' && <span className={`status-chip ${management === 'forbidden' ? 'banned' : 'warning'}`} title={[mother?.lastMembersProbe?.message, mother?.lastSubscriptionProbe?.message].filter(Boolean).join('；')}><i />{managementLabel}</span>}</span>;
+}
+
+function TeamManagementView({ teams, openTeam, openDetail, setShowImport, exportTeamSub2Api, pushTeamSub2Api, openBillingPreviews, billingPreviewLoading }) {
   const totalSeats = teams.reduce((sum, team) => sum + (Number(team.seats.total) || 0), 0);
   const usedSeats = teams.reduce((sum, team) => sum + (Number(team.seats.used) || 0), 0);
   const openSeats = teams.reduce((sum, team) => sum + (Number(team.seats.open) || 0), 0);
@@ -1167,7 +1361,7 @@ function TeamManagementView({ teams, openTeam, openDetail, setShowImport, export
       <Metric label="同步状态" value={teams.length ? '已接入' : '未配置'} detail={teams.length ? '点击管理查看额度' : '添加 Team 后开始'} icon={Activity} tone="slate" />
     </section>
     <section className="content-panel team-list-panel">
-      <div className="content-toolbar"><div><h2>Team 管理</h2><p>按空间查看所有者、席位和当前成员；账号详情在管理弹窗中展示。</p></div><div className="toolbar-actions"><button className="button ghost" onClick={() => exportTeamSub2Api()}><Download size={15} />导出 Team JSON</button><button className="button secondary" onClick={() => pushTeamSub2Api()}><ExternalLink size={15} />推送 Team</button><button className="button ghost" onClick={setShowImport}><ArrowDownToLine size={15} />导入账号</button><button className="button primary" onClick={() => openTeam()}><Plus size={15} />添加 Team</button></div></div>
+      <div className="content-toolbar"><div><h2>Team 管理</h2><p>按空间查看所有者、席位和当前成员；账号详情在管理弹窗中展示。</p></div><div className="toolbar-actions"><button className="button secondary" onClick={openBillingPreviews} disabled={!teams.length || billingPreviewLoading} title={teams.length ? '查询所有 Team 的到期时间与新增普通席位费用' : '请先添加 Team'}><Clock3 size={15} className={billingPreviewLoading ? 'button-spinner' : ''} />{billingPreviewLoading ? '查询中' : '临期 Team'}</button><button className="button ghost" onClick={() => exportTeamSub2Api()}><Download size={15} />导出 Team JSON</button><button className="button secondary" onClick={() => pushTeamSub2Api()}><ExternalLink size={15} />推送 Team</button><button className="button ghost" onClick={setShowImport}><ArrowDownToLine size={15} />导入账号</button><button className="button primary" onClick={() => openTeam()}><Plus size={15} />添加 Team</button></div></div>
       {!teams.length ? <div className="empty-state"><Users size={28} /><strong>还没有 Team 空间</strong><span>添加 Team 后会显示空间、所有者和席位。</span></div> : <div className="table-wrap team-list-wrap"><table className="data-table team-list-table"><thead><tr><th>Team 空间</th><th>所有者</th><th>席位</th><th>当前账号</th><th>今日轮转</th><th>状态</th><th>最后同步</th><th /></tr></thead><tbody>{teams.map((team) => {
         const status = team.mother.status || 'unconfigured';
         const statusLabel = status === 'online' ? '在线' : status === 'offline' ? '离线' : '未检测';
@@ -1175,10 +1369,10 @@ function TeamManagementView({ teams, openTeam, openDetail, setShowImport, export
         return <tr key={team.id}>
           <td><div className="team-list-title"><div className="team-avatar"><Users size={17} /></div><div><strong>{team.displayName}</strong><small className="team-sub2api-target">{team.mother.sub2apiIntegrationName || '未配置 Sub2API'}</small></div></div></td>
           <td><OwnerEmails owners={team.owners} /></td>
-          <td><div className="table-seats"><span>{team.seats.used == null || team.seats.total == null ? '--' : `${team.seats.used}/${team.seats.total}`}</span><i><b style={{ width: `${team.seats.total ? Math.min(100, (team.seats.used || 0) / team.seats.total * 100) : 0}%` }} /></i></div>{team.seats.types?.length ? <div className="seat-type-list">{team.seats.types.map((seat) => <small key={seat.type}>{seat.label} {seat.used == null ? '--' : `${seat.used}/${seat.total}`}</small>)}</div> : null}</td>
+          <td><div className="table-seats"><span>{team.seats.used == null || team.seats.total == null ? '--' : `${team.seats.used}/${team.seats.total}`}</span><i><b style={{ width: `${team.seats.total ? Math.min(100, (team.seats.used || 0) / team.seats.total * 100) : 0}%` }} /></i></div>{team.seats.reserved > 0 && <small className="seat-policy-label">待核验占位 {team.seats.reserved}</small>}{team.seats.types?.length ? <div className="seat-type-list">{team.seats.types.map((seat) => <small key={seat.type}>{seat.label} {seat.used == null ? '--' : `${seat.used}/${seat.total}`}</small>)}</div> : null}<small className="seat-policy-label">补位：{inviteSeatTypeLabel(team.mother.inviteSeatType)}</small></td>
           <td>{team.rows.length} 个</td>
           <td><span className={`rotation-limit ${daily.remaining === 0 ? 'reached' : ''}`}>{daily.count} / {daily.limit}</span></td>
-          <td><span className={`status-chip ${status}`}><i />{statusLabel}</span></td>
+          <td><div className="team-status-stack"><TeamHealthStatus mother={team.mother} /><TeamRotationStatus mother={team.mother} /></div></td>
           <td>{displayTime(team.lastSync)}</td>
           <td><button className="button ghost compact-button" onClick={() => openDetail(team.id)}><Settings2 size={14} />管理</button></td>
         </tr>;
@@ -1219,28 +1413,106 @@ function TaskCenter({ tasks, open, onOpen, onClose }) {
   const recent = tasks.slice(0, 5);
   return <>
     <button className={`task-dock ${active ? 'running' : ''}`} onClick={onOpen} title="打开任务中心"><span className="task-dock-icon">{active ? <RefreshCw size={16} /> : <Clock3 size={16} />}</span><span><strong>{active ? '任务执行中' : '任务中心'}</strong><small>{active ? `${active.progress || 0}% · ${active.message || active.label}` : `${tasks.length} 条记录`}</small></span><ChevronRight size={15} /></button>
-    {open && <Modal title="任务中心" onClose={onClose} className="task-center-modal"><div className="task-center-intro">查看检测、补位和账号处理任务的实时状态、进度与执行结果。</div><div className="task-list">{recent.length ? recent.map((task) => <article className={`task-item ${task.status}`} key={task.id}><div className="task-item-head"><div><strong>{task.label}</strong><span>{taskStatusLabel(task.status)} · 创建 {taskTime(task.createdAt)}</span></div><b>{task.progress ?? 0}%</b></div><div className="task-progress"><i style={{ width: `${Math.max(0, Math.min(100, task.progress || 0))}%` }} /></div><p>{task.message || task.details || '等待更新'}{task.account ? ` · 当前账号：${task.account}` : ''}</p><small>开始：{taskTime(task.startedAt)}　完成：{taskTime(task.completedAt)}</small></article>) : <div className="empty-state compact-empty"><Clock3 size={25} /><strong>暂无任务</strong><span>点击检测、补满席位或批量获取后会显示进度。</span></div>}</div><div className="modal-foot"><span className="muted">任务记录保留最近 30 条</span><button className="button ghost" onClick={onClose}>关闭</button></div></Modal>}
+    {open && <Modal title="任务中心" onClose={onClose} className="task-center-modal"><div className="task-center-intro">查看检测、补位、定时退出和账号处理任务的实时状态、进度与执行结果。</div><div className="task-list">{recent.length ? recent.map((task) => <article className={`task-item ${task.status}`} key={task.id}><div className="task-item-head"><div><strong>{task.label}</strong><span>{taskStatusLabel(task.status)} · 创建 {taskTime(task.createdAt)}</span></div><b>{task.progress ?? 0}%</b></div><div className="task-progress"><i style={{ width: `${Math.max(0, Math.min(100, task.progress || 0))}%` }} /></div><p>{task.message || task.details || '等待更新'}{task.account ? ` · 当前账号：${task.account}` : ''}</p><small>开始：{taskTime(task.startedAt)}　完成：{taskTime(task.completedAt)}</small></article>) : <div className="empty-state compact-empty"><Clock3 size={25} /><strong>暂无任务</strong><span>点击检测、补满席位、设置倒计时或批量获取后会显示进度。</span></div>}</div><div className="modal-foot"><span className="muted">任务记录保留最近 30 条</span><button className="button ghost" onClick={onClose}>关闭</button></div></Modal>}
   </>;
 }
 
-function TeamDetailModal({ team, onClose, runCheck, refillSeats, setSelectedTeam, openTeam, exportTeamSub2Api, pushTeamSub2Api, kickWindow, kickAfterHours }) {
+function TeamDetailModal({ team, onClose, runCheck, refillSeats, setSelectedTeam, openTeam, manageMother, exportTeamSub2Api, pushTeamSub2Api, updateMemberKickTimers, automationEnabled, kickWindow, kickAfterHours }) {
+  const [selectedChildIds, setSelectedChildIds] = useState([]);
+  const [showKickTimer, setShowKickTimer] = useState(false);
+  const [timerHours, setTimerHours] = useState(String(Math.max(1, Number(kickAfterHours) || 12)));
+  const [timerError, setTimerError] = useState('');
+  const [timerSaving, setTimerSaving] = useState(false);
+  const rows = team?.rows || [];
+  const primaryOwnerEmail = String(team?.mother?.primaryOwnerEmail || team?.mother?.email || '').trim().toLowerCase();
+  const fixedRotation = (team?.mother?.rotationMode || 'fixed') !== 'rotating';
+  const rowDetails = rows.map((row, index) => {
+    const account = row.child;
+    const email = account?.email || row.member?.email || '未识别邮箱';
+    const memberships = account?.joinedTeams || [];
+    const membership = memberships.find((entry) => entry.team === team?.teamId && entry.status === 'active') || memberships.find((entry) => entry.team === team?.teamId);
+    const fixedPrimary = fixedRotation && Boolean(primaryOwnerEmail) && email.trim().toLowerCase() === primaryOwnerEmail;
+    const banned = account?.status === 'banned' || account?.banStatus === 'banned';
+    const selectable = Boolean(row.childId) && !fixedPrimary && rows.length > 1 && account?.status !== 'kicked' && !banned;
+    const disabledReason = !row.childId ? '该成员未关联到 Free 账号池' : fixedPrimary ? '固定主号不能设置退出倒计时' : rows.length <= 1 ? 'Team 至少需要保留一个账号' : account?.status === 'kicked' ? '账号已移出 Team' : banned ? '封禁账号无需设置退出倒计时' : '';
+    return {
+      row,
+      account,
+      email,
+      membership,
+      fixedPrimary,
+      selectable,
+      disabledReason,
+      timer: manualKickTimerFor(account, membership),
+      joinedAt: membership?.joinedAt || account?.joinedAt || row.member?.createdTime,
+      memberSeatType: row.member?.seatType || account?.seatType || account?.memberSnapshot?.seatType,
+      key: row.identityKey || `${email}-${row.member?.id || row.childId || index}`,
+    };
+  });
+  const selectableIds = rowDetails.filter((item) => item.selectable).map((item) => item.row.childId);
+  const selectableKey = selectableIds.join('|');
+  useEffect(() => {
+    setSelectedChildIds((current) => current.filter((id) => selectableIds.includes(id)));
+  }, [team?.id, selectableKey]);
   if (!team) return null;
+
+  const selectedSet = new Set(selectedChildIds);
+  const allSelected = Boolean(selectableIds.length) && selectableIds.every((id) => selectedSet.has(id));
+  const someSelected = selectableIds.some((id) => selectedSet.has(id));
+  const activeTimerIds = rowDetails.filter((item) => item.row.childId && item.timer.enabled).map((item) => item.row.childId);
+  const selectedTimerIds = selectedChildIds.filter((id) => activeTimerIds.includes(id));
+  const hours = Number(timerHours);
+  const validHours = Number.isFinite(hours) && hours >= (1 / 60) && hours <= 720;
   const status = team.mother.status || 'unconfigured';
-  const hasExhausted = team.rows.some((row) => row.child?.status === 'exhausted' || row.child?.status === 'banned');
   const daily = dailyRotationValues(team.mother);
   const statusLabel = status === 'online' ? '在线' : status === 'offline' ? '离线' : '未检测';
+
+  function toggleSelection(childId, checked) {
+    setSelectedChildIds((current) => checked ? [...new Set([...current, childId])] : current.filter((id) => id !== childId));
+  }
+
+  function openTimerFor(ids = selectedChildIds) {
+    const nextIds = [...new Set(ids.filter(Boolean))];
+    if (!nextIds.length) return;
+    setSelectedChildIds(nextIds);
+    setTimerError('');
+    setShowKickTimer(true);
+  }
+
+  async function saveTimer(event) {
+    event?.preventDefault();
+    if (!validHours) {
+      setTimerError('请输入 1 分钟到 720 小时之间的时间');
+      return;
+    }
+    setTimerSaving(true);
+    const saved = await updateMemberKickTimers(team.mother.id, selectedChildIds, { enabled: true, durationHours: hours });
+    setTimerSaving(false);
+    if (saved) {
+      setShowKickTimer(false);
+      setSelectedChildIds([]);
+    }
+  }
+
+  async function cancelTimers(ids = selectedTimerIds) {
+    if (!ids.length) return;
+    setTimerSaving(true);
+    const saved = await updateMemberKickTimers(team.mother.id, ids, { enabled: false });
+    setTimerSaving(false);
+    if (saved) setSelectedChildIds((current) => current.filter((id) => !ids.includes(id)));
+  }
+
   return <Modal title={`Team 账号详情 · ${team.displayName}`} onClose={onClose} className="team-detail-modal">
-    <div className="team-detail-top"><div><span className="kicker">TEAM SPACE</span><strong className="team-detail-name">{team.displayName}</strong><small className="team-sub2api-target">同步到 {team.mother.sub2apiIntegrationName || '未配置 Sub2API'}</small></div><div className="team-detail-actions"><span className={`status-chip ${status}`}><i />{statusLabel}</span><button className="button ghost compact-button" onClick={() => { onClose(); openTeam(team.mother); }}><Settings2 size={14} />编辑 Team</button></div></div>
-    <div className="team-detail-summary"><div><span>所有者</span><OwnerEmails owners={team.owners} /><small>{team.owners?.length ? `${team.owners.length} 个所有者` : '未同步所有者'}</small></div><div><span>席位</span><strong>{team.seats.used == null || team.seats.total == null ? '--' : `${team.seats.used} / ${team.seats.total}`}</strong><small>{team.seats.open == null ? '尚未检测' : team.seats.open ? `剩余 ${team.seats.open} 个` : '已满'}</small></div><div><span>今日轮转</span><strong>{daily.count} / {daily.limit}</strong><small>{daily.remaining ? `还可轮转 ${daily.remaining} 个账号` : '今日已达上限'}</small></div><div><span>最后同步</span><strong>{displayTime(team.lastSync)}</strong><small>{team.rows.length} 个当前账号</small></div></div>
+    <div className="team-detail-top"><div><span className="kicker">TEAM SPACE</span><strong className="team-detail-name">{team.displayName}</strong><small className="team-sub2api-target">同步到 {team.mother.sub2apiIntegrationName || '未配置 Sub2API'}</small></div><div className="team-detail-actions"><TeamRotationStatus mother={team.mother} /><TeamHealthStatus mother={team.mother} /><button className="button secondary compact-button" onClick={() => manageMother(team.mother)}><KeyRound size={14} />管理母号</button><button className="button ghost compact-button" onClick={() => { onClose(); openTeam(team.mother); }}><Settings2 size={14} />编辑 Team</button></div></div>
+    <div className="team-detail-summary"><div><span>所有者</span><OwnerEmails owners={team.owners} /><small>{team.owners?.length ? `${team.owners.length} 个所有者` : '未同步所有者'}</small></div><div><span>席位</span><strong>{team.seats.used == null || team.seats.total == null ? '--' : `${team.seats.used} / ${team.seats.total}`}</strong><small>{team.seats.open == null ? '尚未检测' : team.seats.open ? `剩余 ${team.seats.open} 个` : '已满'}</small>{team.seats.reserved > 0 && <small className="seat-policy-label">待核验占位 {team.seats.reserved}</small>}{team.seats.types?.length ? <div className="seat-type-list">{team.seats.types.map((seat) => <small key={seat.type}>{seat.label} {seat.used == null ? '--' : `${seat.used}/${seat.total}`}</small>)}</div> : null}<small className="seat-policy-label">补位策略：{inviteSeatTypeLabel(team.mother.inviteSeatType)}</small></div><div><span>今日轮转</span><strong>{daily.count} / {daily.limit}</strong><small>{daily.remaining ? `还可轮转 ${daily.remaining} 个账号` : '今日已达上限'}</small></div><div><span>最后同步</span><strong>{displayTime(team.lastSync)}</strong><small>{team.rows.length} 个当前账号</small></div></div>
     <RotationProgress progress={team.mother.rotationProgress} />
     <div className="team-detail-toolbar"><div><h3>当前账号</h3><span>额度、身份和凭据状态</span></div><div className="toolbar-actions"><button className="button ghost compact-button" onClick={() => exportTeamSub2Api(team.mother.id)}><Download size={14} />导出 JSON</button><button className="button secondary compact-button" onClick={() => pushTeamSub2Api(team.mother.id)}><ExternalLink size={14} />推送 Sub2API</button><button className="button ghost compact-button" onClick={() => { setSelectedTeam(team.id); runCheck(team.mother.id); }}><RefreshCw size={14} />检测额度</button><button className="button secondary compact-button" disabled={!team.mother.accountId && !team.mother.team} title={!team.mother.accountId && !team.mother.team ? '请先配置 Team ID' : '先同步席位，再从 Free 账号池并发补满空席位'} onClick={() => { setSelectedTeam(team.id); refillSeats(team.mother.id); }}><Sparkles size={14} />补满席位</button></div></div>
-    <div className="table-wrap team-detail-table-wrap"><table className="data-table team-detail-table"><thead><tr><th>账号</th><th>身份</th><th>5h 剩余</th><th>7d 剩余</th><th>登录凭据</th><th>Sub2API</th><th>{kickWindow === 'time' ? '加入时间 / 倒计时' : '加入时间'}</th></tr></thead><tbody>{team.rows.map((row, index) => {
-      const account = row.child;
-      const email = account?.email || row.member?.email || '未识别邮箱';
-      const membership = (account?.joinedTeams || []).find((entry) => entry.team === team.teamId && entry.status === 'active') || (account?.joinedTeams || []).find((entry) => entry.team === team.teamId);
-      const joinedAt = membership?.joinedAt || account?.joinedAt || row.member?.createdTime;
-      return <tr key={`${email}-${row.member?.id || index}`}><td><div className="account-cell"><div className="queue-avatar">{email[0]?.toUpperCase() || '?'}</div><div><strong>{email}</strong><small className="mono">{account?.id || row.member?.id || '成员快照'}</small></div></div></td><td><div className="role-stack">{row.isOwner ? <span className="role-label owner">所有者</span> : <span className="role-label">成员</span>}{account?.status === 'banned' && <StatusBadge status="banned" />}</div></td><td><QuotaBar value={account?.quota5h} /></td><td><QuotaBar value={account?.quota7d} /></td><td><CredentialState account={account} /></td><td><span className={`sub2api-state ${account?.sub2apiStatus?.imported ? 'ready' : ''}`}>{account?.sub2apiStatus?.imported ? '已记录' : '未记录'}</span></td><td><span>{joinedAt ? displayTime(joinedAt) : <span className="muted">成员同步</span>}</span>{kickWindow === 'time' && <RotationCountdown joinedAt={joinedAt} hours={kickAfterHours} />}</td></tr>;
+    <div className="member-timer-toolbar"><span><Clock3 size={14} />已选 {selectedChildIds.length} 个{activeTimerIds.length ? ` · ${activeTimerIds.length} 个倒计时中` : ''}{!automationEnabled && activeTimerIds.length ? ' · 自动轮转已暂停' : ''}</span><div><button className="button ghost compact-button" disabled={!selectedTimerIds.length || timerSaving} onClick={() => cancelTimers()}><X size={14} />取消倒计时{selectedTimerIds.length ? ` (${selectedTimerIds.length})` : ''}</button><button className="button secondary compact-button" disabled={!selectedChildIds.length || timerSaving} title="为选中账号设置退出时间；执行时始终保留至少一个 Team 成员" onClick={() => openTimerFor()}><Clock3 size={14} />启动倒计时{selectedChildIds.length ? ` (${selectedChildIds.length})` : ''}</button></div></div>
+    <div className="table-wrap team-detail-table-wrap"><table className="data-table team-detail-table"><thead><tr><th className="timer-select-cell"><input type="checkbox" aria-label="选择全部可设置倒计时的账号" checked={allSelected} disabled={!selectableIds.length} ref={(node) => { if (node) node.indeterminate = someSelected && !allSelected; }} onChange={(event) => setSelectedChildIds(event.target.checked ? selectableIds : [])} /></th><th>账号</th><th>身份</th><th>5h 剩余</th><th>7d 剩余</th><th>登录凭据</th><th>Sub2API</th><th>{kickWindow === 'time' ? '加入时间 / 全局轮转' : '加入时间'}</th><th>手动退出</th></tr></thead><tbody>{rowDetails.map((item) => {
+      const { row, account, email, joinedAt, memberSeatType, timer } = item;
+      return <tr key={item.key} className={timer.enabled ? 'manual-timer-row' : ''}><td className="timer-select-cell"><span title={item.disabledReason || `选择 ${email}`}><input type="checkbox" aria-label={`选择 ${email}`} checked={selectedSet.has(row.childId)} disabled={!item.selectable} onChange={(event) => toggleSelection(row.childId, event.target.checked)} /></span></td><td><div className="account-cell"><div className="queue-avatar">{email[0]?.toUpperCase() || '?'}</div><div><strong>{email}</strong><small className="mono">{row.childId || account?.id || row.member?.id || '成员快照'}</small></div></div></td><td><div className="role-stack">{row.isOwner ? <span className="role-label owner">所有者</span> : <span className="role-label">成员</span>}{item.fixedPrimary && <small className="primary-owner-label">固定主号</small>}{memberSeatType && <small className={`seat-member-label ${memberSeatType === 'prolite' ? 'premium' : ''}`}>{seatTypeLabel(memberSeatType)}</small>}{account?.status === 'banned' && <StatusBadge status="banned" />}</div></td><td><QuotaBar value={account?.quota5h} /></td><td><QuotaBar value={account?.quota7d} /></td><td><CredentialState account={account} /></td><td><span className={`sub2api-state ${account?.sub2apiStatus?.imported ? 'ready' : ''}`}>{account?.sub2apiStatus?.imported ? '已记录' : '未记录'}</span></td><td><span>{joinedAt ? displayTime(joinedAt) : <span className="muted">成员同步</span>}</span>{kickWindow === 'time' && <RotationCountdown joinedAt={joinedAt} hours={kickAfterHours} />}</td><td><div className="manual-timer-cell"><ManualKickCountdown timer={timer} /><div className="manual-timer-actions"><button className="icon-button small" title={item.disabledReason || '设置退出倒计时'} aria-label={`设置 ${email} 的退出倒计时`} disabled={!item.selectable || timerSaving} onClick={() => openTimerFor([row.childId])}><Clock3 size={14} /></button>{timer.enabled && <button className="icon-button small danger-hover" title="取消退出倒计时" aria-label={`取消 ${email} 的退出倒计时`} disabled={!row.childId || timerSaving} onClick={() => cancelTimers([row.childId])}><X size={14} /></button>}</div></div></td></tr>;
     })}</tbody></table></div>
+    {showKickTimer && createPortal(<Modal title={`设置退出倒计时 · ${selectedChildIds.length} 个账号`} onClose={() => !timerSaving && setShowKickTimer(false)} className="kick-timer-modal"><form className="kick-timer-form" onSubmit={saveTimer}><label><span>倒计时</span><div className="timer-hours-control"><input autoFocus type="number" min="0.0167" max="720" step="any" value={timerHours} onChange={(event) => { setTimerHours(event.target.value); setTimerError(''); }} /><b>小时</b></div></label><div className="timer-presets">{[1, 6, 12, 24].map((value) => <button type="button" className={Number(timerHours) === value ? 'selected' : ''} key={value} onClick={() => { setTimerHours(String(value)); setTimerError(''); }}>{value}h</button>)}</div>{timerError && <span className="timer-form-error">{timerError}</span>}<div className="timer-kick-preview"><Clock3 size={15} /><span>预计退出</span><strong>{validHours ? new Date(Date.now() + hours * 60 * 60 * 1000).toLocaleString('zh-CN') : '--'}</strong></div><div className="modal-foot"><span className="muted">{automationEnabled ? '到期后进入移出与补位流程' : '自动轮转已暂停；到期后等待恢复再执行'}</span><div className="modal-foot-actions"><button type="button" className="button ghost" disabled={timerSaving} onClick={() => setShowKickTimer(false)}>取消</button><button type="submit" className="button primary" disabled={!validHours || timerSaving}><Clock3 size={15} />{timerSaving ? '保存中' : '启动倒计时'}</button></div></div></form></Modal>, document.body)}
   </Modal>;
 }
 
@@ -1264,7 +1536,7 @@ function TeamMaintenanceView({ teams, runCheck, refillSeats, setSelectedTeam, op
         <div className="team-meta-grid"><div><span>所有者</span><OwnerEmails owners={team.owners} /><small>{team.owners?.length ? `${team.owners.length} 个所有者` : '未同步所有者'}</small></div><div><span>席位</span><strong>{team.seats.used == null || team.seats.total == null ? '--' : `${team.seats.used} / ${team.seats.total}`}</strong><small>{team.seats.open ? `剩余 ${team.seats.open} 个` : '已满'}</small></div><div><span>今日轮转</span><strong>{dailyRotationValues(team.mother).count} / {dailyRotationValues(team.mother).limit}</strong><small>{dailyRotationValues(team.mother).remaining ? `剩余 ${dailyRotationValues(team.mother).remaining} 次` : '已达上限'}</small></div><div><span>最后同步</span><strong>{displayTime(team.lastSync)}</strong><small>{team.rows.length} 个当前成员</small></div></div>
         <div className="team-record-actions"><button className="button ghost" onClick={() => { setSelectedTeam(team.id); runCheck(team.id); }}><RefreshCw size={14} />检测额度</button><button className="button secondary" disabled={!team.mother.accountId && !team.mother.team} title={!team.mother.accountId && !team.mother.team ? '请先配置 Team ID' : '先同步席位，再从 Free 账号池并发补满空席位'} onClick={() => { setSelectedTeam(team.id); refillSeats(team.id); }}><Sparkles size={14} />补满席位</button></div>
         <div className="team-member-heading"><div><h4>当前账号</h4><span>成员额度和凭据状态</span></div><b>{team.rows.length}</b></div>
-        <div className="table-wrap team-member-wrap"><table className="data-table team-member-table"><thead><tr><th>账号</th><th>身份</th><th>5h 剩余</th><th>7d 剩余</th><th>凭据</th><th>加入记录</th></tr></thead><tbody>{team.rows.map((row, index) => { const account = row.child; const email = account?.email || row.member?.email || '未识别邮箱'; return <tr key={`${email}-${row.member?.id || index}`}><td><div className="account-cell"><div className="queue-avatar">{email[0]?.toUpperCase() || '?'}</div><div><strong>{email}</strong><small className="mono">{account?.id || row.member?.id || '成员快照'}</small></div></div></td><td><div className="role-stack">{row.isOwner ? <span className="role-label owner">所有者</span> : <span className="role-label">成员</span>}{account?.status === 'banned' && <StatusBadge status="banned" />}</div></td><td><QuotaBar value={account?.quota5h} /></td><td><QuotaBar value={account?.quota7d} /></td><td><CredentialState account={account} /></td><td>{account?.joinedAt ? <span>{displayTime(account.joinedAt)}<small>{account.joinedTeams?.length || account.workspaceHistory?.length || 1} 个 Team</small></span> : <span className="muted">成员同步</span>}</td></tr>; })}</tbody></table></div>
+        <div className="table-wrap team-member-wrap"><table className="data-table team-member-table"><thead><tr><th>账号</th><th>身份</th><th>5h 剩余</th><th>7d 剩余</th><th>凭据</th><th>加入记录</th></tr></thead><tbody>{team.rows.map((row, index) => { const account = row.child; const email = account?.email || row.member?.email || '未识别邮箱'; return <tr key={row.identityKey || `${email}-${row.member?.id || index}`}><td><div className="account-cell"><div className="queue-avatar">{email[0]?.toUpperCase() || '?'}</div><div><strong>{email}</strong><small className="mono">{account?.id || row.member?.id || '成员快照'}</small></div></div></td><td><div className="role-stack">{row.isOwner ? <span className="role-label owner">所有者</span> : <span className="role-label">成员</span>}{account?.status === 'banned' && <StatusBadge status="banned" />}</div></td><td><QuotaBar value={account?.quota5h} /></td><td><QuotaBar value={account?.quota7d} /></td><td><CredentialState account={account} /></td><td>{account?.joinedAt ? <span>{displayTime(account.joinedAt)}<small>{account.joinedTeams?.length || account.workspaceHistory?.length || 1} 个 Team</small></span> : <span className="muted">成员同步</span>}</td></tr>; })}</tbody></table></div>
       </article>)}</div>
     </section>
   </section>;
@@ -1345,26 +1617,29 @@ function FreeAccountsView({ children, allChildren, mothers, search, setSearch, s
       {(batchAcquire?.loading || batchResult) && <div className={`batch-operation ${batchResult?.error ? 'failed' : batchAcquire?.loading ? 'running' : 'complete'}`}><div className="batch-operation-icon">{batchAcquire?.loading ? <RefreshCw size={16} /> : batchResult?.error ? <AlertTriangle size={16} /> : <CheckCircle2 size={16} />}</div><div><strong>{batchAcquire?.loading ? `正在按 ${concurrency} 并发获取 Free JSON` : batchResult?.error ? '批量获取失败' : '批量获取已完成'}</strong><span>{batchAcquire?.loading ? `待处理 ${batchResult?.totalMissing || missingJsonCount} 个缺少 JSON 的账号` : batchResult?.error || `成功 ${batchResult?.acquired || 0} 个 · 失败 ${batchResult?.failed || 0} 个 · 跳过 ${batchResult?.skipped || 0} 个 · 并发 ${batchResult?.concurrency || concurrency}`}</span></div></div>}
       <div className="filter-row"><div className="search-box"><ListFilter size={16} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索邮箱、账号或 Team" /></div><div className="segmented compact-segmented account-status-filters">{filterOptions.map(([id, label, count]) => <button key={id} className={filter === id ? 'selected' : ''} onClick={() => setFilter(id)}>{label}<small>{count}</small></button>)}</div><span className="result-count">显示 {visible.length} / {allChildren.length}</span></div>
       <div className="bulk-delete-bar"><span><ShieldAlert size={14} />只可批量删除已封禁且不在 Team 中的账号</span><button className="button danger" disabled={!selectedBannedIds.length || batchDeleting} onClick={deleteSelected}><Trash2 size={15} />{batchDeleting ? '正在删除' : `删除已选封禁 (${selectedBannedIds.length})`}</button></div>
-      <div className="table-wrap"><table className="data-table account-table"><thead><tr><th className="bulk-select-cell"><input type="checkbox" aria-label="全选当前结果中的可删除封禁账号" title="全选当前筛选结果中的可删除封禁账号" checked={allVisibleSelected} disabled={!selectableVisibleIds.length} ref={(node) => { if (node) node.indeterminate = someVisibleSelected && !allVisibleSelected; }} onChange={(event) => toggleVisibleSelection(event.target.checked)} /></th><th>账号</th><th>状态</th><th>登录凭据</th><th>当前 Team</th><th>加入过的 Team</th><th>Sub2API</th><th /></tr></thead><tbody>{visible.map((account) => { const joinedTeams = joinedTeamsFor(account); const activeTeams = joinedTeams.filter((entry) => entry.status === 'active'); const historyTeams = joinedTeams.filter((entry) => entry.status !== 'active'); const acquireState = acquireStates?.[account.id]; const banned = isBanned(account); const deletable = isDeletableBanned(account); return <tr className={banned ? 'banned-account-row' : ''} key={account.id}><td className="bulk-select-cell"><span title={!banned ? '仅封禁账号可批量选择' : !deletable ? '账号仍在 Team 中，请先移出 Team' : '选择此封禁账号'}><input type="checkbox" aria-label={`选择 ${account.email || account.id}`} checked={selectedSet.has(account.id)} disabled={!deletable} onChange={(event) => setSelectedBannedIds((current) => event.target.checked ? [...new Set([...current, account.id])] : current.filter((id) => id !== account.id))} /></span></td><td><div className="account-cell"><div className="queue-avatar">{(account.email || '?')[0].toUpperCase()}</div><div><strong>{account.email || '未设置邮箱'}</strong><small className="mono">{account.id} · {account.plan || '未检测'}</small>{banned && <small className="ban-reason" title={account.banReason || ''}>{account.banReason || 'OpenAI 账号已停用'}{account.bannedAt ? ` · ${displayTime(account.bannedAt)}` : ''}</small>}</div></div></td><td><StatusBadge status={banned ? 'banned' : account.status} /></td><td><div className="account-credential-cell"><CredentialState account={account} /><AcquireStatus state={acquireState} /></div></td><td>{activeTeams.length ? <div className="team-tags">{activeTeams.map((entry) => <span key={entry.team}>{teamNameForId(mothers, entry.team)}</span>)}</div> : <span className="muted">Free 池</span>}</td><td><div className="team-history-cell"><strong>{joinedTeams.length} 个空间</strong>{historyTeams.slice(-3).map((entry) => <small key={`${entry.team}-${entry.removedAt || entry.cooldownAt || entry.joinedAt}`}>{teamNameForId(mothers, entry.team)} · {entry.status === 'kicked' ? '已移出' : entry.status === 'cooldown' ? '冷却中' : '历史'}{entry.reason === 'account_banned' ? ' · 封禁' : entry.reason === 'time_elapsed' ? ` · 按时间轮转${entry.retryAfter ? ` · ${teamRetryLabel(entry)}` : ''}` : entry.retryAfter ? ` · ${teamRetryLabel(entry)}` : entry.status === 'cooldown' ? ' · 等待额度刷新' : ''}</small>)}</div></td><td><span className={`sub2api-state ${account.sub2apiStatus?.imported ? 'ready' : ''}`}>{account.sub2apiStatus?.imported ? '已记录' : '未记录'}</span>{account.sub2apiStatus?.exportable && <small>可导出</small>}</td><td><div className="row-actions"><button className="icon-button small" title={banned ? '封禁账号不能再获取 Free JSON' : '获取 Free JSON'} onClick={() => acquireAccount(account.id, 'free-json')} disabled={banned || Boolean(acquireState?.loading)}><CloudDownload size={15} /></button><button className="icon-button small" title={banned ? '封禁账号不能再刷新 AT' : '刷新 AT'} onClick={() => acquireAccount(account.id, 'refresh-at')} disabled={banned || Boolean(acquireState?.loading)}><RefreshCw size={15} /></button><button className="icon-button small" title="编辑账号" onClick={() => editAccount(account)}><Settings2 size={15} /></button><button className="icon-button small" title={banned ? '封禁账号不能再导入凭据' : '导入 Free Sub2API JSON'} aria-label="导入 Free Sub2API JSON" onClick={() => openJsonImport(account.id)} disabled={banned}><FileText size={15} /></button><button className="icon-button small" title="移出当前 Team" aria-label="移出当前 Team" onClick={() => removeChild(account.id)} disabled={!account.team}><UserMinus size={15} /></button><button className="icon-button small danger-hover" title="删除 Free 账号" aria-label="删除 Free 账号" onClick={() => deleteFreeAccount(account.id)}><Trash2 size={15} /></button></div></td></tr>; })}</tbody></table></div>{!visible.length && <div className="empty-state compact-empty"><UserRound size={26} /><strong>没有匹配的账号</strong><span>可以切换状态筛选或导入新账号。</span></div>}</section>
+      <div className="table-wrap"><table className="data-table account-table"><thead><tr><th className="bulk-select-cell"><input type="checkbox" aria-label="全选当前结果中的可删除封禁账号" title="全选当前筛选结果中的可删除封禁账号" checked={allVisibleSelected} disabled={!selectableVisibleIds.length} ref={(node) => { if (node) node.indeterminate = someVisibleSelected && !allVisibleSelected; }} onChange={(event) => toggleVisibleSelection(event.target.checked)} /></th><th>账号</th><th>状态</th><th>登录凭据</th><th>当前 Team</th><th>加入过的 Team</th><th>Sub2API</th><th /></tr></thead><tbody>{visible.map((account) => { const joinedTeams = joinedTeamsFor(account); const activeTeams = joinedTeams.filter((entry) => entry.status === 'active'); const historyTeams = joinedTeams.filter((entry) => entry.status !== 'active'); const acquireState = acquireStates?.[account.id]; const banned = isBanned(account); const deletable = isDeletableBanned(account); return <tr className={banned ? 'banned-account-row' : ''} key={account.id}><td className="bulk-select-cell"><span title={!banned ? '仅封禁账号可批量选择' : !deletable ? '账号仍在 Team 中，请先移出 Team' : '选择此封禁账号'}><input type="checkbox" aria-label={`选择 ${account.email || account.id}`} checked={selectedSet.has(account.id)} disabled={!deletable} onChange={(event) => setSelectedBannedIds((current) => event.target.checked ? [...new Set([...current, account.id])] : current.filter((id) => id !== account.id))} /></span></td><td><div className="account-cell"><div className="queue-avatar">{(account.email || '?')[0].toUpperCase()}</div><div><strong>{account.email || '未设置邮箱'}</strong><small className="mono">{account.id} · {account.plan || '未检测'}</small>{banned && <small className="ban-reason" title={account.banReason || ''}>{account.banReason || 'OpenAI 账号已停用'}{account.bannedAt ? ` · ${displayTime(account.bannedAt)}` : ''}</small>}</div></div></td><td><StatusBadge status={banned ? 'banned' : account.status} /></td><td><div className="account-credential-cell"><CredentialState account={account} /><AcquireStatus state={acquireState} /></div></td><td>{activeTeams.length ? <div className="team-tags">{activeTeams.map((entry) => <span key={entry.team}>{teamNameForId(mothers, entry.team)}</span>)}</div> : <span className="muted">Free 池</span>}</td><td><div className="team-history-cell"><strong>{joinedTeams.length} 个空间</strong>{historyTeams.slice(-3).map((entry) => <small key={`${entry.team}-${entry.removedAt || entry.cooldownAt || entry.joinedAt}`}>{teamNameForId(mothers, entry.team)} · {entry.status === 'kicked' ? '已移出' : entry.status === 'cooldown' ? '冷却中' : '历史'}{entry.reason === 'account_banned' ? ' · 封禁' : entry.reason === 'manual_time_elapsed' ? ` · 手动定时退出${entry.retryAfter ? ` · ${teamRetryLabel(entry)}` : ''}` : entry.reason === 'time_elapsed' ? ` · 按时间轮转${entry.retryAfter ? ` · ${teamRetryLabel(entry)}` : ''}` : entry.retryAfter ? ` · ${teamRetryLabel(entry)}` : entry.status === 'cooldown' ? ' · 等待额度刷新' : ''}</small>)}</div></td><td><span className={`sub2api-state ${account.sub2apiStatus?.imported ? 'ready' : ''}`}>{account.sub2apiStatus?.imported ? '已记录' : '未记录'}</span>{account.sub2apiStatus?.exportable && <small>可导出</small>}</td><td><div className="row-actions"><button className="icon-button small" title={banned ? '封禁账号不能再获取 Free JSON' : '获取 Free JSON'} onClick={() => acquireAccount(account.id, 'free-json')} disabled={banned || Boolean(acquireState?.loading)}><CloudDownload size={15} /></button><button className="icon-button small" title={banned ? '封禁账号不能再刷新 AT' : '刷新 AT'} onClick={() => acquireAccount(account.id, 'refresh-at')} disabled={banned || Boolean(acquireState?.loading)}><RefreshCw size={15} /></button><button className="icon-button small" title="编辑账号" onClick={() => editAccount(account)}><Settings2 size={15} /></button><button className="icon-button small" title={banned ? '封禁账号不能再导入凭据' : '导入 Free Sub2API JSON'} aria-label="导入 Free Sub2API JSON" onClick={() => openJsonImport(account.id)} disabled={banned}><FileText size={15} /></button><button className="icon-button small" title="移出当前 Team" aria-label="移出当前 Team" onClick={() => removeChild(account.id)} disabled={!account.team}><UserMinus size={15} /></button><button className="icon-button small danger-hover" title="删除 Free 账号" aria-label="删除 Free 账号" onClick={() => deleteFreeAccount(account.id)}><Trash2 size={15} /></button></div></td></tr>; })}</tbody></table></div>{!visible.length && <div className="empty-state compact-empty"><UserRound size={26} /><strong>没有匹配的账号</strong><span>可以切换状态筛选或导入新账号。</span></div>}</section>
   </section>;
 }
 
 function RunView({ activeMother, activeChildren, trackedChildren, readyChildren, exhausted, canRefillAll, lowQuota, seatsOpen, stage, progress, isRunning, isProcessing, lastSync, runCheck, refillSeats, setShowMother, setSelectedTeam, mothers, autoRefill }) {
-  const steps = [{ id: 'monitor', label: '监控额度', sub: `${trackedChildren.length} 个账号 · ${mothers.length} 个 Team`, icon: Activity }, { id: 'kick', label: '移除耗尽', sub: exhausted.length ? `${exhausted.length} 个待处理` : '暂无待处理', icon: Trash2 }, { id: 'join', label: '加入 Team', sub: activeMother ? (seatsOpen ? `${seatsOpen} 个空席位` : '席位已满') : '暂无空间', icon: UserRound }, { id: 'refill', label: '满额补位', sub: readyChildren.length ? `${readyChildren.length} 个可加入` : '待加入池为空', icon: RefreshCw }];
+  const automaticMothers = mothers.filter((mother) => mother.rotationEnabled !== false);
+  const automaticTeamCount = automaticMothers.length;
+  const activeAutomationEnabled = isRunning && activeMother?.rotationEnabled !== false;
+  const steps = [{ id: 'monitor', label: '监控额度', sub: `${trackedChildren.length} 个账号 · ${automaticTeamCount} 个 Team`, icon: Activity }, { id: 'kick', label: '移除耗尽', sub: exhausted.length ? `${exhausted.length} 个待处理` : '暂无待处理', icon: Trash2 }, { id: 'join', label: '加入 Team', sub: activeMother ? (seatsOpen ? `${seatsOpen} 个空席位` : '席位已满') : '暂无空间', icon: UserRound }, { id: 'refill', label: '满额补位', sub: readyChildren.length ? `${readyChildren.length} 个可加入` : '待加入池为空', icon: RefreshCw }];
   const activeIndex = Math.max(0, steps.findIndex((step) => step.id === stage));
   const seatsUsed = Number.isFinite(Number(activeMother?.used)) ? Number(activeMother.used) : null;
   const seatsTotal = Number.isFinite(Number(activeMother?.seats)) ? Number(activeMother.seats) : null;
   const displayName = teamDisplayName(activeMother);
-  const isLive = isRunning || isProcessing;
-  const traceItems = [{ title: '监控额度', sub: `${activeChildren.length} 个子号`, state: isProcessing && stage === 'monitor' ? '执行中' : isRunning ? '进行中' : '已暂停', icon: Gauge, tone: 'blue', active: isLive && stage === 'monitor' }, { title: '移除耗尽账号', sub: exhausted.length ? `${exhausted.length} 个待处理` : '队列为空', state: exhausted.length ? '待处理' : '已完成', icon: Trash2, tone: exhausted.length ? 'amber' : 'muted', active: isLive && stage === 'kick' }, { title: '加入 Team', sub: `${readyChildren.length} 个候选`, state: activeMother ? (seatsOpen ? '等待中' : '已满') : '未配置', icon: UserRound, tone: 'green', active: isLive && (stage === 'join' || stage === 'refill') }];
+  const isLive = activeAutomationEnabled || isProcessing;
+  const traceItems = [{ title: '监控额度', sub: `${activeChildren.length} 个子号`, state: isProcessing && stage === 'monitor' ? '执行中' : activeAutomationEnabled ? '进行中' : '已暂停', icon: Gauge, tone: 'blue', active: isLive && stage === 'monitor' }, { title: '移除耗尽账号', sub: exhausted.length ? `${exhausted.length} 个待处理` : '队列为空', state: exhausted.length ? '待处理' : '已完成', icon: Trash2, tone: exhausted.length ? 'amber' : 'muted', active: isLive && stage === 'kick' }, { title: '加入 Team', sub: `${readyChildren.length} 个候选`, state: activeMother ? (seatsOpen ? '等待中' : '已满') : '未配置', icon: UserRound, tone: 'green', active: isLive && (stage === 'join' || stage === 'refill') }];
   return <>
-      <section className="metrics"><Metric label="管理 Team" value={mothers.length || '未配置'} detail={activeMother ? `当前轮转：${displayName}` : '请先添加 Team'} icon={KeyRound} tone="blue" /><Metric label="当前席位" value={activeMother ? `${seatsUsed == null ? '--' : seatsUsed} / ${seatsTotal == null ? '--' : seatsTotal}` : '未配置'} detail={activeMother ? (seatsOpen ? `还可加入 ${seatsOpen} 个账号` : seatsTotal == null ? '尚未获取席位' : '空间已满') : '添加 Team 后开始检测'} icon={Users} tone="green" /><Metric label="额度风险" value={lowQuota.length} detail={`${exhausted.length} 个已耗尽 · 当前空间`} icon={Gauge} tone="amber" /><Metric label="下次检测" value={isRunning ? '自动' : '--'} detail={`上次同步 ${lastSync} · ${mothers.length > 1 ? '全部空间' : '当前空间'}`} icon={Clock3} tone="slate" /></section>
+      <section className="metrics"><Metric label="管理 Team" value={mothers.length || '未配置'} detail={mothers.length ? `${automaticTeamCount} 个参与自动轮转` : '请先添加 Team'} icon={KeyRound} tone="blue" /><Metric label="当前席位" value={activeMother ? `${seatsUsed == null ? '--' : seatsUsed} / ${seatsTotal == null ? '--' : seatsTotal}` : '未配置'} detail={activeMother ? (seatsOpen ? `还可加入 ${seatsOpen} 个账号` : seatsTotal == null ? '尚未获取席位' : '空间已满') : '添加 Team 后开始检测'} icon={Users} tone="green" /><Metric label="额度风险" value={lowQuota.length} detail={`${exhausted.length} 个已耗尽 · 当前空间`} icon={Gauge} tone="amber" /><Metric label="下次检测" value={activeAutomationEnabled ? '自动' : '--'} detail={`上次同步 ${lastSync} · ${activeMother?.rotationEnabled === false ? '当前 Team 已停用' : `${automaticTeamCount} 个空间参与`}`} icon={Clock3} tone="slate" /></section>
      <div className="run-layout"><section className="control-panel"><div className="panel-head"><div><span className="kicker">AUTOMATION FLOW</span><h2>配额自动补位</h2><p>所有者：<strong>{activeMother?.email}</strong></p></div><button className="settings-button" title="编辑 Team 配置" onClick={() => setShowMother(true)}><Settings2 size={17} /></button></div>
-       <div className={`orbit-wrap ${isLive ? 'is-running' : ''}`}><div className="orbit-starfield" aria-hidden="true" /><div className={`orbit orbit-large ${isLive ? 'is-running' : ''}`} /><div className={`orbit orbit-small ${isLive ? 'is-running' : ''}`} /><div className={`orbit-core ${isLive ? 'is-running' : ''}`}><div className="core-icon"><Bot size={25} /></div><strong>{activeMother && seatsUsed != null && seatsTotal != null && seatsUsed >= seatsTotal && exhausted.length === 0 ? '运行稳定' : '需要处理'}</strong><span>{activeMother ? `${seatsUsed == null ? '--' : seatsUsed} / ${seatsTotal == null ? '--' : seatsTotal} 席位 · ${isProcessing ? '执行中' : isRunning ? mothers.length > 1 ? `自动轮转 ${mothers.length} 个 Team` : '自动检测中' : '已暂停'}` : '尚未配置母号'}</span><div className={`core-progress ${isLive ? 'is-running' : ''}`}><i style={{ width: `${progress}%` }} /></div></div>
+       <div className={`orbit-wrap ${isLive ? 'is-running' : ''}`}><div className="orbit-starfield" aria-hidden="true" /><div className={`orbit orbit-large ${isLive ? 'is-running' : ''}`} /><div className={`orbit orbit-small ${isLive ? 'is-running' : ''}`} /><div className={`orbit-core ${isLive ? 'is-running' : ''}`}><div className="core-icon"><Bot size={25} /></div><strong>{activeMother && seatsUsed != null && seatsTotal != null && seatsUsed >= seatsTotal && exhausted.length === 0 ? '运行稳定' : '需要处理'}</strong><span>{activeMother ? `${seatsUsed == null ? '--' : seatsUsed} / ${seatsTotal == null ? '--' : seatsTotal} 席位 · ${isProcessing ? '执行中' : activeMother.rotationEnabled === false ? '不参与轮转' : activeAutomationEnabled ? automaticTeamCount > 1 ? `自动轮转 ${automaticTeamCount} 个 Team` : '自动检测中' : '已暂停'}` : '尚未配置母号'}</span><div className={`core-progress ${isLive ? 'is-running' : ''}`}><i style={{ width: `${progress}%` }} /></div></div>
       {steps.map((step, index) => { const Icon = step.icon; const current = isLive && index === activeIndex; return <div key={step.id} className={`orbit-node node-${index + 1} ${index <= activeIndex ? 'reached' : ''} ${current ? 'current' : ''}`}><div className="node-icon"><Icon size={18} /></div><div><strong>{step.label}</strong><small>{step.sub}</small></div></div>; })}</div>
        <div className="control-actions"><button className="button primary" onClick={runCheck}><RefreshCw size={15} />检测全部 Team</button><button className="button secondary" onClick={refillSeats} disabled={!canRefillAll}><Sparkles size={15} />移除并补满全部</button></div>
       <div className="team-picker"><div><span>当前管理空间</span><strong>{activeMother ? displayName : '未配置母号'}</strong></div><select disabled={!mothers.length} value={activeMother?.id || ''} onChange={(event) => setSelectedTeam(event.target.value)}>{mothers.length ? mothers.map((mother) => <option value={mother.id} key={mother.id}>{teamDisplayName(mother)}</option>) : <option value="">添加母号后可选择空间</option>}</select></div>
-     </section><aside className="activity-panel"><div className="panel-head compact"><div><span className="kicker">EXECUTION</span><h2>执行轨迹</h2></div><span className="count-pill">{mothers.length} 个 Team</span></div><div className="trace-list">{traceItems.map((item) => { const Icon = item.icon; return <div className={`trace-item ${item.tone} ${item.active ? 'is-active' : ''}`} key={item.title}><div className="trace-icon"><Icon size={16} /></div><div className="trace-copy"><strong>{item.title}</strong><small>{item.sub}</small></div><span>{item.state}</span></div>; })}</div><div className="queue-head"><span>待拉队列</span><b>{readyChildren.length}</b></div>{readyChildren.slice(0, 3).map((child) => <div className="queue-row" key={child.id}><div className="queue-avatar">{child.email[0].toUpperCase()}</div><span>{child.email}</span><small>待加入</small></div>)}{!readyChildren.length && <div className="empty-queue"><Check size={22} /><span>队列为空，添加子号后显示</span></div>}<div className="activity-foot"><ShieldCheck size={15} /> {mothers.length > 1 ? `自动轮转 ${mothers.length} 个 Team` : '自动化策略已启用'} <button onClick={() => setShowMother(true)}>调整策略</button></div></aside></div>
+     </section><aside className="activity-panel"><div className="panel-head compact"><div><span className="kicker">EXECUTION</span><h2>执行轨迹</h2></div><span className="count-pill">{automaticTeamCount} 个参与</span></div><div className="trace-list">{traceItems.map((item) => { const Icon = item.icon; return <div className={`trace-item ${item.tone} ${item.active ? 'is-active' : ''}`} key={item.title}><div className="trace-icon"><Icon size={16} /></div><div className="trace-copy"><strong>{item.title}</strong><small>{item.sub}</small></div><span>{item.state}</span></div>; })}</div><div className="queue-head"><span>待拉队列</span><b>{readyChildren.length}</b></div>{readyChildren.slice(0, 3).map((child) => <div className="queue-row" key={child.id}><div className="queue-avatar">{child.email[0].toUpperCase()}</div><span>{child.email}</span><small>待加入</small></div>)}{!readyChildren.length && <div className="empty-queue"><Check size={22} /><span>队列为空，添加子号后显示</span></div>}<div className="activity-foot"><ShieldCheck size={15} /> {automaticTeamCount ? `自动轮转 ${automaticTeamCount} 个 Team` : '所有 Team 均已停用'} <button onClick={() => setShowMother(true)}>调整策略</button></div></aside></div>
   </>;
 }
 
@@ -1442,6 +1717,124 @@ function SettingsView({ autoRefill, setAutoRefill, promoteJoinedAccounts, setPro
 function Toggle({ checked, onChange }) { return <button className={`toggle ${checked ? 'checked' : ''}`} onClick={() => onChange(!checked)} aria-label={checked ? '关闭' : '开启'}><span /></button>; }
 
 function Modal({ title, onClose, children, className = '' }) { return <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}><div className={`modal ${className}`}><div className="modal-head"><h2>{title}</h2><button className="icon-button" onClick={onClose}><X size={18} /></button></div>{children}</div></div>; }
+
+function billingDateLabel(value) {
+  if (!value) return '--';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '--';
+  return date.toLocaleString('zh-CN', {
+    year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false,
+  });
+}
+
+function billingAmountLabel(item = {}) {
+  if (item.formattedAmount) return item.formattedAmount;
+  const amount = Number(item.amount);
+  const currency = String(item.currency || '').trim().toUpperCase();
+  if (!Number.isFinite(amount) || !currency) return '--';
+  try {
+    return new Intl.NumberFormat('zh-CN', { style: 'currency', currency }).format(amount);
+  } catch {
+    return `${currency} ${amount}`;
+  }
+}
+
+function billingProliteEstimateLabel(item = {}) {
+  const estimate = item.proliteEstimate && typeof item.proliteEstimate === 'object' ? item.proliteEstimate : {};
+  if (estimate.formattedAmount) return estimate.formattedAmount;
+  const amount = Number(estimate.amount);
+  const currency = String(estimate.currency || item.currency || '').trim().toUpperCase();
+  if (!Number.isFinite(amount) || !currency) return '--';
+  try {
+    return new Intl.NumberFormat('zh-CN', { style: 'currency', currency }).format(amount);
+  } catch {
+    return `${currency} ${amount}`;
+  }
+}
+
+function billingFailureLabel(item = {}) {
+  if (Number(item.status) === 401) return '母号登录已失效';
+  if (Number(item.status) === 403) return '母号无账单查询权限';
+  if (Number(item.status) === 429) return '查询频率受限，请稍后刷新';
+  const labels = {
+    workspace_id_required: '未配置 Team 空间',
+    billing_preview_current_seats_missing: '未返回当前计费席位',
+    billing_preview_amount_missing: '未返回席位费用',
+    billing_preview_currency_missing: '未返回费用币种',
+    billing_preview_seat_target_mismatch: '席位数量已变化，请刷新',
+    billing_preview_seats_changed_repeatedly: '席位数量持续变化，请稍后刷新',
+    missing_token: '母号缺少可用的 Team Token',
+    workspace_owner_token_required: '需要恢复 Team 母号登录',
+    workspace_subscription_failed: '到期信息查询失败',
+    network_error: '网络连接失败，请检查代理',
+    timeout: '请求超时，请检查代理后重试',
+  };
+  return labels[item.message] || item.message || item.code || '查询失败';
+}
+
+function BillingPreviewStatus({ item }) {
+  if (!item.ok && !item.partial) return <div className="billing-status-stack"><span className="billing-status failed"><AlertTriangle size={12} />查询失败</span><small title={item.message || item.code || ''}>{billingFailureLabel(item)}</small></div>;
+  if (item.partial) return <div className="billing-status-stack"><span className="billing-status partial"><AlertTriangle size={12} />部分完成</span><small title={item.subscriptionMessage || item.message || ''}>费用已获取，到期信息未刷新</small>{item.activeUntilSource === 'cached' && <small className="billing-stale">到期信息为上次缓存</small>}</div>;
+  const expiryLabels = {
+    active: '有效',
+    due_soon: '临期',
+    expired: '已到期',
+    cancelling: '到期不续费',
+    delinquent: '欠费',
+    unknown: '日期未知',
+  };
+  const renewalLabel = item.isDelinquent
+    ? '账户欠费'
+    : item.willRenew === true
+      ? '自动续费'
+      : item.willRenew === false
+        ? '不自动续费'
+        : '续费状态未知';
+  return <div className="billing-status-stack"><span className={`billing-status ${item.expiryStatus || 'unknown'}`}>{item.expiryStatus === 'active' ? <CheckCircle2 size={12} /> : <Clock3 size={12} />}{expiryLabels[item.expiryStatus] || expiryLabels.unknown}</span><small>{renewalLabel}</small>{item.subscriptionFresh === false && <small className="billing-stale">到期信息为上次缓存</small>}</div>;
+}
+
+function BillingPreviewModal({ data = {}, loading, error, onRefresh, onClose }) {
+  const sourceItems = Array.isArray(data.items) ? data.items : [];
+  const urgentStatuses = new Set(['due_soon', 'expired', 'cancelling', 'delinquent']);
+  const items = [...sourceItems].sort((left, right) => {
+    const leftGroup = left.partial ? 2 : !left.ok ? 3 : urgentStatuses.has(left.expiryStatus) ? 0 : 1;
+    const rightGroup = right.partial ? 2 : !right.ok ? 3 : urgentStatuses.has(right.expiryStatus) ? 0 : 1;
+    if (leftGroup !== rightGroup) return leftGroup - rightGroup;
+    const leftTime = Date.parse(left.activeUntil || '');
+    const rightTime = Date.parse(right.activeUntil || '');
+    if (Number.isFinite(leftTime) !== Number.isFinite(rightTime)) return Number.isFinite(leftTime) ? -1 : 1;
+    if (Number.isFinite(leftTime) && leftTime !== rightTime) return leftTime - rightTime;
+    return String(left.teamName || '').localeCompare(String(right.teamName || ''), 'zh-CN');
+  });
+  const total = Number.isFinite(Number(data.total)) ? Number(data.total) : items.length;
+  const failed = Number.isFinite(Number(data.failed)) ? Number(data.failed) : items.filter((item) => !item.ok).length;
+  const succeeded = Number.isFinite(Number(data.succeeded)) ? Number(data.succeeded) : Math.max(0, total - failed);
+  const expiring = Number.isFinite(Number(data.expiring)) ? Number(data.expiring) : items.filter((item) => item.ok && urgentStatuses.has(item.expiryStatus)).length;
+  const thresholdDays = Number(data.thresholdDays) || 7;
+
+  return <Modal title="临期 Team" onClose={onClose} className="billing-preview-modal">
+    <div className="billing-preview-intro"><div><strong>Team 到期与席位费用</strong><span>{thresholdDays} 天内标为临期；普通席位为账单接口返回的实时增量，高级席位按同账期普通席位费用的 5 倍估算。</span></div>{data.checkedAt && <small>查询于 {billingDateLabel(data.checkedAt)}</small>}</div>
+    <div className="billing-preview-summary"><div><span>全部 Team</span><strong>{total}</strong></div><div className={expiring ? 'warning' : ''}><span>临期或异常</span><strong>{expiring}</strong></div><div><span>查询成功</span><strong>{succeeded}</strong></div><div className={failed ? 'danger' : ''}><span>查询失败</span><strong>{failed}</strong></div></div>
+    {loading && <div className="billing-preview-loading" aria-live="polite"><RefreshCw size={14} />正在通过 Team 母号查询最新账期与费用...</div>}
+    {error && items.length > 0 && <div className="billing-preview-error"><AlertTriangle size={15} /><span>{error}</span></div>}
+    {loading && !items.length ? <div className="billing-preview-state"><RefreshCw className="billing-preview-spinner" size={28} /><strong>正在查询所有 Team</strong><span>各 Team 独立查询，失败不会阻断其他结果。</span></div> : error && !items.length ? <div className="billing-preview-state error-state"><AlertTriangle size={28} /><strong>查询失败</strong><span>{error}</span><button className="button ghost" onClick={onRefresh} disabled={loading}><RefreshCw size={14} />重新查询</button></div> : items.length ? <div className={`billing-preview-table-wrap ${loading ? 'is-loading' : ''}`}><table className="data-table billing-preview-table"><thead><tr><th>Team</th><th>当前周期截止</th><th>剩余时间</th><th>当前计费席位</th><th>新增 1 个席位</th><th>费用结算日</th><th>状态</th></tr></thead><tbody>{items.map((item, index) => {
+      const remainingDays = Number(item.remainingDays);
+      const hasRemainingDays = item.remainingDays !== null && item.remainingDays !== undefined && Number.isFinite(remainingDays);
+      const hasLiveOrCachedExpiry = Boolean(item.activeUntil) && (item.ok || item.partial);
+      const hasSeatPreview = item.ok || item.partial;
+      const proliteEstimate = item.proliteEstimate && typeof item.proliteEstimate === 'object' ? item.proliteEstimate : null;
+      const hasProliteEstimate = Boolean(proliteEstimate?.formattedAmount)
+        || (proliteEstimate?.amount !== null && proliteEstimate?.amount !== undefined && proliteEstimate?.amount !== '' && Number.isFinite(Number(proliteEstimate.amount)));
+      const remainingLabel = !hasLiveOrCachedExpiry || !hasRemainingDays
+        ? '--'
+        : item.expiryStatus === 'expired'
+          ? remainingDays < 0 ? `已过期 ${Math.abs(remainingDays)} 天` : '已到期'
+          : remainingDays === 0 ? '今天到期' : `${remainingDays} 天`;
+      return <tr key={`${item.teamName || 'team'}-${index}`} className={item.partial ? 'billing-row-partial' : !item.ok ? 'billing-row-failed' : urgentStatuses.has(item.expiryStatus) ? 'billing-row-urgent' : ''}><td data-label="Team"><strong className="billing-team-name">{item.teamName || '未命名 Team'}</strong></td><td data-label="当前周期截止"><span>{hasLiveOrCachedExpiry ? billingDateLabel(item.activeUntil) : '--'}</span>{item.activeUntilSource === 'cached' && <small>缓存</small>}</td><td data-label="剩余时间"><strong className={`billing-remaining ${item.expiryStatus || ''}`}>{remainingLabel}</strong></td><td data-label="当前计费席位"><span>{hasSeatPreview && Number.isFinite(Number(item.currentSeats)) ? `${item.currentSeats} 个` : '--'}</span></td><td data-label="新增 1 个席位"><div className="billing-seat-cost"><div><span>普通</span><strong className="billing-amount">{hasSeatPreview ? billingAmountLabel(item) : '--'}</strong></div><div><span>高级 <b className="billing-estimate-chip">估算 ×5</b></span><strong className="billing-amount billing-prolite-amount">{hasSeatPreview && hasProliteEstimate ? billingProliteEstimateLabel(item) : '--'}</strong></div></div></td><td data-label="费用结算日"><span>{hasSeatPreview ? billingDateLabel(item.renewalDate) : '--'}</span></td><td data-label="状态"><BillingPreviewStatus item={item} /></td></tr>;
+    })}</tbody></table></div> : <div className="billing-preview-state"><Clock3 size={28} /><strong>暂无可查询的 Team</strong><span>添加 Team 后可查询到期与席位费用。</span></div>}
+    <div className="modal-foot billing-preview-foot"><span className="muted">高级费用为估算值；查询过程不会变更席位数量。</span><div className="modal-foot-actions"><button className="button ghost" onClick={onClose}>关闭</button><button className="button primary" onClick={onRefresh} disabled={loading}><RefreshCw size={14} className={loading ? 'button-spinner' : ''} />{loading ? '查询中' : '刷新'}</button></div></div>
+  </Modal>;
+}
 
 function ProxyModal({ proxy = defaultProxySettings, onClose, onSave, onAdd, onRemove }) {
   const [form, setForm] = useState(() => ({ ...defaultProxySettings, ...proxy }));
@@ -1633,25 +2026,52 @@ function IntegrationModal({ type, config = {}, onClose, onSave }) {
 function MotherModal({ mother, sub2apis = [], onClose, onSave }) {
   const defaultSub2apiId = sub2apis[0]?.id || 'sub2api_default';
   const [form, setForm] = useState(() => mother
-    ? { ...mother, token: '', teamName: mother.teamName || mother.displayName || '', primaryOwnerEmail: mother.primaryOwnerEmail || mother.email || '', sub2apiIntegrationId: mother.sub2apiIntegrationId || defaultSub2apiId }
-    : { id: `mother_${Date.now()}`, email: '', name: '', team: '', teamName: '', accountId: '', rotationMode: 'fixed', dailyRotationLimit: 3, primaryOwnerEmail: '', sub2apiIntegrationId: defaultSub2apiId, seats: 0, used: 0, status: 'unconfigured', lastCheck: null, token: '' });
+    ? { ...mother, password: '', totp: '', token: '', teamName: mother.teamName || mother.displayName || '', rotationEnabled: mother.rotationEnabled !== false, inviteSeatType: ['default', 'prolite'].includes(mother.inviteSeatType) ? mother.inviteSeatType : 'auto', primaryOwnerEmail: mother.primaryOwnerEmail || mother.email || '', sub2apiIntegrationId: mother.sub2apiIntegrationId || defaultSub2apiId }
+    : { id: `mother_${Date.now()}`, email: '', name: '', password: '', totp: '', team: '', teamName: '', accountId: '', rotationEnabled: true, syncOwnerToSub2api: true, rotationMode: 'fixed', inviteSeatType: 'auto', dailyRotationLimit: 3, primaryOwnerEmail: '', sub2apiIntegrationId: defaultSub2apiId, seats: 0, used: 0, status: 'unconfigured', lastCheck: null, token: '' });
   const update = (key, value) => setForm((current) => ({ ...current, [key]: value }));
   const ownerOptions = [...[{ email: form.email, name: form.name, userId: form.chatgptUserId }], ...(mother?.ownerAccounts || [])]
     .filter((owner) => owner?.email)
     .filter((owner, index, list) => list.findIndex((item) => item.email.toLowerCase() === owner.email.toLowerCase()) === index);
   const selectedSub2ApiMissing = Boolean(form.sub2apiIntegrationId && !sub2apis.some((item) => item.id === form.sub2apiIntegrationId));
-  return <Modal title={mother ? '编辑 Team' : '添加 Team'} onClose={onClose}><div className="form-grid">
+  return <Modal title={mother ? '编辑 Team' : '添加 Team'} onClose={onClose} className="mother-edit-modal"><div className="form-grid mother-edit-form">
     <label><span>所有者名称</span><input value={form.name || ''} onChange={(event) => update('name', event.target.value)} placeholder="Team 所有者" /></label>
     <label><span>所有者邮箱</span><input value={form.email || ''} onChange={(event) => update('email', event.target.value)} placeholder="owner@example.com" /></label>
+    <label><span>母号密码</span><input type="password" value={form.password || ''} onChange={(event) => update('password', event.target.value)} placeholder={mother?.credentialsStatus?.hasPassword ? '留空保持现有密码' : '母号登录密码'} /></label>
+    <label><span>母号 2FA Secret</span><input type="password" value={form.totp || ''} onChange={(event) => update('totp', event.target.value)} placeholder={mother?.credentialsStatus?.hasTotp ? '留空保持现有 2FA' : 'Base32 Secret'} /></label>
+    <label className="wide"><span>邮箱验证码地址</span><input value={form.mailboxUrl || ''} onChange={(event) => update('mailboxUrl', event.target.value)} placeholder="仅异常触发邮箱验证时使用" /></label>
     <label className="wide"><span>Team 显示名称</span><input value={form.teamName || ''} onChange={(event) => update('teamName', event.target.value)} placeholder="例如：研发 Team" /></label>
     <label className="wide"><span>Team ID（accountId / team）</span><input value={form.accountId || form.team || ''} onChange={(event) => { update('accountId', event.target.value); update('team', event.target.value); }} placeholder="chatgpt_account_id" /></label>
     <label className="wide"><span>目标 Sub2API</span><select className="select-control" value={form.sub2apiIntegrationId || defaultSub2apiId} onChange={(event) => update('sub2apiIntegrationId', event.target.value)}>{selectedSub2ApiMissing && <option value={form.sub2apiIntegrationId}>原连接已删除，请重新选择</option>}{sub2apis.length ? sub2apis.map((item, index) => <option value={item.id} key={item.id}>{item.name || `Sub2API ${index + 1}`}{item.enabled ? '' : '（未启用）'}</option>) : <option value={defaultSub2apiId}>默认 Sub2API（未配置）</option>}</select><small className="field-hint">首次加入和 401 修复都会同步到此连接；未选择时使用第一项。</small></label>
+    <div className="team-rotation-setting"><div><span>参与自动轮转</span><small>关闭后不自动检测、踢出或补位；Team 数据与手动操作仍保留。</small></div><Toggle checked={form.rotationEnabled !== false} onChange={(value) => update('rotationEnabled', value)} /></div>
+    <label className="wide"><span>补位席位类型</span><div className="segmented modal-segmented seat-policy-control">{[['auto', '自动（普通优先）'], ['default', '普通席位'], ['prolite', '高级席位']].map(([id, label]) => <button type="button" key={id} className={(form.inviteSeatType || 'auto') === id ? 'selected' : ''} onClick={() => update('inviteSeatType', id)}>{label}</button>)}</div><small className="field-hint">自动模式按分类余量分配，优先使用普通席位；只有高级席位会在同意申请前调用席位设置接口。</small></label>
     <label><span>轮转方式</span><div className="segmented modal-segmented">{[['fixed', '固定主号'], ['rotating', '不固定主号']].map(([id, label]) => <button type="button" key={id} className={(form.rotationMode || 'fixed') === id ? 'selected' : ''} onClick={() => { update('rotationMode', id); if (id === 'fixed' && !form.primaryOwnerEmail) update('primaryOwnerEmail', form.email || ''); }}>{label}</button>)}</div></label>
     <label className="wide"><span>固定主号（不会被踢）</span><select className="select-control" disabled={(form.rotationMode || 'fixed') === 'rotating' || !ownerOptions.length} value={form.primaryOwnerEmail || form.email || ''} onChange={(event) => update('primaryOwnerEmail', event.target.value)}>{ownerOptions.length ? ownerOptions.map((owner) => <option value={owner.email} key={owner.email}>{owner.name ? `${owner.name} · ${owner.email}` : owner.email}</option>) : <option value="">先填写所有者邮箱</option>}</select><small className="field-hint">{form.rotationMode === 'rotating' ? '不固定主号模式下，所有者都可以轮转' : '固定模式下仅此账号不会被自动移出'}</small></label>
+    <div className="team-rotation-setting"><div><span>不同步母号账号</span><small>只排除母号邮箱；其他所有者和成员正常推送。</small></div><Toggle checked={form.syncOwnerToSub2api === false} onChange={(exclude) => update('syncOwnerToSub2api', !exclude)} /></div>
     <label><span>所有者 Access Token</span><input type="password" value={form.token || ''} onChange={(event) => update('token', event.target.value)} placeholder={mother ? '留空保持现有 AT' : '粘贴所有者 AT'} /></label>
     <label><span>席位上限</span><input type="number" min="0" max="100" value={form.seats ?? 0} onChange={(event) => update('seats', Number(event.target.value))} /></label>
     <label><span>每日轮转账号上限</span><input type="number" min="1" max="100" value={form.dailyRotationLimit ?? 3} onChange={(event) => update('dailyRotationLimit', Math.min(100, Math.max(1, Number(event.target.value) || 3)))} /><small className="field-hint">按 Team 独立统计，次日自动归零</small></label>
-  </div><div className="modal-foot"><span className="muted">所有者凭据用于检测 Team、发送邀请和补位。</span><button className="button primary" onClick={() => onSave(form)}><Check size={15} />保存 Team</button></div></Modal>;
+  </div><div className="modal-foot mother-edit-foot"><span className="muted">所有者凭据用于检测 Team、发送邀请和补位。</span><button className="button primary" onClick={() => onSave(form)}><Check size={15} />保存 Team</button></div></Modal>;
+}
+function MotherManagerModal({ mother, action, onClose, onSave, onProbe, onRecover, onDelete }) {
+  const [form, setForm] = useState(() => ({ email: mother?.email || '', name: mother?.name || '', password: '', totp: '', mailboxUrl: mother?.mailboxUrl || '' }));
+  if (!mother) return null;
+  const update = (key, value) => setForm((current) => ({ ...current, [key]: value }));
+  const fields = { email: form.email, name: form.name, password: form.password, totp: form.totp, mailboxUrl: form.mailboxUrl };
+  const probes = [['额度接口', mother.lastProbe], ['成员接口', mother.lastMembersProbe], ['订阅接口', mother.lastSubscriptionProbe]];
+  return <Modal title={`管理母号 · ${teamDisplayName(mother)}`} onClose={onClose} className="mother-manager-modal">
+    <div className="mother-manager-head"><strong>{mother.email || '未设置母号邮箱'}</strong><TeamHealthStatus mother={mother} /></div>
+    <div className="mother-health-grid">{probes.map(([label, probe]) => <div className="mother-health-item" key={label}><span>{label}</span><strong className={probe?.ok ? 'ready' : probe ? 'failed' : ''}>{probe ? probe.ok ? '正常' : probe.status ? `HTTP ${probe.status}` : '检测失败' : '未检测'}</strong><small title={probe?.message || ''}>{probe?.message || '尚无接口记录'}</small></div>)}</div>
+    {mother.banReason && <div className="mother-ban-notice"><ShieldAlert size={15} />{mother.banReason}</div>}
+    <div className="form-grid mother-credential-form">
+      <label><span>母号邮箱</span><input value={form.email} onChange={(event) => update('email', event.target.value)} /></label>
+      <label><span>名称</span><input value={form.name} onChange={(event) => update('name', event.target.value)} /></label>
+      <label><span>登录密码</span><input type="password" value={form.password} onChange={(event) => update('password', event.target.value)} placeholder={mother.credentialsStatus?.hasPassword ? '已保存，留空保持现有密码' : '输入母号密码'} /></label>
+      <label><span>2FA Secret</span><input type="password" value={form.totp} onChange={(event) => update('totp', event.target.value)} placeholder={mother.credentialsStatus?.hasTotp ? '已保存，留空保持现有 2FA' : '输入 Base32 Secret'} /></label>
+      <label className="wide"><span>邮箱验证码地址</span><input value={form.mailboxUrl} onChange={(event) => update('mailboxUrl', event.target.value)} /></label>
+    </div>
+    {action.message && <div className="mother-manager-action" role="status">{action.message}{action.authUrl && <a href={action.authUrl} target="_blank" rel="noreferrer">打开授权链接</a>}</div>}
+    <div className="modal-foot mother-manager-foot"><button className="button ghost mother-delete-button" disabled={action.loading} onClick={onDelete}><Trash2 size={14} />从项目删除 Team</button><div className="modal-foot-actions"><button className="button ghost" disabled={action.loading} onClick={onProbe}><RefreshCw size={14} />检测母号</button><button className="button secondary" disabled={action.loading || !form.email} onClick={() => onRecover(fields)}><KeyRound size={14} />恢复管理凭据</button><button className="button primary" disabled={action.loading || !form.email} onClick={() => onSave(fields)}><Check size={14} />保存凭据</button></div></div>
+  </Modal>;
 }
 function SettingsModal({ onClose }) { return <Modal title="快速设置" onClose={onClose}><div className="quick-setting"><Activity size={18} /><div><strong>实时监控</strong><span>每 60 秒检测一次子号额度</span></div><Toggle checked onChange={() => {}} /></div><div className="quick-setting"><ShieldCheck size={18} /><div><strong>加入前验证</strong><span>获取 AT 后先检测可用性再进入 Team</span></div><Toggle checked onChange={() => {}} /></div></Modal>; }
 

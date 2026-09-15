@@ -133,3 +133,126 @@ test('Sub2API callback completion reuses a persisted OAuth session', async () =>
   assert.equal(result.sub2api.accountId, 42);
   assert.equal(result.sub2api.integrationId, 'sub2api-primary');
 });
+
+test('stale persisted login session is discarded and retried from a fresh OAuth authorization', async () => {
+  let passwordAttempts = 0;
+  let authorizationAttempts = 0;
+  let exchanged = false;
+  const requestFetch = async (input) => {
+    const url = String(input);
+    if (url === 'https://auth.openai.com/api/accounts/password/verify') {
+      passwordAttempts += 1;
+      return jsonResponse({ error: { code: 'signin_session_invalid', message: 'Your sign-in session is no longer valid. Please start over to continue.' } }, 400);
+    }
+    if (url.startsWith('https://auth.openai.com/oauth/authorize?')) {
+      authorizationAttempts += 1;
+      const state = new URL(url).searchParams.get('state');
+      return new Response('', { status: 302, headers: { location: `http://localhost:1455/auth/callback?code=fresh-code&state=${state}` } });
+    }
+    if (url === 'https://auth.openai.com/oauth/token') {
+      exchanged = true;
+      return jsonResponse({ access_token: 'fresh-access-token', refresh_token: 'fresh-refresh-token', id_token: 'fresh-id-token' });
+    }
+    throw new Error(`unexpected request: ${url}`);
+  };
+
+  const result = await loginFreeAccount({
+    email: 'member@example.com',
+    password: 'password',
+    totp: 'JBSWY3DPEHPK3PXP',
+    fetch: requestFetch,
+    sentinelTokenProvider: async () => 'sentinel-token',
+    session: { currentUrl: 'https://auth.openai.com/log-in/password' },
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.sessionRecovered, true);
+  assert.equal(passwordAttempts, 1);
+  assert.equal(authorizationAttempts, 1);
+  assert.equal(exchanged, true);
+  assert.equal(result.accessToken, 'fresh-access-token');
+});
+
+test('Sub2API OAuth URL failure falls back to the local PKCE authorization flow', async () => {
+  let providerCalls = 0;
+  let localAuthorizationCalls = 0;
+  let tokenExchangeCalls = 0;
+  let callbackHandlerCalls = 0;
+  let localOAuthState = '';
+  const selected = [];
+  const teamAccessToken = `header.${Buffer.from(JSON.stringify({
+    'https://api.openai.com/auth': {
+      chatgpt_account_id: 'team-account',
+      chatgpt_plan_type: 'team',
+    },
+  })).toString('base64url')}.signature`;
+  const requestFetch = async (input, options = {}) => {
+    const url = String(input);
+    if (url.startsWith('https://auth.openai.com/oauth/authorize?')) {
+      localAuthorizationCalls += 1;
+      const authorization = new URL(url);
+      assert.equal(authorization.searchParams.get('code_challenge_method'), 'S256');
+      assert.ok(authorization.searchParams.get('code_challenge'));
+      localOAuthState = authorization.searchParams.get('state');
+      return new Response('', {
+        status: 302,
+        headers: {
+          location: 'https://auth.openai.com/workspace',
+          'set-cookie': `oai-client-auth-session=${workspaceCookie([
+            { id: 'team-account', kind: 'team' },
+            { id: 'personal-account', kind: 'personal' },
+          ])}; Path=/; Secure; HttpOnly`,
+        },
+      });
+    }
+    if (url === 'https://auth.openai.com/workspace' || url === 'https://auth.openai.com/sign-in-with-chatgpt/codex/consent') {
+      return new Response('', { status: 200 });
+    }
+    if (url === 'https://auth.openai.com/api/accounts/workspace/select') {
+      selected.push(JSON.parse(options.body));
+      return jsonResponse({ continue_url: `http://localhost:1455/auth/callback?code=local-code&state=${localOAuthState}` });
+    }
+    if (url === 'https://auth.openai.com/oauth/token') {
+      tokenExchangeCalls += 1;
+      return jsonResponse({
+        access_token: teamAccessToken,
+        refresh_token: 'local-refresh-token',
+        id_token: 'local-id-token',
+      });
+    }
+    throw new Error(`unexpected request: ${url}`);
+  };
+
+  const result = await loginFreeAccount({
+    email: 'member@example.com',
+    password: 'password',
+    totp: 'JBSWY3DPEHPK3PXP',
+    workspaceMode: 'team',
+    workspaceId: 'team-account',
+    fetch: requestFetch,
+    authorizationProvider: async () => {
+      providerCalls += 1;
+      const error = new Error('Invalid admin API key');
+      error.code = 'sub2api_oauth_url_failed';
+      error.status = 401;
+      throw error;
+    },
+    callbackHandler: async () => {
+      callbackHandlerCalls += 1;
+      throw new Error('Sub2API callback must not run after local OAuth fallback');
+    },
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.accessToken, teamAccessToken);
+  assert.equal(result.refreshToken, 'local-refresh-token');
+  assert.equal(result.claims.accountId, 'team-account');
+  assert.equal(result.oauthFallback?.code, 'sub2api_oauth_url_failed');
+  assert.equal(result.oauthFallback?.message, 'Invalid admin API key');
+  assert.equal(providerCalls, 1);
+  assert.equal(localAuthorizationCalls, 1);
+  assert.equal(tokenExchangeCalls, 1);
+  assert.equal(callbackHandlerCalls, 0);
+  assert.deepEqual(selected, [{ workspace_id: 'team-account' }]);
+  assert.equal(result.session.authorization, null);
+});
