@@ -25,7 +25,7 @@ Team 轮转提供前后端一体的本地管理能力：前端负责 Team 与账
 
 ## 友情开源项目
 
-- [icloud-mail](https://github.com/t508708/icloud-mail)：iCloud 邮箱注册工具，感谢开源作者提供相关能力与思路。
+- [icloud-mail](https://github.com/t508708/icloud-mail)：另一个独立开源项目，帮助有需要的朋友注册 iCloud 邮箱，让邮箱账号更充足。
 
 ## 开源协议
 
@@ -92,14 +92,3 @@ npm run server
 ```
 
 MCP 工具包括 `get_state`、`list_teams`、`list_accounts`、`get_history`、`check_team_quota`、`check_all_teams`、`refill_team`、`refill_all_teams`、`acquire_missing_free_json` 和 `update_settings`。其中检测、补位、批量获取 Free JSON 和设置更新会真实改变系统状态；MCP 返回沿用脱敏投影，不返回完整密码、2FA、Access Token 或 refresh token。需要跨机器接入时设置 `HOST=0.0.0.0` 和 `MCP_AUTH_TOKEN`，客户端使用 `Authorization: Bearer <token>`。
-
-## 与真实服务对接
-
-当前实现把登录、Team invite、workspace/select、额度查询和 Sub2API 推送保留为可替换的适配边界。Team 管理参考实现位于 `F:\ai-work\ai-gpt-k12`，无头 Codex OAuth 登录流程参考 `F:\ai-work\pp-auto` 的实现：
-
-- 邀请申请/管理员同意：`server/k12-invite.ts` 与 `server/index.ts` 中的 `approveK12WorkspaceRequestByAdmin`。
-- 切换空间并取得 workspace AT：`selectAuthWorkspace` / `switchToK12WorkspaceAccessToken`。
-- 5h/7d 额度：`probeChatGptUsageQuota`，请求 `/backend-api/wham/usage`。
-- Sub2API OAuth：按上述无头登录流程生成授权链接、完成邮箱/密码/TOTP 登录、选择 Free 或 Team 空间、提交 callback 并取得 Sub2API credentials。
-
-接入真实服务时请将完整 AT、refresh token、密码和 2FA 仅保存在受控服务端，前端只展示脱敏值；不要把浏览器 localStorage 当作生产凭据保险库。

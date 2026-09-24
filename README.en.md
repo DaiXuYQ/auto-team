@@ -17,7 +17,7 @@ Team Rotation is a lightweight local management console for Team workspaces and 
 
 ## Related Open-Source Project
 
-- [icloud-mail](https://github.com/t508708/icloud-mail): an iCloud email registration tool.
+- [icloud-mail](https://github.com/t508708/icloud-mail): an independent open-source project for registering iCloud mailboxes when you need more email accounts.
 
 ## Installation
 
