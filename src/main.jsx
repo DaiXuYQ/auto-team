@@ -3,10 +3,10 @@ import { createRoot } from 'react-dom/client';
 import { createPortal } from 'react-dom';
 import {
   Activity, AlertTriangle, ArrowDownToLine, ArrowUpRight, Bot, Check, CheckCircle2,
-  ChevronLeft, ChevronRight, CircleHelp, Clock3, CloudDownload, Copy, Download, ExternalLink,
-  FileText, Gauge, KeyRound, LayoutDashboard, ListFilter, Mail, Moon, MoreHorizontal,
+  ChevronLeft, ChevronRight, CircleHelp, Clock3, CloudDownload, Copy, Download, ExternalLink, Eye, EyeOff,
+  FileText, Gauge, KeyRound, LayoutDashboard, ListFilter, LogIn, LogOut, Mail, Moon, MoreHorizontal,
   Pause, Play, Plus, RefreshCw, Settings2, ShieldAlert, ShieldCheck, SlidersHorizontal,
-  Sparkles, Sun, Trash2, UserMinus, UserRound, Users, X, Zap
+  Sparkles, Sun, Trash2, UserMinus, UserRound, Users, Wrench, X, Zap
 } from 'lucide-react';
 import { groupTeamAccounts } from '../shared/team-members.mjs';
 import './styles.css';
@@ -17,11 +17,12 @@ const initialHistory = [];
 const historyPageSizeOptions = [20, 50, 100];
 const defaultProxySettings = { enabled: false, strategy: 'failover', timeoutMs: 15000, maxRetries: 2, entries: [] };
 const defaultSub2Api = { id: 'sub2api_default', name: '默认 Sub2API', baseUrl: '', apiKey: '', groupId: null, groupName: '', enabled: false, apiKeySet: false };
-// The production server serves the API from the same origin; Vite dev runs it
-// separately on 8786, so point browser requests at the live local API there.
-const API_BASE = import.meta.env.VITE_API_BASE || (import.meta.env.DEV ? 'http://127.0.0.1:8786' : '');
+// Vite proxies /api during development, keeping session cookies same-origin.
+const API_BASE = import.meta.env.VITE_API_BASE || '';
 const API_TOKEN_STORAGE_KEY = 'team_rotation_api_token';
 const LEGACY_API_TOKEN_STORAGE_KEY = 'TEAM_ROTATION_API_TOKEN';
+let apiTokenPrompt = null;
+let authGeneration = 0;
 
 const navItems = [
   { id: 'run', label: '首页', icon: LayoutDashboard },
@@ -30,6 +31,16 @@ const navItems = [
   { id: 'history', label: '操作历史', icon: Clock3 },
   { id: 'settings', label: '设置', icon: SlidersHorizontal },
 ];
+
+function emailDomain(email) {
+  return String(email || '').trim().toLowerCase().match(/^[^\s@]+@([^\s@]+)$/)?.[1] || '';
+}
+
+function joinModeHint(mode, motherEmail = null) {
+  if (mode === 'invite') return '邀请模式：不限制邮箱域名';
+  const domain = emailDomain(motherEmail);
+  return domain ? `申请模式：仅选 @${domain} 账号` : motherEmail === null ? '申请模式：按各 Team 母号邮箱域名筛选' : '申请模式：母号邮箱无效，无法选取候选';
+}
 
 function hydrateChildren(items) {
   return (Array.isArray(items) ? items : []).map((child) => ({
@@ -59,22 +70,48 @@ function saveApiToken(token) {
   } catch { /* browser storage may be unavailable */ }
 }
 
+function clearApiToken() {
+  try {
+    for (const storage of [window.sessionStorage, window.localStorage]) {
+      storage.removeItem(API_TOKEN_STORAGE_KEY);
+      storage.removeItem(LEGACY_API_TOKEN_STORAGE_KEY);
+    }
+  } catch { /* browser storage may be unavailable */ }
+}
+
+function requestApiToken() {
+  if (!apiTokenPrompt) {
+    apiTokenPrompt = Promise.resolve().then(() => window.prompt('服务端需要 API Token，请输入 TEAM_ROTATION_API_TOKEN：', '')?.trim() || '')
+      .then((token) => {
+        if (token) saveApiToken(token);
+        return token;
+      })
+      .finally(() => { apiTokenPrompt = null; });
+  }
+  return apiTokenPrompt;
+}
+
 async function apiRequest(path, options = {}, retriedAfterAuth = false, promptedToken = '') {
+  const requestAuthGeneration = authGeneration;
   const headers = new Headers(options.headers || {});
   if (options.body && !headers.has('content-type')) headers.set('content-type', 'application/json');
   const token = promptedToken || storedApiToken();
   if (token && (!headers.has('authorization') || promptedToken)) headers.set('authorization', `Bearer ${token}`);
   const response = await fetch(`${API_BASE}${path}`, {
+    credentials: 'include',
     ...options,
     headers,
   });
   const payload = await response.json().catch(() => ({}));
   if (!retriedAfterAuth && response.status === 401 && payload?.code === 'api_auth_required') {
-    const token = window.prompt('服务端需要 API Token，请输入 TEAM_ROTATION_API_TOKEN：', '')?.trim();
-    if (token) {
-      saveApiToken(token);
-      return apiRequest(path, options, true, token);
+    const replacementToken = storedApiToken();
+    const nextToken = replacementToken && replacementToken !== token ? replacementToken : await requestApiToken();
+    if (nextToken) {
+      return apiRequest(path, options, true, nextToken);
     }
+  }
+  if (response.status === 401 && payload?.code === 'login_required') {
+    window.dispatchEvent(new CustomEvent('team-rotation:login-required', { detail: { generation: requestAuthGeneration } }));
   }
   if (!response.ok) {
     const error = new Error(payload.message || payload.detail || `HTTP ${response.status}`);
@@ -157,7 +194,7 @@ function isMemberOfTeam(account, teamId) {
 
 function accountForTeam(account, teamId) {
   const membership = teamMembershipFor(account, teamId);
-  return membership ? { ...account, quota5h: membership.quota5h ?? account.quota5h, quota7d: membership.quota7d ?? account.quota7d, quotaSnapshot: membership.quotaSnapshot || account.quotaSnapshot, seatType: membership.seatType || account.seatType || account.memberSnapshot?.seatType || null, joinedAt: membership.joinedAt || account.joinedAt } : account;
+  return membership ? { ...account, quota5h: membership.quota5h ?? account.quota5h, quota7d: membership.quota7d ?? account.quota7d, quotaSnapshot: membership.quotaSnapshot || account.quotaSnapshot, quotaKickExhaustedAt: membership.quotaKickExhaustedAt ?? null, quotaKickPendingUntil: membership.quotaKickPendingUntil ?? null, quotaKickWindow: membership.quotaKickWindow ?? null, seatType: membership.seatType || account.seatType || account.memberSnapshot?.seatType || null, joinedAt: membership.joinedAt || account.joinedAt } : account;
 }
 
 function teamDisplayName(mother) {
@@ -171,26 +208,65 @@ function seatTypeLabel(type) {
   return type || '其他席位';
 }
 
-function inviteSeatTypeLabel(type) {
-  if (type === 'default') return '普通席位';
-  if (type === 'prolite') return '高级席位';
-  return '自动分配';
+function defaultSeatTypeLabel(type) {
+  return type === 'prolite' ? '高级' : '普通';
+}
+
+function seatCount(value, rounding = 'floor') {
+  if (value === null || value === undefined || value === '') return null;
+  const number = Number(value);
+  if (!Number.isFinite(number) || number < 0) return null;
+  return rounding === 'ceil' ? Math.ceil(number) : Math.floor(number);
 }
 
 function seatBreakdown(snapshot = {}) {
-  const capacities = Array.isArray(snapshot.seatCapacity) ? snapshot.seatCapacity : [];
+  const capacities = Array.isArray(snapshot.seatCapacity) ? snapshot.seatCapacity : Array.isArray(snapshot.seat_capacity) ? snapshot.seat_capacity : [];
   const assigned = snapshot.assigned && typeof snapshot.assigned === 'object' ? snapshot.assigned : {};
   return capacities.map((entry) => {
-    const total = Number(entry?.paid ?? entry?.entitled ?? entry?.total);
-    const availableValue = entry?.available;
-    const available = availableValue === null || availableValue === undefined || availableValue === '' ? null : Number(availableValue);
-    const assignedValue = assigned[String(entry?.type || '').toLowerCase()];
-    const assignedCount = assignedValue === null || assignedValue === undefined || assignedValue === '' ? null : Number(assignedValue);
-    const used = Number.isFinite(assignedCount)
-      ? Math.max(0, assignedCount)
-      : Number.isFinite(total) && Number.isFinite(available) ? Math.max(0, total - available) : null;
-    return { type: entry?.type || '', label: seatTypeLabel(entry?.type), used, total: Number.isFinite(total) ? total : null, available: Number.isFinite(available) ? available : null };
-  }).filter((entry) => entry.total != null || entry.available != null);
+    const type = String(entry?.type || '').toLowerCase();
+    const total = seatCount(entry?.paid ?? entry?.entitled ?? entry?.total);
+    const used = seatCount(assigned[type], 'ceil');
+    const held = entry?.held == null || entry.held === '' ? 0 : seatCount(entry.held, 'ceil');
+    const reportedAvailable = seatCount(entry?.available);
+    const calculatedAvailable = total != null && used != null && held != null ? Math.max(0, total - used - held) : null;
+    const available = calculatedAvailable != null
+      ? reportedAvailable == null ? calculatedAvailable : Math.min(calculatedAvailable, reportedAvailable)
+      : reportedAvailable == null || held == null ? null : Math.max(0, reportedAvailable - held);
+    return { type, label: seatTypeLabel(type), used, total, held, available };
+  }).filter((entry) => entry.total != null || entry.available != null || entry.held > 0);
+}
+
+function teamSeatStats(mother = {}) {
+  const snapshot = mother.seatSnapshot || mother.subscription || {};
+  const total = seatCount(mother.seats) ?? seatCount(snapshot.seatsEntitled ?? snapshot.seats_entitled);
+  const used = Object.hasOwn(mother, 'seatsInUse') ? seatCount(mother.seatsInUse, 'ceil')
+    : seatCount(snapshot.seatsInUse ?? snapshot.seats_in_use, 'ceil') ?? seatCount(mother.used, 'ceil');
+  const reserved = seatCount(mother.seatClaimsCount ?? 0, 'ceil');
+  const types = seatBreakdown(snapshot);
+  const held = Object.hasOwn(mother, 'seatsHeld') ? seatCount(mother.seatsHeld, 'ceil')
+    : types.some((seat) => seat.held == null) ? null : types.reduce((sum, seat) => sum + seat.held, 0);
+  const totalOpen = total != null && used != null && held != null && reserved != null
+    ? Math.max(0, total - used - held - reserved) : null;
+  const typeOpen = types.length ? types.reduce((sum, seat) => sum + (seat.available || 0), 0) : null;
+  const open = Object.hasOwn(mother, 'seatsOpen') ? seatCount(mother.seatsOpen)
+    : totalOpen == null || typeOpen == null ? null : Math.min(totalOpen, typeOpen);
+  return { used, total, open, held, reserved, types };
+}
+
+function seatOpenLabel(seats) {
+  return seats.open == null ? '尚未检测可用席位' : `可补 ${seats.open} 个`;
+}
+
+function teamsSeatSummaryLabel(teams) {
+  const known = teams.filter((team) => team.seats.open != null);
+  const open = known.reduce((sum, team) => sum + team.seats.open, 0);
+  const held = teams.reduce((sum, team) => sum + (team.seats.held || 0), 0);
+  const availability = known.length ? `${known.length < teams.length ? '已检测' : ''}可补 ${open} 个` : '尚未检测可用席位';
+  return `${availability}${held ? ` · 暂留 ${held} 个` : ''}`;
+}
+
+function SeatTypeList({ types = [] }) {
+  return types.length ? <div className="seat-type-list">{types.map((seat) => <small key={seat.type}>{seat.label} {seat.used == null || seat.total == null ? '--' : `${seat.used}/${seat.total}`}{seat.held > 0 ? ` · 暂留 ${seat.held}` : ''}{seat.available != null ? ` · 可用 ${seat.available}` : ''}</small>)}</div> : null;
 }
 
 function teamNameForId(mothers, teamId) {
@@ -369,7 +445,7 @@ function AcquireStatus({ state }) {
   return <span className={`acquire-status ${state.status} ${state.loading ? 'loading' : ''}`} title={state.message || ''}><i />{labels[state.status] || '处理中'}{state.authUrl && <a className="auth-link" href={state.authUrl} target="_blank" rel="noreferrer">打开授权链接</a>}</span>;
 }
 
-function App() {
+function App({ onLogout }) {
   const [view, setView] = useState('run');
   const [children, setChildren] = useState(initialChildren);
   const [mothers, setMothers] = useState(initialMothers);
@@ -382,7 +458,8 @@ function App() {
   const [selectedHistory, setSelectedHistory] = useState(null);
   const [historyReloadKey, setHistoryReloadKey] = useState(0);
   const [isRunning, setIsRunning] = useState(false);
-  const [isProcessing, setIsProcessing] = useState(false);
+  const [processingCount, setProcessingCount] = useState(0);
+  const isProcessing = processingCount > 0;
   const [stage, setStage] = useState('monitor');
   const [progress, setProgress] = useState(0);
   const [lastSync, setLastSync] = useState('未同步');
@@ -408,6 +485,7 @@ function App() {
   const [detailTeamId, setDetailTeamId] = useState(null);
   const [showSettings, setShowSettings] = useState(false);
   const [showAgentHelp, setShowAgentHelp] = useState(false);
+  const [showQuickJson, setShowQuickJson] = useState(false);
   const [tasks, setTasks] = useState([]);
   const [showTaskCenter, setShowTaskCenter] = useState(false);
   const [selectedTeam, setSelectedTeam] = useState(null);
@@ -421,6 +499,10 @@ function App() {
   const [concurrency, setConcurrency] = useState(3);
   const [kickWindow, setKickWindow] = useState('5h');
   const [kickAfterHours, setKickAfterHours] = useState(12);
+  const [delayedKickEnabled, setDelayedKickEnabled] = useState(false);
+  const [delayedKickMinutes, setDelayedKickMinutes] = useState(10);
+  const [joinMode, setJoinMode] = useState('request');
+  const [effectiveJoinMode, setEffectiveJoinMode] = useState('request');
   const [promoteJoinedAccounts, setPromoteJoinedAccounts] = useState(true);
   const [integrations, setIntegrations] = useState({
     sub2api: defaultSub2Api,
@@ -429,6 +511,7 @@ function App() {
   });
   const [showIntegration, setShowIntegration] = useState(null);
   const [proxySettings, setProxySettings] = useState(defaultProxySettings);
+  const [versionInfo, setVersionInfo] = useState(null);
   const [showProxy, setShowProxy] = useState(false);
   const [search, setSearch] = useState('');
   const [theme, setTheme] = useState(() => {
@@ -481,6 +564,11 @@ function App() {
           setConcurrency(Math.min(10, Math.max(1, Number(payload.settings.concurrency) || 3)));
           setKickWindow(['5h', '7d', 'time'].includes(payload.settings.kickWindow) ? payload.settings.kickWindow : '5h');
           setKickAfterHours(Math.min(720, Math.max(1, Number(payload.settings.kickAfterHours) || 12)));
+          setDelayedKickEnabled(payload.settings.delayedKickEnabled === true);
+          setDelayedKickMinutes(Math.min(1440, Math.max(1, Number(payload.settings.delayedKickMinutes) || 10)));
+          const nextJoinMode = payload.settings.joinMode === 'invite' ? 'invite' : 'request';
+          setJoinMode(nextJoinMode);
+          setEffectiveJoinMode(nextJoinMode);
           setPromoteJoinedAccounts(payload.settings.promoteJoinedAccounts !== false);
           setIntegrations((current) => mergedIntegrations(current, payload.settings.integrations));
           setProxySettings((current) => ({ ...current, ...(payload.settings.proxy || {}), entries: Array.isArray(payload.settings.proxy?.entries) ? payload.settings.proxy.entries : current.entries }));
@@ -490,6 +578,14 @@ function App() {
     }).catch(() => {
       if (!cancelled) notify('无法连接服务端，当前保持空状态', 'error');
     });
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    apiRequest('/api/version').then((result) => {
+      if (!cancelled) setVersionInfo(result);
+    }).catch(() => {});
     return () => { cancelled = true; };
   }, []);
 
@@ -526,26 +622,23 @@ function App() {
   const automaticMothers = useMemo(() => mothers.filter((mother) => mother.rotationEnabled !== false), [mothers]);
   const activeChildren = children.filter((c) => activeMother && isMemberOfTeam(c, activeMother.accountId || activeMother.team) && c.status !== 'kicked');
   const trackedChildren = children.filter((c) => joinedTeamsFor(c).some((entry) => entry.status === 'active'));
-  const readyChildren = children.filter((c) => c.status === 'ready');
+  const activeMotherDomain = emailDomain(activeMother?.email);
+  const readyChildren = children.filter((c) => activeMother && c.status === 'ready' && (effectiveJoinMode === 'invite' || (activeMotherDomain && emailDomain(c.email) === activeMotherDomain)));
   const exhausted = activeChildren.filter((c) => c.status === 'banned' || (c.status === 'exhausted' && c.lastProbe?.ok === true));
   const anyExhausted = children.some((c) => c.status === 'banned' || (c.status === 'exhausted' && c.lastProbe?.ok === true));
-  const anyOpenSeat = mothers.some((mother) => Number.isFinite(Number(mother.seats)) && Number.isFinite(Number(mother.used)) && Number(mother.seats) > Number(mother.used));
+  const anyOpenSeat = mothers.some((mother) => (teamSeatStats(mother).open || 0) > 0);
   const lowQuota = activeChildren.filter((c) => [c.quota5h, c.quota7d].some((value) => Number.isFinite(Number(value)) && Number(value) <= Number(threshold)));
-  const seatsOpen = activeMother && Number.isFinite(Number(activeMother.seats)) && Number.isFinite(Number(activeMother.used))
-    ? Math.max(0, Number(activeMother.seats) - Number(activeMother.used))
-    : 0;
+  const activeSeatStats = activeMother ? teamSeatStats(activeMother) : null;
+  const seatsOpen = activeSeatStats?.open || 0;
   const accountRecords = useMemo(() => children.map((child) => ({ ...child, recordType: 'child', accountType: 'free', joinedTeams: joinedTeamsFor(child) })), [children]);
   const filteredAccounts = accountRecords.filter((c) => `${c.email} ${c.id} ${c.team || ''} ${joinedTeamsFor(c).map((entry) => entry.team).join(' ')}`.toLowerCase().includes(search.toLowerCase()));
   const teamRecords = useMemo(() => mothers.map((mother) => {
     const teamId = mother.accountId || mother.team || mother.id;
     const displayName = teamDisplayName(mother);
-    const snapshot = mother.seatSnapshot || mother.subscription || {};
     const ownerQuota = snapshotQuota(mother);
     const primaryOwner = teamOwnerRecordFor(mother, mother.email);
     const ownerAccount = { ...primaryOwner, email: mother.email, id: primaryOwner?.id || mother.chatgptUserId, status: mother.status, credentialsStatus: primaryOwner?.credentialsStatus || mother.credentialsStatus, sub2apiStatus: primaryOwner?.sub2apiStatus || { imported: Boolean(mother.hasAccessToken), exportable: Boolean(mother.hasAccessToken) }, joinedAt: mother.createdAt, joinedTeams: [{ team: teamId, status: 'active', joinedAt: mother.createdAt }], ...ownerQuota };
-    const seatTotal = Number.isFinite(Number(mother.seats)) ? Number(mother.seats) : numericOrNull(snapshot.seatsEntitled);
-    const seatUsed = Number.isFinite(Number(mother.used)) ? Number(mother.used) : numericOrNull(snapshot.seatsInUse);
-    const seatTypes = seatBreakdown(snapshot);
+    const seats = teamSeatStats(mother);
     const teamChildren = children.filter((child) => isMemberOfTeam(child, teamId) && child.status !== 'kicked').map((child) => accountForTeam(child, teamId));
     const remoteMembers = (mother.members || []).filter((item) => (item.email || item.id) && !item.deactivated_time && !item.deactivatedTime);
     const authoritativeMembers = mother.lastMembersProbe?.ok === true;
@@ -600,7 +693,7 @@ function App() {
       mother,
       owners,
       owner: owners[0] || { email: mother.email || '', name: mother.name || '', userId: mother.chatgptUserId || null },
-      seats: { used: seatUsed, total: seatTotal, open: seatUsed != null && seatTotal != null ? Math.max(0, seatTotal - seatUsed) : null, reserved: Math.max(0, Number(mother.seatClaimsCount) || 0), types: seatTypes },
+      seats,
       rows,
       lastSync: mother.lastWorkspaceSyncAt || mother.lastCheck || null,
     };
@@ -667,6 +760,11 @@ function App() {
         setConcurrency(Math.min(10, Math.max(1, Number(payload.settings.concurrency) || 3)));
         setKickWindow(['5h', '7d', 'time'].includes(payload.settings.kickWindow) ? payload.settings.kickWindow : '5h');
         setKickAfterHours(Math.min(720, Math.max(1, Number(payload.settings.kickAfterHours) || 12)));
+        setDelayedKickEnabled(payload.settings.delayedKickEnabled === true);
+        setDelayedKickMinutes(Math.min(1440, Math.max(1, Number(payload.settings.delayedKickMinutes) || 10)));
+        const nextJoinMode = payload.settings.joinMode === 'invite' ? 'invite' : 'request';
+        setJoinMode(nextJoinMode);
+        setEffectiveJoinMode(nextJoinMode);
         setPromoteJoinedAccounts(payload.settings.promoteJoinedAccounts !== false);
         setIntegrations((current) => mergedIntegrations(current, payload.settings.integrations));
         setProxySettings((current) => ({ ...current, ...(payload.settings.proxy || {}), entries: Array.isArray(payload.settings.proxy?.entries) ? payload.settings.proxy.entries : current.entries }));
@@ -726,7 +824,7 @@ function App() {
     if (!motherId && !mothers.length) { notify('请先添加一个 Team', 'error'); return; }
     const allTeams = !motherId;
     const taskId = createTask('check', allTeams ? `检测全部 ${mothers.length} 个 Team` : '检测 Team 额度', motherId, allTeams ? '同步所有 Team 的席位、成员和 5h / 7d 额度' : '同步席位、成员和 5h / 7d 额度');
-    setStage('monitor'); setProgress(12); setIsProcessing(true); notify(allTeams ? `已启动全部 ${mothers.length} 个 Team 的额度检测` : '额度检测已启动', 'info');
+    setStage('monitor'); setProgress(12); setProcessingCount((count) => count + 1); notify(allTeams ? `已启动全部 ${mothers.length} 个 Team 的额度检测` : '额度检测已启动', 'info');
     try {
       const result = await apiRequest(allTeams ? '/api/maintenance/check-all' : '/api/maintenance/check', { method: 'POST', body: JSON.stringify(allTeams ? {} : { motherId }) });
       await refreshState(false);
@@ -751,14 +849,15 @@ function App() {
     } catch (error) {
       finishTask(taskId, 'failed', `检测失败：${error.message}`);
       setProgress(0); notify(`额度检测失败：${error.message}`, 'error');
-    } finally { setIsProcessing(false); }
+    } finally { setProcessingCount((count) => Math.max(0, count - 1)); }
   }
 
   async function refillSeats(motherId = null) {
     if (!motherId && !mothers.length) { notify('请先添加一个 Team', 'error'); return; }
     const allTeams = !motherId;
-    const taskId = createTask('refill', allTeams ? `补满全部 ${mothers.length} 个 Team` : '补满 Team 席位', motherId, allTeams ? '按空席位从 Free 池补位' : '先同步席位，再按空席位从 Free 池补位');
-    setProgress(20); setIsProcessing(true); notify(allTeams ? `正在为全部 ${mothers.length} 个 Team 移除耗尽账号并补位` : '正在移除耗尽账号并补位', 'info');
+    const modeHint = joinModeHint(effectiveJoinMode, allTeams ? null : mothers.find((mother) => mother.id === motherId)?.email || '');
+    const taskId = createTask('refill', allTeams ? `补满全部 ${mothers.length} 个 Team` : '补满 Team 席位', motherId, `${allTeams ? '按空席位从 Free 池补位' : '先同步席位，再按空席位从 Free 池补位'} · ${modeHint}`);
+    setProgress(20); setProcessingCount((count) => count + 1); notify(`${allTeams ? `正在为全部 ${mothers.length} 个 Team 移除耗尽账号并补位` : '正在移除耗尽账号并补位'} · ${modeHint}`, 'info');
     try {
       const result = await apiRequest(allTeams ? '/api/maintenance/refill-all' : '/api/maintenance/refill', { method: 'POST', body: JSON.stringify(allTeams ? {} : { motherId }) });
       await refreshState(false);
@@ -769,7 +868,7 @@ function App() {
     } catch (error) {
       finishTask(taskId, 'failed', `补位失败：${error.message}`);
       setProgress(0); notify(`补位失败：${error.message}`, 'error');
-    } finally { setIsProcessing(false); }
+    } finally { setProcessingCount((count) => Math.max(0, count - 1)); }
   }
 
   async function toggleAutomation() {
@@ -794,7 +893,7 @@ function App() {
     try {
       await apiRequest('/api/settings', {
         method: 'PATCH',
-        body: JSON.stringify({ autoRefill, promoteJoinedAccounts, threshold: Number(threshold), checkInterval: Number(checkInterval), concurrency: Number(concurrency), kickWindow, kickAfterHours: Number(kickAfterHours) }),
+        body: JSON.stringify({ autoRefill, promoteJoinedAccounts, threshold: Number(threshold), checkInterval: Number(checkInterval), concurrency: Number(concurrency), kickWindow, kickAfterHours: Number(kickAfterHours), delayedKickEnabled, delayedKickMinutes: Number(delayedKickMinutes), joinMode }),
       });
       await refreshState(false);
       notify('自动化设置已保存');
@@ -919,6 +1018,46 @@ function App() {
       const blob = new Blob([JSON.stringify({ exported_at: payload.exported_at, accounts: payload.account ? [payload.account] : [] }, null, 2)], { type: 'application/json' });
       const url = URL.createObjectURL(blob); const anchor = document.createElement('a'); anchor.href = url; anchor.download = `free-${email.replace(/[^a-z0-9_.-]+/gi, '_')}.json`; anchor.click(); URL.revokeObjectURL(url);
     } catch (error) { notify('Free JSON 已生成，但下载失败，请使用批量导出', 'error'); }
+  }
+
+  async function acquireQuickJson(fields) {
+    const taskId = createTask('acquire', `快捷获取 ${fields.scope === 'team' ? 'Team' : 'Free'} JSON`, fields.motherId || null, `账号：${fields.email.trim()}`);
+    updateTask(taskId, { progress: 24, message: '正在登录并获取授权' });
+    try {
+      const payload = await apiRequest('/api/tools/quick-json/acquire', { method: 'POST', body: JSON.stringify(fields) });
+      if (payload.ok === false || !payload.account) {
+        const error = new Error(payload.message || (payload.needsInput ? '需要完成账号验证' : '服务端未返回账号 JSON'));
+        error.payload = payload;
+        throw error;
+      }
+      finishTask(taskId, 'completed', `${fields.scope === 'team' ? 'Team' : 'Free'} JSON 已获取`);
+      reloadHistory();
+      notify('JSON 已获取，可下载或推送到 Sub2API');
+      return payload;
+    } catch (error) {
+      finishTask(taskId, 'failed', `获取失败：${error.message}`);
+      throw error;
+    }
+  }
+
+  async function pushQuickJson(result, sub2apiIntegrationId) {
+    const taskId = createTask('push', '快捷推送 Sub2API', result.motherId || null, `账号：${result.email}`);
+    try {
+      const payload = await apiRequest('/api/tools/quick-json/push', {
+        method: 'POST',
+        body: JSON.stringify({ ticket: result.ticket, scope: result.scope, motherId: result.motherId, sub2apiIntegrationId }),
+      });
+      if (payload.ok === false || payload.failed?.length) throw new Error(payload.failed?.[0]?.error || payload.failed?.[0]?.message || 'Sub2API 推送失败');
+      const action = payload.pushed?.[0]?.action || payload.skipped?.[0]?.action;
+      const message = action === 'updated' || action === 'repaired' ? 'Sub2API 已更新该账号 JSON' : action === 'created' ? 'JSON 已推送到 Sub2API' : action === 'skipped_existing' ? 'Sub2API 已存在该账号' : 'Sub2API 账号已处理';
+      finishTask(taskId, 'completed', message);
+      reloadHistory();
+      notify(message);
+      return payload;
+    } catch (error) {
+      finishTask(taskId, 'failed', `推送失败：${error.message}`);
+      throw error;
+    }
   }
 
   function openAccount(account = null) {
@@ -1217,8 +1356,8 @@ function App() {
       const path = editingMotherId ? `/api/mothers/${encodeURIComponent(editingMotherId)}` : '/api/mothers';
       const method = editingMotherId ? 'PATCH' : 'POST';
       const teamId = next.accountId || next.team || '';
-      const inviteSeatType = ['default', 'prolite'].includes(next.inviteSeatType) ? next.inviteSeatType : 'auto';
-      const payload = await apiRequest(path, { method, body: JSON.stringify({ ...next, team: teamId, accountId: teamId, teamName: next.teamName || next.displayName || '', rotationMode: next.rotationMode === 'rotating' ? 'rotating' : 'fixed', inviteSeatType, primaryOwnerEmail: next.primaryOwnerEmail || next.email || '', accessToken: next.accessToken || next.token || '' }) });
+      const defaultSeatType = next.defaultSeatType === 'prolite' ? 'prolite' : 'default';
+      const payload = await apiRequest(path, { method, body: JSON.stringify({ ...next, team: teamId, accountId: teamId, teamName: next.teamName || next.displayName || '', rotationMode: next.rotationMode === 'rotating' ? 'rotating' : 'fixed', defaultSeatType, primaryOwnerEmail: next.primaryOwnerEmail || next.email || '', accessToken: next.accessToken || next.token || '' }) });
       applyStatePayload(payload, setChildren, setMothers);
       reloadHistory();
       setSelectedTeam(next.id); setShowMother(false);
@@ -1237,17 +1376,17 @@ function App() {
     <header className="topbar">
       <div className="brand"><div className="brand-mark"><Zap size={17} strokeWidth={2.6} /></div><div><strong>team轮转</strong><span>TEAM AUTOMATION</span></div></div>
       <nav className="main-nav">{navItems.map(({ id, label, icon: Icon }) => <button key={id} className={view === id ? 'nav-item active' : 'nav-item'} onClick={() => setView(id)}><Icon size={17} />{label}{id === 'free' && <em>{accountRecords.length}</em>}</button>)}</nav>
-      <div className="top-actions"><button className="icon-button theme-toggle" title={theme === 'dark' ? '切换为白天模式' : '切换为黑夜模式'} aria-label={theme === 'dark' ? '切换为白天模式' : '切换为黑夜模式'} onClick={() => setTheme((current) => current === 'dark' ? 'light' : 'dark')}>{theme === 'dark' ? <Sun size={18} /> : <Moon size={18} />}</button><button className="icon-button" title="Agent 接入与功能说明" aria-label="Agent 接入与功能说明" onClick={() => setShowAgentHelp(true)}><CircleHelp size={18} /></button><button className="icon-button" title="更多" aria-label="更多"><MoreHorizontal size={19} /></button><div className="avatar" title="当前用户">AL</div></div>
+      <div className="top-actions"><button className="icon-button theme-toggle" title={theme === 'dark' ? '切换为白天模式' : '切换为黑夜模式'} aria-label={theme === 'dark' ? '切换为白天模式' : '切换为黑夜模式'} onClick={() => setTheme((current) => current === 'dark' ? 'light' : 'dark')}>{theme === 'dark' ? <Sun size={18} /> : <Moon size={18} />}</button><button className="icon-button" title="快捷获取 JSON" aria-label="快捷获取 JSON" onClick={() => setShowQuickJson(true)}><Wrench size={18} /></button><button className="icon-button" title="Agent 接入与功能说明" aria-label="Agent 接入与功能说明" onClick={() => setShowAgentHelp(true)}><CircleHelp size={18} /></button><button className="icon-button" title="退出登录" aria-label="退出登录" onClick={() => onLogout().catch((error) => notify(`退出失败：${error.message}`, 'error'))}><LogOut size={18} /></button><div className="avatar" title="当前用户">AL</div></div>
     </header>
 
     <main className={`main-content ${view === 'run' ? 'home-content' : ''}`}>
       <div className="page-heading"><div><div className="breadcrumb"><span>我的工作区</span><ChevronRight size={14} /><strong>{view === 'run' ? '首页' : navItems.find((item) => item.id === view)?.label}</strong></div><h1>{view === 'run' ? 'Team 配额自动化' : navItems.find((item) => item.id === view)?.label}</h1><p>{view === 'run' ? '持续监控 Team 席位与账号额度，自动完成移除和补位。' : view === 'teams' ? '管理 Team 所有者、席位和当前成员。' : view === 'free' ? '维护账号凭据、加入过的 Team 和 Sub2API 状态。' : '集中管理自动检测和操作记录。'}</p></div><div className="heading-actions"><span className={isRunning ? 'live-badge on' : 'live-badge'}><i />{isRunning ? 'Live' : 'Paused'}</span><button className="button ghost" onClick={toggleAutomation}>{isRunning ? <Pause size={15} /> : <Play size={15} />}{isRunning ? '暂停' : '恢复'}</button><button className="button primary" onClick={syncNow}><RefreshCw size={15} />同步进度</button></div></div>
 
-      {view === 'run' && <RunView activeMother={activeMother} activeChildren={activeChildren} trackedChildren={trackedChildren} readyChildren={readyChildren} exhausted={exhausted} canRefillAll={anyExhausted || anyOpenSeat || kickWindow === 'time'} lowQuota={lowQuota} seatsOpen={seatsOpen} stage={stage} progress={progress} isRunning={isRunning} isProcessing={isProcessing} lastSync={lastSync} runCheck={runCheck} refillSeats={refillSeats} setShowMother={() => openMother(activeMother)} setSelectedTeam={setSelectedTeam} mothers={mothers} autoRefill={autoRefill} />}
+      {view === 'run' && <RunView activeMother={activeMother} activeSeatStats={activeSeatStats} activeChildren={activeChildren} trackedChildren={trackedChildren} readyChildren={readyChildren} exhausted={exhausted} canRefillAll={anyExhausted || anyOpenSeat || kickWindow === 'time'} lowQuota={lowQuota} seatsOpen={seatsOpen} stage={stage} progress={progress} isRunning={isRunning} isProcessing={isProcessing} lastSync={lastSync} runCheck={runCheck} refillSeats={refillSeats} setShowMother={() => openMother(activeMother)} setSelectedTeam={setSelectedTeam} mothers={mothers} autoRefill={autoRefill} joinMode={effectiveJoinMode} />}
       {view === 'teams' && <TeamManagementView teams={teamRecords} openTeam={openMother} openDetail={openTeamDetail} setShowImport={() => setShowImport(true)} exportTeamSub2Api={exportTeamSub2Api} pushTeamSub2Api={pushTeamSub2Api} openBillingPreviews={openBillingPreviews} billingPreviewLoading={billingPreviewLoading} />}
       {view === 'free' && <FreeAccountsView children={filteredAccounts} allChildren={accountRecords} mothers={mothers} search={search} setSearch={setSearch} setShowImport={() => setShowImport(true)} addAccount={() => openAccount()} exportSub2Api={exportSub2Api} pushSub2Api={pushSub2Api} removeChild={removeChild} deleteFreeAccount={deleteFreeAccount} batchDeleteBannedAccounts={batchDeleteBannedAccounts} openJsonImport={openJsonImport} editAccount={openAccount} acquireAccount={acquireAccount} acquireMissingFreeJson={acquireMissingFreeJson} acquireStates={acquireStates} batchAcquire={batchAcquire} concurrency={concurrency} />}
       {view === 'history' && <HistoryView history={history} page={historyPage} pageSize={historyPageSize} meta={historyMeta} loading={historyLoading} error={historyError} onPageChange={changeHistoryPage} onPageSizeChange={changeHistoryPageSize} onRetry={reloadHistory} onSelect={setSelectedHistory} />}
-      {view === 'settings' && <SettingsView autoRefill={autoRefill} setAutoRefill={setAutoRefill} promoteJoinedAccounts={promoteJoinedAccounts} setPromoteJoinedAccounts={setPromoteJoinedAccounts} threshold={threshold} setThreshold={setThreshold} checkInterval={checkInterval} setCheckInterval={setCheckInterval} concurrency={concurrency} setConcurrency={setConcurrency} kickWindow={kickWindow} setKickWindow={setKickWindow} kickAfterHours={kickAfterHours} setKickAfterHours={setKickAfterHours} integrations={integrations} openIntegration={setShowIntegration} proxy={proxySettings} openProxy={() => setShowProxy(true)} saveSettings={saveSettings} />}
+      {view === 'settings' && <SettingsView autoRefill={autoRefill} setAutoRefill={setAutoRefill} promoteJoinedAccounts={promoteJoinedAccounts} setPromoteJoinedAccounts={setPromoteJoinedAccounts} joinMode={joinMode} setJoinMode={setJoinMode} threshold={threshold} setThreshold={setThreshold} checkInterval={checkInterval} concurrency={concurrency} setConcurrency={setConcurrency} kickWindow={kickWindow} setKickWindow={setKickWindow} kickAfterHours={kickAfterHours} setKickAfterHours={setKickAfterHours} delayedKickEnabled={delayedKickEnabled} setDelayedKickEnabled={setDelayedKickEnabled} delayedKickMinutes={delayedKickMinutes} setDelayedKickMinutes={setDelayedKickMinutes} integrations={integrations} openIntegration={setShowIntegration} proxy={proxySettings} openProxy={() => setShowProxy(true)} saveSettings={saveSettings} versionInfo={versionInfo} />}
     </main>
 
     {showImport && <Modal title="导入账号" onClose={closeImport}><div className="modal-intro">Sub2API 混合文件会按 `plan_type` 自动分流：Team 记录合并到对应空间并保留多个所有者，Free 记录进入普通账号池。完整凭据只提交服务端，不写入浏览器存储。</div><label className="file-picker"><span>选择 Sub2API JSON</span><input type="file" accept="application/json,.json" onChange={importSub2ApiFile} /><small>{importFileName || '未选择文件'}</small></label><div className="segmented">{[['email-code', '邮箱 / 接码地址'], ['password-2fa', '邮箱 / 密码 / 2FA']].map(([id, label]) => <button key={id} className={importMode === id ? 'selected' : ''} onClick={() => setImportMode(id)}>{label}</button>)}</div><textarea className="import-area" value={importText} onChange={(event) => { setImportAccounts(null); setImportFileName(''); setImportText(event.target.value); }} placeholder={importMode === 'email-code' ? 'name@example.com | sms-provider://address\nname2@example.com | https://mailbox.example/...' : 'name@example.com----password----2fa-secret'} /><div className="modal-foot"><span className="muted">{importAccounts?.length ? `${importAccounts.length} 个 JSON 账号待导入` : '支持粘贴账号信息；不会生成演示账号。'}</span><button className="button primary" onClick={importChildren}><ArrowDownToLine size={15} />开始导入</button></div></Modal>}
@@ -1257,11 +1396,12 @@ function App() {
     {showIntegration === 'sub2api' && <Sub2ApiModal configs={integrations.sub2apis || []} mothers={mothers} onClose={() => setShowIntegration(null)} onSave={(next) => saveIntegration('sub2api', next)} />}
     {showIntegration === 'mailbox' && <IntegrationModal type="mailbox" config={integrations.mailbox} onClose={() => setShowIntegration(null)} onSave={(next) => saveIntegration('mailbox', next)} />}
     {showProxy && <ProxyModal proxy={proxySettings} onClose={() => setShowProxy(false)} onSave={saveProxySettings} onAdd={addProxyEntries} onRemove={removeProxyEntry} notify={notify} />}
-    {showTeamDetail && <TeamDetailModal team={teamRecords.find((item) => item.id === detailTeamId) || null} onClose={() => setShowTeamDetail(false)} runCheck={runCheck} refillSeats={refillSeats} setSelectedTeam={setSelectedTeam} openTeam={openMother} manageMother={openMotherManager} exportTeamSub2Api={exportTeamSub2Api} pushTeamSub2Api={pushTeamSub2Api} updateMemberKickTimers={updateMemberKickTimers} automationEnabled={autoRefill && (teamRecords.find((item) => item.id === detailTeamId)?.mother?.rotationEnabled !== false)} kickWindow={kickWindow} kickAfterHours={kickAfterHours} />}
+    {showTeamDetail && <TeamDetailModal team={teamRecords.find((item) => item.id === detailTeamId) || null} onClose={() => setShowTeamDetail(false)} runCheck={runCheck} refillSeats={refillSeats} setSelectedTeam={setSelectedTeam} openTeam={openMother} manageMother={openMotherManager} exportTeamSub2Api={exportTeamSub2Api} pushTeamSub2Api={pushTeamSub2Api} updateMemberKickTimers={updateMemberKickTimers} automationEnabled={autoRefill && (teamRecords.find((item) => item.id === detailTeamId)?.mother?.rotationEnabled !== false)} kickWindow={kickWindow} kickAfterHours={kickAfterHours} delayedKickEnabled={delayedKickEnabled} joinMode={effectiveJoinMode} />}
     {managedMotherId && <MotherManagerModal mother={mothers.find((item) => item.id === managedMotherId)} action={managerAction} onClose={() => setManagedMotherId(null)} onSave={(fields) => manageMother(managedMotherId, 'save', fields)} onProbe={() => manageMother(managedMotherId, 'probe')} onRecover={(fields) => manageMother(managedMotherId, 'recover', fields)} onDelete={() => deleteMother(managedMotherId)} />}
     {showBillingPreview && <BillingPreviewModal data={billingPreviewData} loading={billingPreviewLoading} error={billingPreviewError} onRefresh={loadBillingPreviews} onClose={() => setShowBillingPreview(false)} />}
     {showSettings && <SettingsModal onClose={() => setShowSettings(false)} />}
     {showAgentHelp && <AgentAccessModal onClose={() => setShowAgentHelp(false)} notify={notify} />}
+    {showQuickJson && <QuickJsonModal mothers={mothers} children={children} sub2apis={integrations.sub2apis || []} onAcquire={acquireQuickJson} onPush={pushQuickJson} onClose={() => setShowQuickJson(false)} />}
     <TaskCenter tasks={tasks} open={showTaskCenter} onOpen={() => setShowTaskCenter(true)} onClose={() => setShowTaskCenter(false)} />
     {selectedHistory && <HistoryDetailModal item={selectedHistory} onClose={() => setSelectedHistory(null)} />}
     {toast && <div className={`toast ${toast.type}`}><CheckCircle2 size={18} /><span>{toast.message}</span><button onClick={() => setToast(null)}><X size={16} /></button></div>}
@@ -1296,6 +1436,26 @@ function RotationCountdown({ joinedAt, hours }) {
   const remainingMinutes = totalMinutes % 60;
   const label = remainingHours ? `${remainingHours}h ${remainingMinutes}m` : `${remainingMinutes}m`;
   return <small className="rotation-countdown">剩余 {label}</small>;
+}
+
+function QuotaKickCountdown({ until, windowName, status, verifiedAt, automationEnabled, enabled }) {
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    if (!until || !enabled) return undefined;
+    const timer = window.setInterval(() => setTick((value) => value + 1), 1000);
+    return () => window.clearInterval(timer);
+  }, [until, enabled]);
+  if (!enabled) return <span className="manual-timer-empty">未开启</span>;
+  const kickAt = Date.parse(until || '');
+  if (!Number.isFinite(kickAt)) return <span className="manual-timer-empty">未触发</span>;
+  const remainingSeconds = Math.max(0, Math.ceil((kickAt - Date.now()) / 1000));
+  const hours = Math.floor(remainingSeconds / 3600);
+  const minutes = Math.floor((remainingSeconds % 3600) / 60);
+  const seconds = remainingSeconds % 60;
+  const due = remainingSeconds <= 0;
+  const confirmed = status === 'exhausted';
+  const verifiedAfterDelay = confirmed && Date.parse(verifiedAt || '') >= kickAt;
+  return <span className={`quota-kick-state ${due ? 'due' : ''}`} title={confirmed ? `预计 ${displayTime(until)} 后复核并移出` : '额度检测未确认，等待成功复核'}><strong>{due ? (verifiedAfterDelay ? '等待移出' : '等待额度复核') : `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`}</strong><small>{windowName === '7d' ? '7d' : '5h'} {confirmed ? '已耗尽' : '待复核'}{automationEnabled ? '' : ' · 自动暂停'}</small></span>;
 }
 
 function manualKickTimerFor(account, membership) {
@@ -1352,11 +1512,11 @@ function TeamHealthStatus({ mother }) {
 function TeamManagementView({ teams, openTeam, openDetail, setShowImport, exportTeamSub2Api, pushTeamSub2Api, openBillingPreviews, billingPreviewLoading }) {
   const totalSeats = teams.reduce((sum, team) => sum + (Number(team.seats.total) || 0), 0);
   const usedSeats = teams.reduce((sum, team) => sum + (Number(team.seats.used) || 0), 0);
-  const openSeats = teams.reduce((sum, team) => sum + (Number(team.seats.open) || 0), 0);
+  const seatsKnown = teams.length && teams.every((team) => team.seats.used != null && team.seats.total != null);
   return <section className="team-management">
     <section className="metrics">
       <Metric label="Team 空间" value={teams.length} detail="当前接入的空间" icon={Users} tone="blue" />
-      <Metric label="席位使用" value={`${usedSeats} / ${totalSeats || '--'}`} detail={openSeats ? `还可加入 ${openSeats} 个账号` : '当前没有空席位'} icon={LayoutDashboard} tone="green" />
+      <Metric label="席位使用" value={seatsKnown ? `${usedSeats} / ${totalSeats}` : '--'} detail={teamsSeatSummaryLabel(teams)} icon={LayoutDashboard} tone="green" />
       <Metric label="当前账号" value={teams.reduce((sum, team) => sum + team.rows.length, 0)} detail="已同步成员列表" icon={UserRound} tone="amber" />
       <Metric label="同步状态" value={teams.length ? '已接入' : '未配置'} detail={teams.length ? '点击管理查看额度' : '添加 Team 后开始'} icon={Activity} tone="slate" />
     </section>
@@ -1369,7 +1529,7 @@ function TeamManagementView({ teams, openTeam, openDetail, setShowImport, export
         return <tr key={team.id}>
           <td><div className="team-list-title"><div className="team-avatar"><Users size={17} /></div><div><strong>{team.displayName}</strong><small className="team-sub2api-target">{team.mother.sub2apiIntegrationName || '未配置 Sub2API'}</small></div></div></td>
           <td><OwnerEmails owners={team.owners} /></td>
-          <td><div className="table-seats"><span>{team.seats.used == null || team.seats.total == null ? '--' : `${team.seats.used}/${team.seats.total}`}</span><i><b style={{ width: `${team.seats.total ? Math.min(100, (team.seats.used || 0) / team.seats.total * 100) : 0}%` }} /></i></div>{team.seats.reserved > 0 && <small className="seat-policy-label">待核验占位 {team.seats.reserved}</small>}{team.seats.types?.length ? <div className="seat-type-list">{team.seats.types.map((seat) => <small key={seat.type}>{seat.label} {seat.used == null ? '--' : `${seat.used}/${seat.total}`}</small>)}</div> : null}<small className="seat-policy-label">补位：{inviteSeatTypeLabel(team.mother.inviteSeatType)}</small></td>
+          <td><div className="table-seats"><span>{team.seats.used == null || team.seats.total == null ? '--' : `${team.seats.used}/${team.seats.total}`}</span><i><b style={{ width: `${team.seats.total ? Math.min(100, (team.seats.used || 0) / team.seats.total * 100) : 0}%` }} /></i></div><small className="seat-policy-label">{seatOpenLabel(team.seats)}</small>{team.seats.held > 0 && <small className="seat-held-label">暂留 {team.seats.held} 个 · 暂不可用</small>}{team.seats.reserved > 0 && <small className="seat-policy-label">待核验占位 {team.seats.reserved}</small>}<SeatTypeList types={team.seats.types} /><small className="seat-policy-label">默认席位：{defaultSeatTypeLabel(team.mother.defaultSeatType)}</small></td>
           <td>{team.rows.length} 个</td>
           <td><span className={`rotation-limit ${daily.remaining === 0 ? 'reached' : ''}`}>{daily.count} / {daily.limit}</span></td>
           <td><div className="team-status-stack"><TeamHealthStatus mother={team.mother} /><TeamRotationStatus mother={team.mother} /></div></td>
@@ -1417,7 +1577,7 @@ function TaskCenter({ tasks, open, onOpen, onClose }) {
   </>;
 }
 
-function TeamDetailModal({ team, onClose, runCheck, refillSeats, setSelectedTeam, openTeam, manageMother, exportTeamSub2Api, pushTeamSub2Api, updateMemberKickTimers, automationEnabled, kickWindow, kickAfterHours }) {
+function TeamDetailModal({ team, onClose, runCheck, refillSeats, setSelectedTeam, openTeam, manageMother, exportTeamSub2Api, pushTeamSub2Api, updateMemberKickTimers, automationEnabled, kickWindow, kickAfterHours, delayedKickEnabled, joinMode }) {
   const [selectedChildIds, setSelectedChildIds] = useState([]);
   const [showKickTimer, setShowKickTimer] = useState(false);
   const [timerHours, setTimerHours] = useState(String(Math.max(1, Number(kickAfterHours) || 12)));
@@ -1444,6 +1604,10 @@ function TeamDetailModal({ team, onClose, runCheck, refillSeats, setSelectedTeam
       selectable,
       disabledReason,
       timer: manualKickTimerFor(account, membership),
+      quotaKickPendingUntil: membership ? membership.quotaKickPendingUntil : account?.quotaKickPendingUntil,
+      quotaKickWindow: membership ? membership.quotaKickWindow : account?.quotaKickWindow,
+      quotaKickStatus: membership?.quotaStatus || 'unknown',
+      quotaKickVerifiedAt: membership?.quotaKickVerifiedAt || null,
       joinedAt: membership?.joinedAt || account?.joinedAt || row.member?.createdTime,
       memberSeatType: row.member?.seatType || account?.seatType || account?.memberSnapshot?.seatType,
       key: row.identityKey || `${email}-${row.member?.id || row.childId || index}`,
@@ -1504,13 +1668,13 @@ function TeamDetailModal({ team, onClose, runCheck, refillSeats, setSelectedTeam
 
   return <Modal title={`Team 账号详情 · ${team.displayName}`} onClose={onClose} className="team-detail-modal">
     <div className="team-detail-top"><div><span className="kicker">TEAM SPACE</span><strong className="team-detail-name">{team.displayName}</strong><small className="team-sub2api-target">同步到 {team.mother.sub2apiIntegrationName || '未配置 Sub2API'}</small></div><div className="team-detail-actions"><TeamRotationStatus mother={team.mother} /><TeamHealthStatus mother={team.mother} /><button className="button secondary compact-button" onClick={() => manageMother(team.mother)}><KeyRound size={14} />管理母号</button><button className="button ghost compact-button" onClick={() => { onClose(); openTeam(team.mother); }}><Settings2 size={14} />编辑 Team</button></div></div>
-    <div className="team-detail-summary"><div><span>所有者</span><OwnerEmails owners={team.owners} /><small>{team.owners?.length ? `${team.owners.length} 个所有者` : '未同步所有者'}</small></div><div><span>席位</span><strong>{team.seats.used == null || team.seats.total == null ? '--' : `${team.seats.used} / ${team.seats.total}`}</strong><small>{team.seats.open == null ? '尚未检测' : team.seats.open ? `剩余 ${team.seats.open} 个` : '已满'}</small>{team.seats.reserved > 0 && <small className="seat-policy-label">待核验占位 {team.seats.reserved}</small>}{team.seats.types?.length ? <div className="seat-type-list">{team.seats.types.map((seat) => <small key={seat.type}>{seat.label} {seat.used == null ? '--' : `${seat.used}/${seat.total}`}</small>)}</div> : null}<small className="seat-policy-label">补位策略：{inviteSeatTypeLabel(team.mother.inviteSeatType)}</small></div><div><span>今日轮转</span><strong>{daily.count} / {daily.limit}</strong><small>{daily.remaining ? `还可轮转 ${daily.remaining} 个账号` : '今日已达上限'}</small></div><div><span>最后同步</span><strong>{displayTime(team.lastSync)}</strong><small>{team.rows.length} 个当前账号</small></div></div>
+    <div className="team-detail-summary"><div><span>所有者</span><OwnerEmails owners={team.owners} /><small>{team.owners?.length ? `${team.owners.length} 个所有者` : '未同步所有者'}</small></div><div><span>席位</span><strong>{team.seats.used == null || team.seats.total == null ? '--' : `${team.seats.used} / ${team.seats.total}`}</strong><small>{seatOpenLabel(team.seats)}</small>{team.seats.held > 0 && <small className="seat-held-label">暂留 {team.seats.held} 个 · 暂不可用</small>}{team.seats.reserved > 0 && <small className="seat-policy-label">待核验占位 {team.seats.reserved}</small>}<SeatTypeList types={team.seats.types} /><small className="seat-policy-label">默认席位：{defaultSeatTypeLabel(team.mother.defaultSeatType)}</small></div><div><span>今日轮转</span><strong>{daily.count} / {daily.limit}</strong><small>{daily.remaining ? `还可轮转 ${daily.remaining} 个账号` : '今日已达上限'}</small></div><div><span>最后同步</span><strong>{displayTime(team.lastSync)}</strong><small>{team.rows.length} 个当前账号</small></div></div>
     <RotationProgress progress={team.mother.rotationProgress} />
-    <div className="team-detail-toolbar"><div><h3>当前账号</h3><span>额度、身份和凭据状态</span></div><div className="toolbar-actions"><button className="button ghost compact-button" onClick={() => exportTeamSub2Api(team.mother.id)}><Download size={14} />导出 JSON</button><button className="button secondary compact-button" onClick={() => pushTeamSub2Api(team.mother.id)}><ExternalLink size={14} />推送 Sub2API</button><button className="button ghost compact-button" onClick={() => { setSelectedTeam(team.id); runCheck(team.mother.id); }}><RefreshCw size={14} />检测额度</button><button className="button secondary compact-button" disabled={!team.mother.accountId && !team.mother.team} title={!team.mother.accountId && !team.mother.team ? '请先配置 Team ID' : '先同步席位，再从 Free 账号池并发补满空席位'} onClick={() => { setSelectedTeam(team.id); refillSeats(team.mother.id); }}><Sparkles size={14} />补满席位</button></div></div>
+    <div className="team-detail-toolbar"><div><h3>当前账号</h3><span>额度、身份和凭据状态 · {joinModeHint(joinMode, team.mother.email || '')}</span></div><div className="toolbar-actions"><button className="button ghost compact-button" onClick={() => exportTeamSub2Api(team.mother.id)}><Download size={14} />导出 JSON</button><button className="button secondary compact-button" onClick={() => pushTeamSub2Api(team.mother.id)}><ExternalLink size={14} />推送 Sub2API</button><button className="button ghost compact-button" onClick={() => { setSelectedTeam(team.id); runCheck(team.mother.id); }}><RefreshCw size={14} />检测额度</button><button className="button secondary compact-button" disabled={!team.mother.accountId && !team.mother.team} title={!team.mother.accountId && !team.mother.team ? '请先配置 Team ID' : `先同步席位，再从 Free 账号池并发补满空席位；${joinModeHint(joinMode, team.mother.email || '')}`} onClick={() => { setSelectedTeam(team.id); refillSeats(team.mother.id); }}><Sparkles size={14} />补满席位</button></div></div>
     <div className="member-timer-toolbar"><span><Clock3 size={14} />已选 {selectedChildIds.length} 个{activeTimerIds.length ? ` · ${activeTimerIds.length} 个倒计时中` : ''}{!automationEnabled && activeTimerIds.length ? ' · 自动轮转已暂停' : ''}</span><div><button className="button ghost compact-button" disabled={!selectedTimerIds.length || timerSaving} onClick={() => cancelTimers()}><X size={14} />取消倒计时{selectedTimerIds.length ? ` (${selectedTimerIds.length})` : ''}</button><button className="button secondary compact-button" disabled={!selectedChildIds.length || timerSaving} title="为选中账号设置退出时间；执行时始终保留至少一个 Team 成员" onClick={() => openTimerFor()}><Clock3 size={14} />启动倒计时{selectedChildIds.length ? ` (${selectedChildIds.length})` : ''}</button></div></div>
-    <div className="table-wrap team-detail-table-wrap"><table className="data-table team-detail-table"><thead><tr><th className="timer-select-cell"><input type="checkbox" aria-label="选择全部可设置倒计时的账号" checked={allSelected} disabled={!selectableIds.length} ref={(node) => { if (node) node.indeterminate = someSelected && !allSelected; }} onChange={(event) => setSelectedChildIds(event.target.checked ? selectableIds : [])} /></th><th>账号</th><th>身份</th><th>5h 剩余</th><th>7d 剩余</th><th>登录凭据</th><th>Sub2API</th><th>{kickWindow === 'time' ? '加入时间 / 全局轮转' : '加入时间'}</th><th>手动退出</th></tr></thead><tbody>{rowDetails.map((item) => {
+    <div className="table-wrap team-detail-table-wrap"><table className="data-table team-detail-table"><thead><tr><th className="timer-select-cell"><input type="checkbox" aria-label="选择全部可设置倒计时的账号" checked={allSelected} disabled={!selectableIds.length} ref={(node) => { if (node) node.indeterminate = someSelected && !allSelected; }} onChange={(event) => setSelectedChildIds(event.target.checked ? selectableIds : [])} /></th><th>账号</th><th>身份</th><th>5h 剩余</th><th>7d 剩余</th><th>登录凭据</th><th>Sub2API</th><th>{kickWindow === 'time' ? '加入时间 / 全局轮转' : '加入时间'}</th><th>额度延迟</th><th>手动退出</th></tr></thead><tbody>{rowDetails.map((item) => {
       const { row, account, email, joinedAt, memberSeatType, timer } = item;
-      return <tr key={item.key} className={timer.enabled ? 'manual-timer-row' : ''}><td className="timer-select-cell"><span title={item.disabledReason || `选择 ${email}`}><input type="checkbox" aria-label={`选择 ${email}`} checked={selectedSet.has(row.childId)} disabled={!item.selectable} onChange={(event) => toggleSelection(row.childId, event.target.checked)} /></span></td><td><div className="account-cell"><div className="queue-avatar">{email[0]?.toUpperCase() || '?'}</div><div><strong>{email}</strong><small className="mono">{row.childId || account?.id || row.member?.id || '成员快照'}</small></div></div></td><td><div className="role-stack">{row.isOwner ? <span className="role-label owner">所有者</span> : <span className="role-label">成员</span>}{item.fixedPrimary && <small className="primary-owner-label">固定主号</small>}{memberSeatType && <small className={`seat-member-label ${memberSeatType === 'prolite' ? 'premium' : ''}`}>{seatTypeLabel(memberSeatType)}</small>}{account?.status === 'banned' && <StatusBadge status="banned" />}</div></td><td><QuotaBar value={account?.quota5h} /></td><td><QuotaBar value={account?.quota7d} /></td><td><CredentialState account={account} /></td><td><span className={`sub2api-state ${account?.sub2apiStatus?.imported ? 'ready' : ''}`}>{account?.sub2apiStatus?.imported ? '已记录' : '未记录'}</span></td><td><span>{joinedAt ? displayTime(joinedAt) : <span className="muted">成员同步</span>}</span>{kickWindow === 'time' && <RotationCountdown joinedAt={joinedAt} hours={kickAfterHours} />}</td><td><div className="manual-timer-cell"><ManualKickCountdown timer={timer} /><div className="manual-timer-actions"><button className="icon-button small" title={item.disabledReason || '设置退出倒计时'} aria-label={`设置 ${email} 的退出倒计时`} disabled={!item.selectable || timerSaving} onClick={() => openTimerFor([row.childId])}><Clock3 size={14} /></button>{timer.enabled && <button className="icon-button small danger-hover" title="取消退出倒计时" aria-label={`取消 ${email} 的退出倒计时`} disabled={!row.childId || timerSaving} onClick={() => cancelTimers([row.childId])}><X size={14} /></button>}</div></div></td></tr>;
+      return <tr key={item.key} className={timer.enabled ? 'manual-timer-row' : ''}><td className="timer-select-cell"><span title={item.disabledReason || `选择 ${email}`}><input type="checkbox" aria-label={`选择 ${email}`} checked={selectedSet.has(row.childId)} disabled={!item.selectable} onChange={(event) => toggleSelection(row.childId, event.target.checked)} /></span></td><td><div className="account-cell"><div className="queue-avatar">{email[0]?.toUpperCase() || '?'}</div><div><strong>{email}</strong><small className="mono">{row.childId || account?.id || row.member?.id || '成员快照'}</small></div></div></td><td><div className="role-stack">{row.isOwner ? <span className="role-label owner">所有者</span> : <span className="role-label">成员</span>}{item.fixedPrimary && <small className="primary-owner-label">固定主号</small>}{memberSeatType && <small className={`seat-member-label ${memberSeatType === 'prolite' ? 'premium' : ''}`}>{seatTypeLabel(memberSeatType)}</small>}{account?.status === 'banned' && <StatusBadge status="banned" />}</div></td><td><QuotaBar value={account?.quota5h} /></td><td><QuotaBar value={account?.quota7d} /></td><td><CredentialState account={account} /></td><td><span className={`sub2api-state ${account?.sub2apiStatus?.imported ? 'ready' : ''}`}>{account?.sub2apiStatus?.imported ? '已记录' : '未记录'}</span></td><td><span>{joinedAt ? displayTime(joinedAt) : <span className="muted">成员同步</span>}</span>{kickWindow === 'time' && <RotationCountdown joinedAt={joinedAt} hours={kickAfterHours} />}</td><td><QuotaKickCountdown until={item.quotaKickPendingUntil} windowName={item.quotaKickWindow} status={item.quotaKickStatus} verifiedAt={item.quotaKickVerifiedAt} automationEnabled={automationEnabled} enabled={delayedKickEnabled && kickWindow !== 'time'} /></td><td><div className="manual-timer-cell"><ManualKickCountdown timer={timer} /><div className="manual-timer-actions"><button className="icon-button small" title={item.disabledReason || '设置退出倒计时'} aria-label={`设置 ${email} 的退出倒计时`} disabled={!item.selectable || timerSaving} onClick={() => openTimerFor([row.childId])}><Clock3 size={14} /></button>{timer.enabled && <button className="icon-button small danger-hover" title="取消退出倒计时" aria-label={`取消 ${email} 的退出倒计时`} disabled={!row.childId || timerSaving} onClick={() => cancelTimers([row.childId])}><X size={14} /></button>}</div></div></td></tr>;
     })}</tbody></table></div>
     {showKickTimer && createPortal(<Modal title={`设置退出倒计时 · ${selectedChildIds.length} 个账号`} onClose={() => !timerSaving && setShowKickTimer(false)} className="kick-timer-modal"><form className="kick-timer-form" onSubmit={saveTimer}><label><span>倒计时</span><div className="timer-hours-control"><input autoFocus type="number" min="0.0167" max="720" step="any" value={timerHours} onChange={(event) => { setTimerHours(event.target.value); setTimerError(''); }} /><b>小时</b></div></label><div className="timer-presets">{[1, 6, 12, 24].map((value) => <button type="button" className={Number(timerHours) === value ? 'selected' : ''} key={value} onClick={() => { setTimerHours(String(value)); setTimerError(''); }}>{value}h</button>)}</div>{timerError && <span className="timer-form-error">{timerError}</span>}<div className="timer-kick-preview"><Clock3 size={15} /><span>预计退出</span><strong>{validHours ? new Date(Date.now() + hours * 60 * 60 * 1000).toLocaleString('zh-CN') : '--'}</strong></div><div className="modal-foot"><span className="muted">{automationEnabled ? '到期后进入移出与补位流程' : '自动轮转已暂停；到期后等待恢复再执行'}</span><div className="modal-foot-actions"><button type="button" className="button ghost" disabled={timerSaving} onClick={() => setShowKickTimer(false)}>取消</button><button type="submit" className="button primary" disabled={!validHours || timerSaving}><Clock3 size={15} />{timerSaving ? '保存中' : '启动倒计时'}</button></div></div></form></Modal>, document.body)}
   </Modal>;
@@ -1519,12 +1683,12 @@ function TeamDetailModal({ team, onClose, runCheck, refillSeats, setSelectedTeam
 function TeamMaintenanceView({ teams, runCheck, refillSeats, setSelectedTeam, openTeam, setShowImport }) {
   const totalSeats = teams.reduce((sum, team) => sum + (team.seats.total || 0), 0);
   const usedSeats = teams.reduce((sum, team) => sum + (team.seats.used || 0), 0);
-  const openSeats = teams.reduce((sum, team) => sum + (team.seats.open || 0), 0);
+  const seatsKnown = teams.length && teams.every((team) => team.seats.used != null && team.seats.total != null);
   const accountCount = teams.reduce((sum, team) => sum + team.rows.length, 0);
   return <section className="team-maintenance">
     <section className="metrics">
       <Metric label="Team 空间" value={teams.length} detail="当前接入的 Team" icon={Users} tone="blue" />
-      <Metric label="席位使用" value={`${usedSeats} / ${totalSeats || '--'}`} detail={openSeats ? `还可加入 ${openSeats} 个账号` : '当前没有空席位'} icon={LayoutDashboard} tone="green" />
+      <Metric label="席位使用" value={seatsKnown ? `${usedSeats} / ${totalSeats}` : '--'} detail={teamsSeatSummaryLabel(teams)} icon={LayoutDashboard} tone="green" />
       <Metric label="Team 账号" value={accountCount} detail="已同步到成员列表" icon={UserRound} tone="amber" />
       <Metric label="维护状态" value={teams.length ? '自动检测中' : '未配置'} detail={teams.length ? '按设置周期轮询额度' : '添加 Team 后开始'} icon={Activity} tone="slate" />
     </section>
@@ -1533,7 +1697,7 @@ function TeamMaintenanceView({ teams, runCheck, refillSeats, setSelectedTeam, op
       {!teams.length && <div className="empty-state"><Users size={28} /><strong>还没有 Team 空间</strong><span>添加 Team 后，这里会显示所有者、席位和账号额度。</span></div>}
       <div className="team-record-list">{teams.map((team) => <article className="team-record" key={team.id}>
         <div className="team-record-head"><div className="team-title"><div className="team-avatar"><Users size={18} /></div><div><h3>{team.displayName}</h3></div></div><span className={`status-chip ${team.mother.status || 'unconfigured'}`}><i />{team.mother.status === 'online' ? '在线' : team.mother.status === 'offline' ? '离线' : '未检测'}</span></div>
-        <div className="team-meta-grid"><div><span>所有者</span><OwnerEmails owners={team.owners} /><small>{team.owners?.length ? `${team.owners.length} 个所有者` : '未同步所有者'}</small></div><div><span>席位</span><strong>{team.seats.used == null || team.seats.total == null ? '--' : `${team.seats.used} / ${team.seats.total}`}</strong><small>{team.seats.open ? `剩余 ${team.seats.open} 个` : '已满'}</small></div><div><span>今日轮转</span><strong>{dailyRotationValues(team.mother).count} / {dailyRotationValues(team.mother).limit}</strong><small>{dailyRotationValues(team.mother).remaining ? `剩余 ${dailyRotationValues(team.mother).remaining} 次` : '已达上限'}</small></div><div><span>最后同步</span><strong>{displayTime(team.lastSync)}</strong><small>{team.rows.length} 个当前成员</small></div></div>
+        <div className="team-meta-grid"><div><span>所有者</span><OwnerEmails owners={team.owners} /><small>{team.owners?.length ? `${team.owners.length} 个所有者` : '未同步所有者'}</small></div><div><span>席位</span><strong>{team.seats.used == null || team.seats.total == null ? '--' : `${team.seats.used} / ${team.seats.total}`}</strong><small>{seatOpenLabel(team.seats)}</small>{team.seats.held > 0 && <small className="seat-held-label">暂留 {team.seats.held} 个 · 暂不可用</small>}<SeatTypeList types={team.seats.types} /></div><div><span>今日轮转</span><strong>{dailyRotationValues(team.mother).count} / {dailyRotationValues(team.mother).limit}</strong><small>{dailyRotationValues(team.mother).remaining ? `剩余 ${dailyRotationValues(team.mother).remaining} 次` : '已达上限'}</small></div><div><span>最后同步</span><strong>{displayTime(team.lastSync)}</strong><small>{team.rows.length} 个当前成员</small></div></div>
         <div className="team-record-actions"><button className="button ghost" onClick={() => { setSelectedTeam(team.id); runCheck(team.id); }}><RefreshCw size={14} />检测额度</button><button className="button secondary" disabled={!team.mother.accountId && !team.mother.team} title={!team.mother.accountId && !team.mother.team ? '请先配置 Team ID' : '先同步席位，再从 Free 账号池并发补满空席位'} onClick={() => { setSelectedTeam(team.id); refillSeats(team.id); }}><Sparkles size={14} />补满席位</button></div>
         <div className="team-member-heading"><div><h4>当前账号</h4><span>成员额度和凭据状态</span></div><b>{team.rows.length}</b></div>
         <div className="table-wrap team-member-wrap"><table className="data-table team-member-table"><thead><tr><th>账号</th><th>身份</th><th>5h 剩余</th><th>7d 剩余</th><th>凭据</th><th>加入记录</th></tr></thead><tbody>{team.rows.map((row, index) => { const account = row.child; const email = account?.email || row.member?.email || '未识别邮箱'; return <tr key={row.identityKey || `${email}-${row.member?.id || index}`}><td><div className="account-cell"><div className="queue-avatar">{email[0]?.toUpperCase() || '?'}</div><div><strong>{email}</strong><small className="mono">{account?.id || row.member?.id || '成员快照'}</small></div></div></td><td><div className="role-stack">{row.isOwner ? <span className="role-label owner">所有者</span> : <span className="role-label">成员</span>}{account?.status === 'banned' && <StatusBadge status="banned" />}</div></td><td><QuotaBar value={account?.quota5h} /></td><td><QuotaBar value={account?.quota7d} /></td><td><CredentialState account={account} /></td><td>{account?.joinedAt ? <span>{displayTime(account.joinedAt)}<small>{account.joinedTeams?.length || account.workspaceHistory?.length || 1} 个 Team</small></span> : <span className="muted">成员同步</span>}</td></tr>; })}</tbody></table></div>
@@ -1621,25 +1785,27 @@ function FreeAccountsView({ children, allChildren, mothers, search, setSearch, s
   </section>;
 }
 
-function RunView({ activeMother, activeChildren, trackedChildren, readyChildren, exhausted, canRefillAll, lowQuota, seatsOpen, stage, progress, isRunning, isProcessing, lastSync, runCheck, refillSeats, setShowMother, setSelectedTeam, mothers, autoRefill }) {
+function RunView({ activeMother, activeSeatStats, activeChildren, trackedChildren, readyChildren, exhausted, canRefillAll, lowQuota, seatsOpen, stage, progress, isRunning, isProcessing, lastSync, runCheck, refillSeats, setShowMother, setSelectedTeam, mothers, autoRefill, joinMode }) {
   const automaticMothers = mothers.filter((mother) => mother.rotationEnabled !== false);
   const automaticTeamCount = automaticMothers.length;
   const activeAutomationEnabled = isRunning && activeMother?.rotationEnabled !== false;
-  const steps = [{ id: 'monitor', label: '监控额度', sub: `${trackedChildren.length} 个账号 · ${automaticTeamCount} 个 Team`, icon: Activity }, { id: 'kick', label: '移除耗尽', sub: exhausted.length ? `${exhausted.length} 个待处理` : '暂无待处理', icon: Trash2 }, { id: 'join', label: '加入 Team', sub: activeMother ? (seatsOpen ? `${seatsOpen} 个空席位` : '席位已满') : '暂无空间', icon: UserRound }, { id: 'refill', label: '满额补位', sub: readyChildren.length ? `${readyChildren.length} 个可加入` : '待加入池为空', icon: RefreshCw }];
+  const seatsUsed = activeSeatStats?.used ?? null;
+  const seatsTotal = activeSeatStats?.total ?? null;
+  const heldSeats = activeSeatStats?.held || 0;
+  const noOpenLabel = activeSeatStats?.open == null ? '尚未检测' : heldSeats ? '暂留不可用' : '无可补席位';
+  const steps = [{ id: 'monitor', label: '监控额度', sub: `${trackedChildren.length} 个账号 · ${automaticTeamCount} 个 Team`, icon: Activity }, { id: 'kick', label: '移除耗尽', sub: exhausted.length ? `${exhausted.length} 个待处理` : '暂无待处理', icon: Trash2 }, { id: 'join', label: '加入 Team', sub: activeMother ? (seatsOpen ? `${seatsOpen} 个可补席位` : noOpenLabel) : '暂无空间', icon: UserRound }, { id: 'refill', label: '满额补位', sub: readyChildren.length ? `${readyChildren.length} 个候选` : '当前 Team 无候选', icon: RefreshCw }];
   const activeIndex = Math.max(0, steps.findIndex((step) => step.id === stage));
-  const seatsUsed = Number.isFinite(Number(activeMother?.used)) ? Number(activeMother.used) : null;
-  const seatsTotal = Number.isFinite(Number(activeMother?.seats)) ? Number(activeMother.seats) : null;
   const displayName = teamDisplayName(activeMother);
   const isLive = activeAutomationEnabled || isProcessing;
-  const traceItems = [{ title: '监控额度', sub: `${activeChildren.length} 个子号`, state: isProcessing && stage === 'monitor' ? '执行中' : activeAutomationEnabled ? '进行中' : '已暂停', icon: Gauge, tone: 'blue', active: isLive && stage === 'monitor' }, { title: '移除耗尽账号', sub: exhausted.length ? `${exhausted.length} 个待处理` : '队列为空', state: exhausted.length ? '待处理' : '已完成', icon: Trash2, tone: exhausted.length ? 'amber' : 'muted', active: isLive && stage === 'kick' }, { title: '加入 Team', sub: `${readyChildren.length} 个候选`, state: activeMother ? (seatsOpen ? '等待中' : '已满') : '未配置', icon: UserRound, tone: 'green', active: isLive && (stage === 'join' || stage === 'refill') }];
+  const traceItems = [{ title: '监控额度', sub: `${activeChildren.length} 个子号`, state: isProcessing && stage === 'monitor' ? '执行中' : activeAutomationEnabled ? '进行中' : '已暂停', icon: Gauge, tone: 'blue', active: isLive && stage === 'monitor' }, { title: '移除耗尽账号', sub: exhausted.length ? `${exhausted.length} 个待处理` : '队列为空', state: exhausted.length ? '待处理' : '已完成', icon: Trash2, tone: exhausted.length ? 'amber' : 'muted', active: isLive && stage === 'kick' }, { title: '加入 Team', sub: `${readyChildren.length} 个候选`, state: activeMother ? (seatsOpen ? '等待中' : noOpenLabel) : '未配置', icon: UserRound, tone: 'green', active: isLive && (stage === 'join' || stage === 'refill') }];
   return <>
-      <section className="metrics"><Metric label="管理 Team" value={mothers.length || '未配置'} detail={mothers.length ? `${automaticTeamCount} 个参与自动轮转` : '请先添加 Team'} icon={KeyRound} tone="blue" /><Metric label="当前席位" value={activeMother ? `${seatsUsed == null ? '--' : seatsUsed} / ${seatsTotal == null ? '--' : seatsTotal}` : '未配置'} detail={activeMother ? (seatsOpen ? `还可加入 ${seatsOpen} 个账号` : seatsTotal == null ? '尚未获取席位' : '空间已满') : '添加 Team 后开始检测'} icon={Users} tone="green" /><Metric label="额度风险" value={lowQuota.length} detail={`${exhausted.length} 个已耗尽 · 当前空间`} icon={Gauge} tone="amber" /><Metric label="下次检测" value={activeAutomationEnabled ? '自动' : '--'} detail={`上次同步 ${lastSync} · ${activeMother?.rotationEnabled === false ? '当前 Team 已停用' : `${automaticTeamCount} 个空间参与`}`} icon={Clock3} tone="slate" /></section>
+      <section className="metrics"><Metric label="管理 Team" value={mothers.length || '未配置'} detail={mothers.length ? `${automaticTeamCount} 个参与自动轮转` : '请先添加 Team'} icon={KeyRound} tone="blue" /><Metric label="当前席位" value={activeMother ? `${seatsUsed == null ? '--' : seatsUsed} / ${seatsTotal == null ? '--' : seatsTotal}` : '未配置'} detail={activeMother ? `${seatOpenLabel(activeSeatStats)}${heldSeats ? ` · 暂留 ${heldSeats} 个` : ''}` : '添加 Team 后开始检测'} icon={Users} tone="green" /><Metric label="额度风险" value={lowQuota.length} detail={`${exhausted.length} 个已耗尽 · 当前空间`} icon={Gauge} tone="amber" /><Metric label="下次检测" value={activeAutomationEnabled ? '自动' : '--'} detail={`上次同步 ${lastSync} · ${activeMother?.rotationEnabled === false ? '当前 Team 已停用' : `${automaticTeamCount} 个空间参与`}`} icon={Clock3} tone="slate" /></section>
      <div className="run-layout"><section className="control-panel"><div className="panel-head"><div><span className="kicker">AUTOMATION FLOW</span><h2>配额自动补位</h2><p>所有者：<strong>{activeMother?.email}</strong></p></div><button className="settings-button" title="编辑 Team 配置" onClick={() => setShowMother(true)}><Settings2 size={17} /></button></div>
-       <div className={`orbit-wrap ${isLive ? 'is-running' : ''}`}><div className="orbit-starfield" aria-hidden="true" /><div className={`orbit orbit-large ${isLive ? 'is-running' : ''}`} /><div className={`orbit orbit-small ${isLive ? 'is-running' : ''}`} /><div className={`orbit-core ${isLive ? 'is-running' : ''}`}><div className="core-icon"><Bot size={25} /></div><strong>{activeMother && seatsUsed != null && seatsTotal != null && seatsUsed >= seatsTotal && exhausted.length === 0 ? '运行稳定' : '需要处理'}</strong><span>{activeMother ? `${seatsUsed == null ? '--' : seatsUsed} / ${seatsTotal == null ? '--' : seatsTotal} 席位 · ${isProcessing ? '执行中' : activeMother.rotationEnabled === false ? '不参与轮转' : activeAutomationEnabled ? automaticTeamCount > 1 ? `自动轮转 ${automaticTeamCount} 个 Team` : '自动检测中' : '已暂停'}` : '尚未配置母号'}</span><div className={`core-progress ${isLive ? 'is-running' : ''}`}><i style={{ width: `${progress}%` }} /></div></div>
+       <div className={`orbit-wrap ${isLive ? 'is-running' : ''}`}><div className="orbit-starfield" aria-hidden="true" /><div className={`orbit orbit-large ${isLive ? 'is-running' : ''}`} /><div className={`orbit orbit-small ${isLive ? 'is-running' : ''}`} /><div className={`orbit-core ${isLive ? 'is-running' : ''}`}><div className="core-icon"><Bot size={25} /></div><strong>{activeMother && activeSeatStats?.open === 0 && exhausted.length === 0 ? '运行稳定' : '需要处理'}</strong><span>{activeMother ? `${seatsUsed == null ? '--' : seatsUsed} / ${seatsTotal == null ? '--' : seatsTotal} 席位${heldSeats ? ` · 暂留 ${heldSeats}` : ''} · ${isProcessing ? '执行中' : activeMother.rotationEnabled === false ? '不参与轮转' : activeAutomationEnabled ? automaticTeamCount > 1 ? `自动轮转 ${automaticTeamCount} 个 Team` : '自动检测中' : '已暂停'}` : '尚未配置母号'}</span><div className={`core-progress ${isLive ? 'is-running' : ''}`}><i style={{ width: `${progress}%` }} /></div></div>
       {steps.map((step, index) => { const Icon = step.icon; const current = isLive && index === activeIndex; return <div key={step.id} className={`orbit-node node-${index + 1} ${index <= activeIndex ? 'reached' : ''} ${current ? 'current' : ''}`}><div className="node-icon"><Icon size={18} /></div><div><strong>{step.label}</strong><small>{step.sub}</small></div></div>; })}</div>
-       <div className="control-actions"><button className="button primary" onClick={runCheck}><RefreshCw size={15} />检测全部 Team</button><button className="button secondary" onClick={refillSeats} disabled={!canRefillAll}><Sparkles size={15} />移除并补满全部</button></div>
+       <div className="control-actions"><button className="button primary" onClick={() => runCheck()}><RefreshCw size={15} />检测全部 Team</button><button className="button secondary" onClick={() => refillSeats()} disabled={!canRefillAll} title={joinModeHint(joinMode)}><Sparkles size={15} />移除并补满全部</button></div>
       <div className="team-picker"><div><span>当前管理空间</span><strong>{activeMother ? displayName : '未配置母号'}</strong></div><select disabled={!mothers.length} value={activeMother?.id || ''} onChange={(event) => setSelectedTeam(event.target.value)}>{mothers.length ? mothers.map((mother) => <option value={mother.id} key={mother.id}>{teamDisplayName(mother)}</option>) : <option value="">添加母号后可选择空间</option>}</select></div>
-     </section><aside className="activity-panel"><div className="panel-head compact"><div><span className="kicker">EXECUTION</span><h2>执行轨迹</h2></div><span className="count-pill">{automaticTeamCount} 个参与</span></div><div className="trace-list">{traceItems.map((item) => { const Icon = item.icon; return <div className={`trace-item ${item.tone} ${item.active ? 'is-active' : ''}`} key={item.title}><div className="trace-icon"><Icon size={16} /></div><div className="trace-copy"><strong>{item.title}</strong><small>{item.sub}</small></div><span>{item.state}</span></div>; })}</div><div className="queue-head"><span>待拉队列</span><b>{readyChildren.length}</b></div>{readyChildren.slice(0, 3).map((child) => <div className="queue-row" key={child.id}><div className="queue-avatar">{child.email[0].toUpperCase()}</div><span>{child.email}</span><small>待加入</small></div>)}{!readyChildren.length && <div className="empty-queue"><Check size={22} /><span>队列为空，添加子号后显示</span></div>}<div className="activity-foot"><ShieldCheck size={15} /> {automaticTeamCount ? `自动轮转 ${automaticTeamCount} 个 Team` : '所有 Team 均已停用'} <button onClick={() => setShowMother(true)}>调整策略</button></div></aside></div>
+     </section><aside className="activity-panel"><div className="panel-head compact"><div><span className="kicker">EXECUTION</span><h2>执行轨迹</h2></div><span className="count-pill">{automaticTeamCount} 个参与</span></div><div className="trace-list">{traceItems.map((item) => { const Icon = item.icon; return <div className={`trace-item ${item.tone} ${item.active ? 'is-active' : ''}`} key={item.title}><div className="trace-icon"><Icon size={16} /></div><div className="trace-copy"><strong>{item.title}</strong><small>{item.sub}</small></div><span>{item.state}</span></div>; })}</div><div className="queue-head" title={joinModeHint(joinMode, activeMother?.email || '')}><span>当前 Team 候选 · {joinMode === 'invite' ? '邀请' : '申请'}</span><b>{readyChildren.length}</b></div>{readyChildren.slice(0, 3).map((child) => <div className="queue-row" key={child.id}><div className="queue-avatar">{child.email[0].toUpperCase()}</div><span>{child.email}</span><small>待加入</small></div>)}{!readyChildren.length && <div className="empty-queue"><Check size={22} /><span>{!activeMother ? '先添加 Team' : joinMode === 'request' ? emailDomain(activeMother.email) ? `当前 Team 无 @${emailDomain(activeMother.email)} 候选` : '母号邮箱无效，无法申请加入' : '队列为空，添加账号后显示'}</span></div>}<div className="activity-foot"><ShieldCheck size={15} /> {automaticTeamCount ? `自动轮转 ${automaticTeamCount} 个 Team` : '所有 Team 均已停用'} <button onClick={() => setShowMother(true)}>调整策略</button></div></aside></div>
   </>;
 }
 
@@ -1686,7 +1852,8 @@ function HistoryDetailModal({ item, onClose }) {
     <div className="modal-foot"><span className="muted">记录时间：{taskTime(item.time)}</span><button className="button ghost" onClick={onClose}>关闭</button></div>
   </Modal>;
 }
-function SettingsView({ autoRefill, setAutoRefill, promoteJoinedAccounts, setPromoteJoinedAccounts, threshold, setThreshold, checkInterval, setCheckInterval, concurrency, setConcurrency, kickWindow, setKickWindow, kickAfterHours, setKickAfterHours, integrations, openIntegration, proxy, openProxy, saveSettings }) {
+function SettingsView({ autoRefill, setAutoRefill, promoteJoinedAccounts, setPromoteJoinedAccounts, joinMode, setJoinMode, threshold, setThreshold, checkInterval, setCheckInterval, concurrency, setConcurrency, kickWindow, setKickWindow, kickAfterHours, setKickAfterHours, delayedKickEnabled, setDelayedKickEnabled, delayedKickMinutes, setDelayedKickMinutes, integrations, openIntegration, proxy, openProxy, saveSettings, versionInfo }) {
+  const [showJoinHelp, setShowJoinHelp] = useState(false);
   const sub2apis = integrations.sub2apis?.length ? integrations.sub2apis : [integrations.sub2api || defaultSub2Api];
   const readySub2Apis = sub2apis.filter((item) => item.enabled && item.baseUrl && item.apiKeySet && ((Number.isFinite(Number(item.groupId)) && Number(item.groupId) > 0) || String(item.groupName || '').trim()));
   const sub2apiReady = readySub2Apis.length > 0;
@@ -1698,7 +1865,9 @@ function SettingsView({ autoRefill, setAutoRefill, promoteJoinedAccounts, setPro
       <div className="content-toolbar"><div><h2>自动化策略</h2><p>控制额度检测和自动补位行为。</p></div><span className={`status-chip ${autoRefill ? 'online' : 'cooldown'}`}><i />{autoRefill ? '已启用' : '已暂停'}</span></div>
       <div className="setting-row"><div><strong>自动补满席位</strong><p>检测到选定踢出条件满足时，自动移出账号并从待加入池补位。</p></div><Toggle checked={autoRefill} onChange={setAutoRefill} /></div>
       <div className="setting-row"><div><strong>加入后设置为所有者</strong><p>开启后，新补位账号会提升为所有者；关闭时保留普通成员权限。</p></div><Toggle checked={promoteJoinedAccounts} onChange={setPromoteJoinedAccounts} /></div>
-      <div className="setting-row kick-window-row"><div><strong>自动踢出条件</strong><p>{kickWindow === 'time' ? `仅按加入时间踢出，额度仍会检测并更新；加入 ${kickAfterHours} 小时后轮转。` : '5h 和 7d 只能选择一个作为自动踢出条件，额度预警不会改变这个选择。'}</p></div><div className="kick-window-controls"><div className="segmented setting-segmented">{[['5h', '5h 耗尽'], ['7d', '7d 满额'], ['time', '按时间']].map(([id, label]) => <button key={id} className={kickWindow === id ? 'selected' : ''} onClick={() => setKickWindow(id)}>{label}</button>)}</div>{kickWindow === 'time' && <label className="number-input kick-hours-input"><input type="number" min="1" max="720" value={kickAfterHours} onChange={(event) => setKickAfterHours(Math.min(720, Math.max(1, Number(event.target.value) || 1)))} /><span>小时</span></label>}</div></div>
+      <div className="setting-row join-mode-row"><div><div className="setting-label-with-help"><strong>加入 Team 方式</strong><button className="icon-button small join-mode-help" type="button" title="查看申请与邀请模式说明" aria-label="查看加入 Team 方式说明" onClick={() => setShowJoinHelp(true)}><CircleHelp size={15} /></button></div><p>{joinMode === 'invite' ? '由母号邀请，Free 账号接受邀请；不限制邮箱域名。' : '由 Free 账号申请，母号同意；仅使用与母号邮箱域名相同的账号。'}</p></div><div className="segmented setting-segmented join-mode-control" role="group" aria-label="加入 Team 方式">{[['request', '申请模式'], ['invite', '邀请模式']].map(([mode, label]) => <button type="button" key={mode} className={joinMode === mode ? 'selected' : ''} aria-pressed={joinMode === mode} onClick={() => setJoinMode(mode)}>{label}</button>)}</div></div>
+      <div className="setting-row kick-window-row"><div><strong>自动踢出条件</strong><p>{kickWindow === 'time' ? `仅按加入时间踢出，额度仍会检测并更新；加入 ${kickAfterHours} 小时后轮转。` : '5h 和 7d 只能选择一个作为自动踢出条件；不固定主号的 Team 始终按 7d 轮转。'}</p></div><div className="kick-window-controls"><div className="segmented setting-segmented">{[['5h', '5h 耗尽'], ['7d', '7d 满额'], ['time', '按时间']].map(([id, label]) => <button key={id} className={kickWindow === id ? 'selected' : ''} onClick={() => setKickWindow(id)}>{label}</button>)}</div>{kickWindow === 'time' && <label className="number-input kick-hours-input"><input type="number" min="1" max="720" value={kickAfterHours} onChange={(event) => setKickAfterHours(Math.min(720, Math.max(1, Number(event.target.value) || 1)))} /><span>小时</span></label>}</div></div>
+      <div className={`setting-row delayed-kick-row ${kickWindow === 'time' ? 'is-inactive' : ''}`}><div><strong>额度耗尽后延迟踢出</strong><p>{kickWindow === 'time' ? '按时间轮转不使用此设置；切回 5h 或 7d 后生效。' : `选定额度耗尽后等待 ${delayedKickMinutes} 分钟，再移出并补位；等待期间会继续检测额度。`}</p></div><div className="delayed-kick-controls"><Toggle checked={delayedKickEnabled} onChange={setDelayedKickEnabled} disabled={kickWindow === 'time'} /><label className="number-input delayed-kick-minutes"><input type="number" min="1" max="1440" aria-label="延迟踢出分钟数" disabled={kickWindow === 'time' || !delayedKickEnabled} value={delayedKickMinutes} onChange={(event) => setDelayedKickMinutes(Math.min(1440, Math.max(1, Number(event.target.value) || 1)))} /><span>分钟</span></label></div></div>
       <div className="setting-row"><div><strong>额度预警阈值</strong><p>低于此百分比时标记为“额度偏低”，但不会立即移除。</p></div><div className="number-input"><input type="number" min="1" max="50" value={threshold} onChange={(event) => setThreshold(event.target.value)} /><span>%</span></div></div>
       <div className="setting-row"><div><strong>检测周期</strong><p>自动轮询 Team 空间和所有已加入的账号。</p></div><select className="select-control" value={checkInterval} onChange={(event) => setCheckInterval(event.target.value)}><option value="30">30 秒</option><option value="60">60 秒</option><option value="300">5 分钟</option></select></div>
       <div className="setting-row"><div><strong>全局并发数</strong><p>统一限制 Free 登录、Team 检测、OAuth 刷新和 Sub2API 推送的同时请求数。</p></div><div className="number-input"><input type="number" min="1" max="10" value={concurrency} onChange={(event) => setConcurrency(Math.min(10, Math.max(1, Number(event.target.value) || 1)))} /><span>个</span></div></div>
@@ -1712,9 +1881,11 @@ function SettingsView({ autoRefill, setAutoRefill, promoteJoinedAccounts, setPro
       <div className="integration-note"><CircleHelp size={15} /><span>代理超时或网络错误会自动切换池中下一条代理；关闭代理池时才会直连。</span></div>
       <div className="integration-note"><CircleHelp size={15} /><span>每个 Team 可选择一个 Sub2API 连接；未选择时使用列表中的第一个。</span></div>
     </section>
+    <div className="version-identity"><span>当前版本</span><strong>v{versionInfo?.currentVersion || '--'}</strong></div>
+    {showJoinHelp && <Modal title="加入 Team 方式" onClose={() => setShowJoinHelp(false)} className="join-mode-help-modal"><div className="join-mode-help-content"><div><strong>申请模式</strong><p>Free 账号先申请加入 Team，母号再同意申请。仅选择与母号邮箱后缀相同的 Free 账号，例如双方均为 gmail.com；不要求邮箱地址完全相同。</p></div><div><strong>邀请模式</strong><p>母号向 Free 账号发出邀请，Free 账号接受后进入 Team，并获取该空间的 JSON。此模式不按邮箱后缀筛选账号。</p></div><p className="join-mode-help-footnote">此项对所有 Team 的后续自动补位生效，不会改变已经加入 Team 的账号。</p></div><div className="modal-foot"><span className="muted">切换后需保存设置</span><button className="button primary" onClick={() => setShowJoinHelp(false)}>知道了</button></div></Modal>}
   </section>;
 }
-function Toggle({ checked, onChange }) { return <button className={`toggle ${checked ? 'checked' : ''}`} onClick={() => onChange(!checked)} aria-label={checked ? '关闭' : '开启'}><span /></button>; }
+function Toggle({ checked, onChange, disabled = false }) { return <button type="button" className={`toggle ${checked ? 'checked' : ''}`} onClick={() => onChange(!checked)} aria-label={checked ? '关闭' : '开启'} aria-pressed={checked} disabled={disabled}><span /></button>; }
 
 function Modal({ title, onClose, children, className = '' }) { return <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}><div className={`modal ${className}`}><div className="modal-head"><h2>{title}</h2><button className="icon-button" onClick={onClose}><X size={18} /></button></div>{children}</div></div>; }
 
@@ -1893,6 +2064,117 @@ function AgentAccessModal({ onClose, notify }) {
   </Modal>;
 }
 
+function QuickJsonModal({ mothers = [], children = [], sub2apis = [], onAcquire, onPush, onClose }) {
+  const [scope, setScope] = useState('free');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [totp, setTotp] = useState('');
+  const [showSecrets, setShowSecrets] = useState(false);
+  const [motherId, setMotherId] = useState(mothers[0]?.id || '');
+  const [selectedConnection, setSelectedConnection] = useState('');
+  const [result, setResult] = useState(null);
+  const [busy, setBusy] = useState('');
+  const [error, setError] = useState('');
+  const [authUrl, setAuthUrl] = useState('');
+  const [pushMessage, setPushMessage] = useState('');
+  const [pushedTargets, setPushedTargets] = useState([]);
+  const readyConnections = sub2apis.filter((item) => item.enabled && item.baseUrl && item.apiKeySet
+    && (Number(item.groupId) > 0 || String(item.groupName || '').trim()));
+  const teamConnection = scope === 'team' ? mothers.find((item) => item.id === motherId)?.sub2apiIntegrationId : '';
+  const suggestedConnection = readyConnections.find((item) => item.id === teamConnection)?.id || readyConnections[0]?.id || '';
+  const connectionId = readyConnections.some((item) => item.id === selectedConnection) ? selectedConnection : suggestedConnection;
+  const poolMatch = children.some((item) => item.email?.toLowerCase() === email.trim().toLowerCase());
+  const missingCredentials = Boolean(password.trim()) !== Boolean(totp.trim());
+
+  function clearResult() {
+    setResult(null);
+    setError('');
+    setAuthUrl('');
+    setPushMessage('');
+    setPushedTargets([]);
+  }
+
+  function changeScope(next) {
+    setScope(next);
+    setSelectedConnection('');
+    clearResult();
+  }
+
+  async function acquire(event) {
+    event.preventDefault();
+    if (busy || missingCredentials || (scope === 'team' && !motherId)) return;
+    clearResult();
+    setBusy('acquire');
+    try {
+      const payload = await onAcquire({ scope, email: email.trim(), ...(password.trim() ? { password, totp: totp.trim() } : {}), ...(scope === 'team' ? { motherId } : {}) });
+      setResult(payload);
+    } catch (cause) {
+      setError(cause.payload?.message || cause.message || 'JSON 获取失败');
+      setAuthUrl(cause.payload?.authUrl || '');
+    } finally {
+      setBusy('');
+    }
+  }
+
+  function download() {
+    if (!result?.account) return;
+    const json = { exported_at: result.exported_at || new Date().toISOString(), scope: result.scope, proxies: [], accounts: [result.account] };
+    const file = new Blob([JSON.stringify(json, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(file);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = `${result.scope}-${String(result.email || email).replace(/[^a-z0-9_.-]+/gi, '_')}.json`;
+    anchor.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  async function push() {
+    if (!result?.account || !connectionId || busy || pushedTargets.includes(connectionId)) return;
+    setError('');
+    setBusy('push');
+    try {
+      const response = await onPush(result, connectionId);
+      const action = response.pushed?.[0]?.action || response.skipped?.[0]?.action;
+      setPushMessage(action === 'updated' || action === 'repaired' ? '目标连接中的账号 JSON 已更新。' : action === 'created' ? '已推送到所选连接。' : action === 'skipped_existing' ? '目标连接已有该账号。' : '账号已处理。');
+      setPushedTargets((current) => [...current, connectionId]);
+    } catch (cause) {
+      setError(cause.message || 'Sub2API 推送失败');
+    } finally {
+      setBusy('');
+    }
+  }
+
+  return <Modal title="快捷获取 JSON" onClose={busy ? () => {} : onClose} className="quick-json-modal">
+    <div className="quick-json-body">
+      <div className="quick-json-section-head"><strong>账号授权</strong></div>
+      <form id="quick-json-form" onSubmit={acquire}>
+        <div className="segmented quick-json-modes" role="group" aria-label="JSON 类型">
+          <button type="button" className={scope === 'free' ? 'selected' : ''} disabled={Boolean(busy)} onClick={() => changeScope('free')}><UserRound size={14} />Free JSON</button>
+          <button type="button" className={scope === 'team' ? 'selected' : ''} disabled={Boolean(busy)} onClick={() => changeScope('team')}><Users size={14} />Team JSON</button>
+        </div>
+        <div className="form-grid quick-json-form">
+          <label className="wide"><span>账号邮箱</span><input type="email" autoComplete="username" required placeholder="name@example.com" value={email} disabled={Boolean(busy)} onChange={(event) => { setEmail(event.target.value); clearResult(); }} /></label>
+          {scope === 'team' && <label className="wide"><span>目标 Team</span><select className="select-control" required value={motherId} disabled={Boolean(busy)} onChange={(event) => { setMotherId(event.target.value); setSelectedConnection(''); clearResult(); }}><option value="">请选择 Team</option>{mothers.map((mother) => <option key={mother.id} value={mother.id}>{teamDisplayName(mother)}</option>)}</select></label>}
+          <label><span>密码（可选）</span><input type={showSecrets ? 'text' : 'password'} autoComplete="off" value={password} disabled={Boolean(busy)} onChange={(event) => { setPassword(event.target.value); clearResult(); }} placeholder="留空则从 Free 号池获取" /></label>
+          <label><span>2FA Secret（可选）</span><span className="quick-json-secret"><input type={showSecrets ? 'text' : 'password'} autoComplete="off" value={totp} disabled={Boolean(busy)} onChange={(event) => { setTotp(event.target.value); clearResult(); }} placeholder="与密码同时填写" /><button type="button" className="icon-button small" title={showSecrets ? '隐藏凭据' : '显示凭据'} aria-label={showSecrets ? '隐藏凭据' : '显示凭据'} onClick={() => setShowSecrets((current) => !current)}>{showSecrets ? <EyeOff size={15} /> : <Eye size={15} />}</button></span></label>
+        </div>
+        <p className={`quick-json-hint ${missingCredentials ? 'warning' : ''}`}>{missingCredentials ? '密码和 2FA Secret 需同时填写。' : password && totp ? '使用本次输入的凭据。' : poolMatch ? '已匹配 Free 号池账号。' : '仅邮箱时，从 Free 号池读取凭据。'}</p>
+        {scope === 'team' && !mothers.length && <p className="quick-json-hint warning">尚无 Team，请先在 Team 管理中添加空间。</p>}
+      </form>
+
+      <div className="quick-json-output" aria-live="polite">
+        <div className="quick-json-section-head"><strong>获取结果</strong><span>{result ? '当前账号 JSON 已就绪' : busy === 'acquire' ? '正在获取授权' : '等待获取'}</span></div>
+        {result ? <div className="quick-json-result"><CheckCircle2 size={19} /><div><strong>{result.email || email}</strong><span>{result.scope === 'team' ? `Team · ${teamDisplayName(mothers.find((item) => item.id === result.motherId))}` : 'Free 账号'}</span></div></div> : <div className="quick-json-empty">{busy === 'acquire' ? '正在获取授权…' : '尚未获取 JSON'}</div>}
+        {error && <p className="quick-json-error" role="alert"><AlertTriangle size={15} />{error}</p>}
+        {authUrl && <a className="quick-json-auth" href={authUrl} target="_blank" rel="noreferrer"><ExternalLink size={14} />打开授权链接</a>}
+        {pushMessage && <p className="quick-json-success"><CheckCircle2 size={15} />{pushMessage}</p>}
+        {result && <div className="quick-json-delivery"><label><span>目标 Sub2API</span><select className="select-control" value={connectionId} disabled={!readyConnections.length || Boolean(busy)} onChange={(event) => { setSelectedConnection(event.target.value); setPushMessage(''); }}><option value="">{readyConnections.length ? '请选择连接' : '暂无可用连接'}</option>{readyConnections.map((item) => <option key={item.id} value={item.id}>{item.name || item.baseUrl}{item.groupName ? ` · ${item.groupName}` : ''}</option>)}</select></label>{!readyConnections.length && <small>请先在设置中配置可用的 Sub2API 服务和分组。</small>}</div>}
+      </div>
+    </div>
+    <div className="modal-foot quick-json-foot"><span className="muted">临时凭据不保存</span><div className="modal-foot-actions">{result && <><button type="button" className="button ghost" disabled={Boolean(busy)} onClick={download}><Download size={15} />下载 JSON</button><button type="button" className="button secondary" disabled={!connectionId || Boolean(busy) || pushedTargets.includes(connectionId)} onClick={push}><ExternalLink size={15} />{busy === 'push' ? '推送中' : pushedTargets.includes(connectionId) ? '已处理' : '推送 Sub2API'}</button></>}<button type="submit" form="quick-json-form" className="button primary" disabled={Boolean(busy) || missingCredentials || (scope === 'team' && !motherId)}><RefreshCw size={15} className={busy === 'acquire' ? 'button-spinner' : ''} />{busy === 'acquire' ? '获取中' : result ? '重新获取' : '获取 JSON'}</button></div></div>
+  </Modal>;
+}
+
 function AccountModal({ account, onClose, onSave, onSaveAndAcquire, onAcquire, acquireState }) {
   const [form, setForm] = useState(() => ({ email: account?.email || '', password: '', totp: '', mailboxUrl: account?.mailboxUrl || '' }));
   const [sub2apiJson, setSub2apiJson] = useState('');
@@ -2026,8 +2308,8 @@ function IntegrationModal({ type, config = {}, onClose, onSave }) {
 function MotherModal({ mother, sub2apis = [], onClose, onSave }) {
   const defaultSub2apiId = sub2apis[0]?.id || 'sub2api_default';
   const [form, setForm] = useState(() => mother
-    ? { ...mother, password: '', totp: '', token: '', teamName: mother.teamName || mother.displayName || '', rotationEnabled: mother.rotationEnabled !== false, inviteSeatType: ['default', 'prolite'].includes(mother.inviteSeatType) ? mother.inviteSeatType : 'auto', primaryOwnerEmail: mother.primaryOwnerEmail || mother.email || '', sub2apiIntegrationId: mother.sub2apiIntegrationId || defaultSub2apiId }
-    : { id: `mother_${Date.now()}`, email: '', name: '', password: '', totp: '', team: '', teamName: '', accountId: '', rotationEnabled: true, syncOwnerToSub2api: true, rotationMode: 'fixed', inviteSeatType: 'auto', dailyRotationLimit: 3, primaryOwnerEmail: '', sub2apiIntegrationId: defaultSub2apiId, seats: 0, used: 0, status: 'unconfigured', lastCheck: null, token: '' });
+    ? { ...mother, password: '', totp: '', token: '', teamName: mother.teamName || mother.displayName || '', rotationEnabled: mother.rotationEnabled !== false, defaultSeatType: mother.defaultSeatType === 'prolite' ? 'prolite' : 'default', primaryOwnerEmail: mother.primaryOwnerEmail || mother.email || '', sub2apiIntegrationId: mother.sub2apiIntegrationId || defaultSub2apiId }
+    : { id: `mother_${Date.now()}`, email: '', name: '', password: '', totp: '', team: '', teamName: '', accountId: '', rotationEnabled: true, syncOwnerToSub2api: true, rotationMode: 'fixed', defaultSeatType: 'default', dailyRotationLimit: 3, primaryOwnerEmail: '', sub2apiIntegrationId: defaultSub2apiId, seats: 0, used: 0, status: 'unconfigured', lastCheck: null, token: '' });
   const update = (key, value) => setForm((current) => ({ ...current, [key]: value }));
   const ownerOptions = [...[{ email: form.email, name: form.name, userId: form.chatgptUserId }], ...(mother?.ownerAccounts || [])]
     .filter((owner) => owner?.email)
@@ -2043,7 +2325,7 @@ function MotherModal({ mother, sub2apis = [], onClose, onSave }) {
     <label className="wide"><span>Team ID（accountId / team）</span><input value={form.accountId || form.team || ''} onChange={(event) => { update('accountId', event.target.value); update('team', event.target.value); }} placeholder="chatgpt_account_id" /></label>
     <label className="wide"><span>目标 Sub2API</span><select className="select-control" value={form.sub2apiIntegrationId || defaultSub2apiId} onChange={(event) => update('sub2apiIntegrationId', event.target.value)}>{selectedSub2ApiMissing && <option value={form.sub2apiIntegrationId}>原连接已删除，请重新选择</option>}{sub2apis.length ? sub2apis.map((item, index) => <option value={item.id} key={item.id}>{item.name || `Sub2API ${index + 1}`}{item.enabled ? '' : '（未启用）'}</option>) : <option value={defaultSub2apiId}>默认 Sub2API（未配置）</option>}</select><small className="field-hint">首次加入和 401 修复都会同步到此连接；未选择时使用第一项。</small></label>
     <div className="team-rotation-setting"><div><span>参与自动轮转</span><small>关闭后不自动检测、踢出或补位；Team 数据与手动操作仍保留。</small></div><Toggle checked={form.rotationEnabled !== false} onChange={(value) => update('rotationEnabled', value)} /></div>
-    <label className="wide"><span>补位席位类型</span><div className="segmented modal-segmented seat-policy-control">{[['auto', '自动（普通优先）'], ['default', '普通席位'], ['prolite', '高级席位']].map(([id, label]) => <button type="button" key={id} className={(form.inviteSeatType || 'auto') === id ? 'selected' : ''} onClick={() => update('inviteSeatType', id)}>{label}</button>)}</div><small className="field-hint">自动模式按分类余量分配，优先使用普通席位；只有高级席位会在同意申请前调用席位设置接口。</small></label>
+    <label className="wide"><span>Team 默认席位</span><div className="segmented modal-segmented seat-policy-control">{[['default', '普通席位'], ['prolite', '高级席位']].map(([id, label]) => <button type="button" key={id} className={(form.defaultSeatType || 'default') === id ? 'selected' : ''} onClick={() => update('defaultSeatType', id)}>{label}</button>)}</div><small className="field-hint">保存后会直接同步 Team 默认席位，账号加入时无需再切换；自动补位仍按实时分类余量分配普通和高级席位。</small></label>
     <label><span>轮转方式</span><div className="segmented modal-segmented">{[['fixed', '固定主号'], ['rotating', '不固定主号']].map(([id, label]) => <button type="button" key={id} className={(form.rotationMode || 'fixed') === id ? 'selected' : ''} onClick={() => { update('rotationMode', id); if (id === 'fixed' && !form.primaryOwnerEmail) update('primaryOwnerEmail', form.email || ''); }}>{label}</button>)}</div></label>
     <label className="wide"><span>固定主号（不会被踢）</span><select className="select-control" disabled={(form.rotationMode || 'fixed') === 'rotating' || !ownerOptions.length} value={form.primaryOwnerEmail || form.email || ''} onChange={(event) => update('primaryOwnerEmail', event.target.value)}>{ownerOptions.length ? ownerOptions.map((owner) => <option value={owner.email} key={owner.email}>{owner.name ? `${owner.name} · ${owner.email}` : owner.email}</option>) : <option value="">先填写所有者邮箱</option>}</select><small className="field-hint">{form.rotationMode === 'rotating' ? '不固定主号模式下，所有者都可以轮转' : '固定模式下仅此账号不会被自动移出'}</small></label>
     <div className="team-rotation-setting"><div><span>不同步母号账号</span><small>只排除母号邮箱；其他所有者和成员正常推送。</small></div><Toggle checked={form.syncOwnerToSub2api === false} onChange={(exclude) => update('syncOwnerToSub2api', !exclude)} /></div>
@@ -2075,4 +2357,71 @@ function MotherManagerModal({ mother, action, onClose, onSave, onProbe, onRecove
 }
 function SettingsModal({ onClose }) { return <Modal title="快速设置" onClose={onClose}><div className="quick-setting"><Activity size={18} /><div><strong>实时监控</strong><span>每 60 秒检测一次子号额度</span></div><Toggle checked onChange={() => {}} /></div><div className="quick-setting"><ShieldCheck size={18} /><div><strong>加入前验证</strong><span>获取 AT 后先检测可用性再进入 Team</span></div><Toggle checked onChange={() => {}} /></div></Modal>; }
 
-createRoot(document.getElementById('root')).render(<App />);
+function LoginScreen({ onLogin, busy, checking, error }) {
+  const [password, setPassword] = useState('');
+  const [visible, setVisible] = useState(false);
+  useEffect(() => {
+    try {
+      document.documentElement.dataset.theme = window.localStorage.getItem('quota-hub-theme') === 'dark' ? 'dark' : 'light';
+    } catch {
+      document.documentElement.dataset.theme = 'light';
+    }
+  }, []);
+  return <main className="login-shell">
+    <div className="login-brand brand"><div className="brand-mark"><Zap size={20} strokeWidth={2.6} /></div><div><strong>team轮转</strong><span>TEAM AUTOMATION</span></div></div>
+    <form className="login-form" onSubmit={(event) => { event.preventDefault(); onLogin(password); }}>
+      <div className="login-emblem"><KeyRound size={22} /></div>
+      <h1>登录工作区</h1>
+      <p>管理员验证</p>
+      <label htmlFor="login-password">密码</label>
+      <div className="login-password"><input id="login-password" type={visible ? 'text' : 'password'} value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="current-password" disabled={checking || busy} required /><button type="button" className="icon-button" onClick={() => setVisible((current) => !current)} title={visible ? '隐藏密码' : '显示密码'} aria-label={visible ? '隐藏密码' : '显示密码'}>{visible ? <EyeOff size={18} /> : <Eye size={18} />}</button></div>
+      <div className="login-feedback" role="status" aria-live="polite">{error}</div>
+      <button className="button primary login-submit" type="submit" disabled={checking || busy}>{busy || checking ? <RefreshCw size={17} className="button-spinner" /> : <LogIn size={17} />}{checking ? '验证会话中' : busy ? '登录中' : '登录'}</button>
+    </form>
+  </main>;
+}
+
+function AuthGate() {
+  const [authenticated, setAuthenticated] = useState(false);
+  const [checking, setChecking] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    let cancelled = false;
+    apiRequest('/api/auth/session').then((result) => {
+      if (!cancelled) setAuthenticated(result.authenticated === true);
+    }).catch(() => {
+      if (!cancelled) setError('无法连接服务端，请确认服务已启动');
+    }).finally(() => {
+      if (!cancelled) setChecking(false);
+    });
+    const requireLogin = (event) => {
+      if (event.detail?.generation === authGeneration) setAuthenticated(false);
+    };
+    window.addEventListener('team-rotation:login-required', requireLogin);
+    return () => { cancelled = true; window.removeEventListener('team-rotation:login-required', requireLogin); };
+  }, []);
+
+  async function login(password) {
+    setBusy(true);
+    setError('');
+    try {
+      await apiRequest('/api/auth/login', { method: 'POST', body: JSON.stringify({ password }) });
+      authGeneration += 1;
+      setAuthenticated(true);
+    } catch (failure) { setError(failure.message || '登录失败'); }
+    finally { setBusy(false); }
+  }
+
+  async function logout() {
+    await apiRequest('/api/auth/logout', { method: 'POST' });
+    authGeneration += 1;
+    clearApiToken();
+    setAuthenticated(false);
+  }
+
+  return authenticated ? <App onLogout={logout} /> : <LoginScreen onLogin={login} busy={busy} checking={checking} error={error} />;
+}
+
+createRoot(document.getElementById('root')).render(<AuthGate />);

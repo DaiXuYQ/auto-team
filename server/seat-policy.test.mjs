@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { inviteApprovalPayloads, normalizeInviteSeatType, reconcileAcceptedSeatUsage, selectInviteSeatType, shouldRetainSeatClaim } from './seat-policy.mjs';
+import { inviteApprovalPayloads, normalizeInviteSeatType, reconcileAcceptedSeatUsage, seatCapacityByType, selectInviteSeatType, shouldRetainSeatClaim, totalSeatAvailability } from './seat-policy.mjs';
 
 const snapshot = {
   seatsEntitled: 15,
@@ -73,21 +73,33 @@ test('reservations across seat types cannot exceed the total remaining seats', (
   assert.equal(result.code, 'seat_capacity_exhausted');
 });
 
-test('a pending request or remote held value does not consume an unapproved seat', () => {
-  const result = selectInviteSeatType('default', {
-    seatsEntitled: 10,
-    seatsInUse: 9,
-    assigned: { default: 9 },
-    seatCapacity: [
-      { type: 'default', paid: 10, available: 0, held: 1 },
+test('held seats exhaust the total and type capacity in the subscription example', () => {
+  const subscription = {
+    seats_in_use: 52,
+    seats_entitled: 62,
+    seat_capacity: [
+      { type: 'default', paid: 2, held: 0 },
+      { type: 'prolite', paid: 60, held: 10 },
     ],
+    assigned: { default: 2, prolite: 50 },
+  };
+  assert.deepEqual(totalSeatAvailability(subscription), {
+    entitled: 62,
+    inUse: 52,
+    held: 10,
+    reserved: 0,
+    remaining: 0,
   });
-  assert.equal(result.ok, true);
-  assert.equal(result.seatType, 'default');
+  assert.equal(seatCapacityByType(subscription).get('prolite').remaining, 0);
+  for (const mode of ['auto', 'default', 'prolite']) {
+    const result = selectInviteSeatType(mode, subscription);
+    assert.equal(result.ok, false);
+    assert.equal(result.code, 'seat_capacity_exhausted');
+  }
 });
 
-test('held metadata is not required when current usage and type availability are known', () => {
-  for (const held of [undefined, null, '', 'invalid', -1]) {
+test('missing or empty held metadata is treated as zero', () => {
+  for (const held of [undefined, null, '']) {
     const result = selectInviteSeatType('default', {
       seatsEntitled: 10,
       seatsInUse: 8,
@@ -98,7 +110,33 @@ test('held metadata is not required when current usage and type availability are
   }
 });
 
-test('only approved usage and local approval claims share the hard total limit', () => {
+test('invalid or negative held metadata blocks approval instead of over-admitting', () => {
+  for (const held of ['invalid', -1, Number.POSITIVE_INFINITY]) {
+    const subscription = {
+      seatsEntitled: 10,
+      seatsInUse: 8,
+      seatCapacity: [{ type: 'default', paid: 10, available: 2, held }],
+    };
+    assert.equal(totalSeatAvailability(subscription), null);
+    assert.equal(seatCapacityByType(subscription).get('default').remaining, null);
+    assert.equal(selectInviteSeatType('default', subscription).code, 'seat_capacity_unavailable');
+  }
+});
+
+test('held seats from future types consume the shared total capacity', () => {
+  const subscription = {
+    seatsEntitled: 10,
+    seatsInUse: 9,
+    seatCapacity: [
+      { type: 'default', paid: 10, available: 1, held: 0 },
+      { type: 'future-type', paid: 1, held: 1 },
+    ],
+  };
+  assert.equal(totalSeatAvailability(subscription).remaining, 0);
+  assert.equal(selectInviteSeatType('default', subscription).code, 'seat_capacity_exhausted');
+});
+
+test('remote held seats and local approval claims share the hard total limit', () => {
   const constrained = {
     seatsEntitled: 10,
     seatsInUse: 6,
@@ -116,15 +154,37 @@ test('only approved usage and local approval claims share the hard total limit',
   }
 });
 
-test('type capacity fallback ignores held requests and uses assigned members', () => {
+test('assigned members remain actual usage while held consumes type capacity', () => {
   const result = selectInviteSeatType('default', {
-    seatsEntitled: 10,
+    seatsEntitled: 12,
     seatsInUse: 9,
     assigned: { default: 9 },
     seatCapacity: [{ type: 'default', paid: 10, available: null, held: 1 }],
   });
-  assert.equal(result.ok, true);
-  assert.equal(result.seatType, 'default');
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'seat_type_capacity_exhausted');
+});
+
+test('reported availability can only lower computed type capacity', () => {
+  const subscription = {
+    seatsEntitled: 20,
+    seatsInUse: 6,
+    assigned: { default: 6 },
+    seatCapacity: [{ type: 'default', paid: 10, held: 1, available: 2 }],
+  };
+  assert.equal(seatCapacityByType(subscription).get('default').remaining, 2);
+  subscription.seatCapacity[0].available = 9;
+  assert.equal(seatCapacityByType(subscription).get('default').remaining, 3);
+});
+
+test('reported type availability is reduced by held when assigned is unavailable', () => {
+  const subscription = {
+    seatsEntitled: 10,
+    seatsInUse: 5,
+    seatCapacity: [{ type: 'default', paid: 10, available: 3, held: 1 }],
+  };
+  assert.equal(seatCapacityByType(subscription).get('default').remaining, 2);
+  assert.equal(selectInviteSeatType('default', subscription, { default: 2 }).code, 'seat_type_capacity_exhausted');
 });
 
 test('reservations for any present or future seat type consume the hard total limit', () => {

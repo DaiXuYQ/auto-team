@@ -35,10 +35,16 @@ Team 轮转提供前后端一体的本地管理能力：前端负责 Team 与账
 
 ```powershell
 npm install
+npm run server
+```
+
+在另一个终端运行前端开发服务：
+
+```powershell
 npm run dev
 ```
 
-然后打开 <http://localhost:5173>。前端和服务端默认从空状态启动，不包含预置母号、子号或历史记录。数据以服务端 `data/state.json` 为准；该文件使用 AES-256-GCM 加密，可以在“设置”中调整预警阈值和轮询周期。
+然后打开 <http://localhost:5173>，使用默认密码 `daixuteam` 登录。开发模式需要同时运行 `npm run server` 和 `npm run dev`：Vite 将 `/api` 代理至本机服务端。前端和服务端默认从空状态启动，不包含预置母号、子号或历史记录。数据以服务端 `data/state.json` 为准；该文件使用 AES-256-GCM 加密，可以在“设置”中调整预警阈值和轮询周期。
 
 前端不会生成演示账号。Free 账号可以通过“导入 Sub2API JSON”导入真实 `accounts[].credentials` 和 `accounts[].extra`，也可以粘贴 `邮箱----密码----2FA`（或使用 `|`、逗号）保存已完成手机号验证的登录凭据。开启自动补位后，没有 Free JSON 的账号会先通过 RT 或邮箱、密码、2FA 完成 Codex OAuth；已有 AT 过期时优先用 RT 刷新。遇到额外邮箱验证码、Turnstile 或浏览器设备校验时不会伪造成功，界面会保留验证状态。JSON 的完整凭据只提交并加密保存在服务端，界面和 API 响应只返回脱敏 token。
 
@@ -46,7 +52,7 @@ npm run dev
 
 混合 Sub2API 文件会按 `credentials.plan_type` 分流：`team` 记录按 `chatgpt_account_id` 合并为空间，并保留该空间的多个所有者；`free` 记录进入 Free 账号池。同一邮箱同时存在 Free 和 Team 记录时不会互相覆盖。
 
-需要启动持久化 API 时，先构建再运行：
+正式部署并由服务端提供已构建页面时，先构建再运行：
 
 ```powershell
 npm run build
@@ -55,12 +61,19 @@ npm run server
 
 服务监听 `http://127.0.0.1:8786`，并提供 `/api/state`、`/api/history`、`/api/settings`、`/api/mothers/*`（Team 所有者与空间操作）、`/api/children/import`、`/api/children/:id/login`、`/api/children/:id/acquire`、`/api/children/:id/join`、`/api/children/:id/switch`、`/api/children/:id/kick`、`/api/maintenance/check`、`/api/maintenance/refill` 和 `/api/sub2api/export`。Free 账号只用于登录、取得凭据和加入 Team，不单独检测额度；5h / 7d 额度只保存和检测在对应 Team 空间下。`/api/state` 额外返回脱敏的 `teams` 汇总、账号凭据状态、加入历史和 Sub2API 状态；前端同步时可传 `includeHistory=false` 跳过历史。`/api/history?page=1&pageSize=20` 返回当前页 `items` 及 `total`、`totalPages` 等分页信息，不带分页参数时保持返回完整数组。单个成员检测失败只记录为部分失败，不会阻断其他成员或已确认额度状态的补位。
 
+## 版本标识
+
+当前版本以 `package.json` 的 `version` 为准，并在管理台显示为版本标识。项目不连接 GitHub 仓库检测更新；版本变更记录见 [CHANGELOG.md](./CHANGELOG.md)。
+
+发布时按语义化版本更新 `package.json` 与 `package-lock.json`，并补充变更记录。
+
 ## 安全配置
 
-- 默认只监听 `127.0.0.1`。设置非本机 `HOST` 时，必须同时设置 `TEAM_ROTATION_API_TOKEN`，否则服务拒绝启动。页面第一次访问受保护 API 时会要求输入 Token，并仅保存到当前浏览器会话。
+- 管理台默认登录密码是 `daixuteam`；启动服务端前设置 `TEAM_ROTATION_LOGIN_PASSWORD` 可覆盖。远程部署应更换强密码。登录成功后使用路径为 `/api` 的 HttpOnly、SameSite=Lax Cookie，会话有效期 7 天并仅保存在服务端内存中；服务端重启后需要重新登录，退出会使当前会话失效。
+- 默认只监听 `127.0.0.1`。设置非本机 `HOST` 时，必须同时设置 `TEAM_ROTATION_API_TOKEN`，否则服务拒绝启动。管理台登录不替代 API Token：配置了 Token 时，页面登录后访问受保护 API 仍需输入 Token，Token 仅保存到当前浏览器会话并在退出时清除。携带有效 Token 的程序化 HTTP 客户端可不建立管理台 Cookie 会话。
 - 状态文件默认使用 `data/.state-key` 加密；非本机监听必须设置独立的 `TEAM_ROTATION_DATA_KEY`（32 字节 Base64、64 位十六进制或高强度口令），并单独备份该密钥。密钥丢失后无法解密状态数据。
 - 跨域前端通过 `TEAM_ROTATION_ALLOWED_ORIGINS` 配置允许来源，多个来源使用逗号分隔。默认只允许同源以及本机 Vite 开发地址。
-- MCP 默认复用 `TEAM_ROTATION_API_TOKEN`；也可以单独设置 `MCP_AUTH_TOKEN`。远程部署仍应在 HTTPS 反向代理后使用。
+- MCP 认证机制不受管理台登录影响：默认复用 `TEAM_ROTATION_API_TOKEN`，也可以单独设置 `MCP_AUTH_TOKEN`。远程部署仍应在 HTTPS 反向代理后使用。
 
 ## Agent MCP 接入
 

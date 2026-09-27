@@ -28,16 +28,36 @@ function reservedSeatCount(reservations = {}) {
   return total;
 }
 
-function totalSeatAvailability(snapshot = {}, reservations = {}) {
+function seatCapacityEntries(snapshot) {
+  return Array.isArray(snapshot?.seatCapacity)
+    ? snapshot.seatCapacity
+    : Array.isArray(snapshot?.seat_capacity)
+      ? snapshot.seat_capacity
+      : [];
+}
+
+function heldSeatCount(entry) {
+  const held = entry?.held;
+  return held === null || held === undefined || held === '' ? 0 : wholeSeatCount(held, 'ceil');
+}
+
+export function totalSeatAvailability(snapshot = {}, reservations = {}) {
   const entitled = wholeSeatCount(snapshot?.seatsEntitled ?? snapshot?.seats_entitled, 'floor');
   const inUse = wholeSeatCount(snapshot?.seatsInUse ?? snapshot?.seats_in_use, 'ceil');
   const reserved = reservedSeatCount(reservations);
+  let held = 0;
+  for (const entry of seatCapacityEntries(snapshot)) {
+    const count = heldSeatCount(entry);
+    if (count == null) return null;
+    held += count;
+  }
   if (entitled == null || inUse == null || reserved == null) return null;
   return {
     entitled,
     inUse,
+    held,
     reserved,
-    remaining: Math.max(0, entitled - inUse - reserved),
+    remaining: Math.max(0, entitled - inUse - held - reserved),
   };
 }
 
@@ -51,28 +71,28 @@ export function reconcileAcceptedSeatUsage({ syncedUsed, usedBeforeRefill, accep
 }
 
 export function seatCapacityByType(snapshot = {}, reservations = {}) {
-  const capacities = Array.isArray(snapshot?.seatCapacity)
-    ? snapshot.seatCapacity
-    : Array.isArray(snapshot?.seat_capacity)
-      ? snapshot.seat_capacity
-      : [];
   const assigned = snapshot?.assigned && typeof snapshot.assigned === 'object' ? snapshot.assigned : {};
   const result = new Map();
-  for (const entry of capacities) {
+  for (const entry of seatCapacityEntries(snapshot)) {
     const type = String(entry?.type || '').trim().toLowerCase();
     if (!['default', 'prolite'].includes(type)) continue;
     const paid = wholeSeatCount(entry?.paid ?? entry?.entitled ?? entry?.total, 'floor');
     const assignedCount = wholeSeatCount(assigned[type], 'ceil');
     const reportedAvailable = wholeSeatCount(entry?.available, 'floor');
-    // Pending access requests do not consume seats. Prefer paid - assigned
-    // when both values are present, then fall back to the reported remainder.
-    const available = paid != null && assignedCount != null
-      ? Math.max(0, paid - assignedCount)
-      : reportedAvailable;
+    const held = heldSeatCount(entry);
+    const calculatedAvailable = paid != null && assignedCount != null && held != null
+      ? Math.max(0, paid - assignedCount - held)
+      : null;
+    // The reported remainder can be lower than paid - assigned - held.
+    // Without assigned, conservatively treat reported availability as pre-held.
+    const available = calculatedAvailable != null
+      ? reportedAvailable == null ? calculatedAvailable : Math.min(calculatedAvailable, reportedAvailable)
+      : reportedAvailable == null || held == null ? null : Math.max(0, reportedAvailable - held);
     const reserved = wholeSeatCount(reservations[type] ?? 0, 'ceil');
     result.set(type, {
       type,
       paid,
+      held,
       available,
       remaining: available == null || reserved == null ? null : Math.max(0, available - reserved),
       reserved,
