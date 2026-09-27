@@ -355,6 +355,19 @@ async function waitForMailboxCode(mailboxUrl, email, baseline, requestFetch, tim
   throw new OpenAiLoginError('email_otp_timeout', `邮箱验证码获取超时（${last || '未收到新验证码'}）`, 408);
 }
 
+const LOGIN_ATTEMPT_WINDOW_MS = 30000;
+const loginAttemptTimestamps = new Map();
+
+function enforceLoginRateLimit(email) {
+  const key = string(email).toLowerCase() || 'unknown';
+  const now = Date.now();
+  const last = loginAttemptTimestamps.get(key) || 0;
+  if (now - last < LOGIN_ATTEMPT_WINDOW_MS) {
+    throw new OpenAiLoginError('login_rate_limited', '登录尝试过于频繁，请稍后重试', 429);
+  }
+  loginAttemptTimestamps.set(key, now);
+}
+
 class LoginRunner {
   constructor(options = {}) {
     this.email = string(options.email).toLowerCase();
@@ -813,6 +826,7 @@ class LoginRunner {
 }
 
 export async function loginFreeAccount(options = {}) {
+  enforceLoginRateLimit(options.email);
   let runner = new LoginRunner(options);
   let oauthFallback = null;
   try {
